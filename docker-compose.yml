@@ -1,0 +1,58 @@
+# Docker Compose configuration for PDF to Excel Converter
+# Run with: docker-compose up -d
+
+version: '3.8'
+
+services:
+  # Frontend - Next.js Application
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://backend:8000
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  # Backend - FastAPI Application
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - UPLOAD_DIR=/app/uploads
+      - OUTPUT_DIR=/app/outputs
+      - MAX_FILE_SIZE=10485760
+      - ALLOWED_ORIGINS=http://localhost:3000,http://frontend:3000
+      # AI Features - Set your OpenAI API key here or use .env file
+      # - OPENAI_API_KEY=${OPENAI_API_KEY}
+    volumes:
+      - uploads_data:/app/uploads
+      - outputs_data:/app/outputs
+    networks:
+      - app-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+# Named volumes for persistent storage
+volumes:
+  uploads_data:
+  outputs_data:
+
+# Network for inter-service communication
+networks:
+  app-network:
+    driver: bridge

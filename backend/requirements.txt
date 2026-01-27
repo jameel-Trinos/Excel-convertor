@@ -1,0 +1,44 @@
+# FastAPI and server
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.6
+
+# PDF Processing
+pdfplumber>=0.10.3
+tabula-py>=2.9.0
+camelot-py>=0.11.0
+opencv-python-headless>=4.8.0
+ghostscript>=0.7
+
+# OCR Processing (for scanned/image-based PDFs)
+pytesseract>=0.3.10
+pdf2image>=1.16.3
+easyocr>=1.7.0  # Fallback OCR engine
+# Note: Tesseract OCR must be installed on the system:
+#   macOS: brew install tesseract
+#   Ubuntu: sudo apt-get install tesseract-ocr
+# Note: Poppler is required for pdf2image:
+#   macOS: brew install poppler
+#   Ubuntu: sudo apt-get install poppler-utils
+
+# Excel Creation
+openpyxl>=3.1.5
+
+# Data Processing
+pandas>=2.1.4
+numpy>=2.0.0
+
+# Utilities
+python-dotenv>=1.0.0
+aiofiles>=24.1.0
+
+# Server-Sent Events
+sse-starlette>=1.8.2
+
+# File validation
+python-magic>=0.4.27
+
+# AI Processing
+openai>=1.12.0
+tiktoken>=0.5.2
+anthropic>=0.43.0  # Latest version for enhanced Claude processing

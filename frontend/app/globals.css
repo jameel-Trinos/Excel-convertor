@@ -1,0 +1,151 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 222.2 84% 4.9%;
+
+    --muted: 210 40% 96.1%;
+    --muted-foreground: 215.4 16.3% 46.9%;
+
+    --accent: 210 40% 96.1%;
+    --accent-foreground: 222.2 47.4% 11.2%;
+
+    --border: 214.3 31.8% 91.4%;
+    --input: 214.3 31.8% 91.4%;
+    --ring: 222.2 84% 4.9%;
+
+    --primary: 222.2 47.4% 11.2%;
+    --primary-foreground: 210 40% 98%;
+
+    --secondary: 210 40% 96.1%;
+    --secondary-foreground: 222.2 47.4% 11.2%;
+
+    --destructive: 0 84.2% 60.2%;
+    --destructive-foreground: 210 40% 98%;
+
+    --radius: 0.5rem;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+}
+
+/* Screen reader only - visually hidden but accessible */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border-width: 0;
+}
+
+/* Ensure left-to-right text direction for all table content */
+/* This prevents RTL Unicode control characters from reversing text display */
+table,
+th,
+td,
+.preview-table,
+.preview-table * {
+  direction: ltr !important;
+  unicode-bidi: isolate-override !important;
+  text-align: left;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: hsl(var(--muted));
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: hsl(var(--muted-foreground) / 0.3);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: hsl(var(--muted-foreground) / 0.5);
+}
+
+/* Dropzone animations */
+.dropzone-active {
+  @apply border-blue-500 bg-blue-50;
+}
+
+/* Progress bar animation */
+@keyframes progress-pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.7;
+  }
+}
+
+.animate-progress-pulse {
+  animation: progress-pulse 2s ease-in-out infinite;
+}
+
+/* Mobile responsiveness */
+@media (max-width: 640px) {
+  .dropzone-icon {
+    width: 48px;
+    height: 48px;
+  }
+
+  .preview-table {
+    font-size: 0.75rem;
+  }
+}
+
+/* Fortune Sheet - Full width spreadsheet styles */
+.fortune-sheet-container {
+  width: 100% !important;
+  height: 100% !important;
+  position: relative;
+}
+
+.fortune-sheet-container > div {
+  width: 100% !important;
+  height: 100% !important;
+}
+
+/* Ensure Fortune Sheet takes full available space */
+[class*="luckysheet"] {
+  width: 100% !important;
+}
+
+.luckysheet-grid-container {
+  width: 100% !important;
+}
+
+/* Dialog fullscreen override */
+[role="dialog"][data-state="open"] {
+  max-width: 100vw !important;
+  width: 100vw !important;
+  max-height: 100vh !important;
+  height: 100vh !important;
+  border-radius: 0 !important;
+}
+
+/* Remove dialog backdrop blur for full screen */
+[data-radix-popper-content-wrapper] {
+  transform: none !important;
+}
