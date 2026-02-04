@@ -9,6 +9,8 @@ import openpyxl
 import pandas as pd
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
+from .party_normalizer import PartyNormalizer
+
 logger = logging.getLogger(__name__)
 
 
@@ -26,6 +28,7 @@ class ColumnFilterService:
         output_dir: str,
         include_others: bool = False,
         header_overrides: Optional[Dict[str, str]] = None,
+        others_columns: Optional[List[str]] = None,
     ) -> tuple[str, dict]:
         """
         Filter Excel file to include only requested columns.
@@ -35,6 +38,8 @@ class ColumnFilterService:
             requested_columns: List of column names to include (in desired order)
             output_dir: Directory to save the filtered Excel file
             include_others: If True, add an "OTHER Votes" column with sum of unselected party columns
+            header_overrides: Optional mapping of original column name -> desired output header name
+            others_columns: Optional list of specific column names to sum into OTHERS. If provided, these columns will be used instead of auto-detection.
 
         Returns:
             Tuple of (output_file_path, metadata_dict)
@@ -139,30 +144,57 @@ class ColumnFilterService:
         filtered_df = df[requested_columns].copy()
 
         # Add OTHERS column if requested
-        others_columns = []
+        others_columns_used = []
         if include_others:
-            # Get all unselected numeric columns
-            unselected_columns = [col for col in available_columns if col not in requested_columns]
-            
-            # Filter to only numeric columns
-            numeric_unselected = []
-            for col in unselected_columns:
-                # Check if column is numeric by sampling data
-                sample_values = df[col].dropna().head(10)
-                if len(sample_values) > 0:
-                    numeric_count = pd.to_numeric(sample_values, errors='coerce').notna().sum()
-                    if numeric_count / len(sample_values) >= 0.5:  # At least 50% numeric
-                        numeric_unselected.append(col)
-            
-            if numeric_unselected:
-                logger.info(f"Adding OTHERS column with sum of: {numeric_unselected}")
-                # Calculate sum of unselected numeric columns (convert to numeric, treating NaN as 0)
-                others_sum = pd.Series(0, index=df.index)
-                for col in numeric_unselected:
-                    others_sum += pd.to_numeric(df[col], errors='coerce').fillna(0)
+            # Use provided others_columns if available, otherwise auto-detect
+            if others_columns and len(others_columns) > 0:
+                # Validate that all provided others_columns exist in the dataframe
+                valid_others_columns = [col for col in others_columns if col in available_columns]
+                invalid_others_columns = [col for col in others_columns if col not in available_columns]
                 
-                filtered_df['OTHERS'] = others_sum.astype(int)
-                others_columns = numeric_unselected
+                if invalid_others_columns:
+                    logger.warning(f"Some others_columns not found in Excel file: {invalid_others_columns}")
+                
+                if valid_others_columns:
+                    logger.info(f"Adding OTHERS column with sum of specified columns: {valid_others_columns}")
+                    # Calculate sum of specified columns (convert to numeric, treating NaN as 0)
+                    others_sum = pd.Series(0, index=df.index)
+                    for col in valid_others_columns:
+                        others_sum += pd.to_numeric(df[col], errors='coerce').fillna(0)
+                    
+                    filtered_df['OTHERS'] = others_sum.astype(int)
+                    others_columns_used = valid_others_columns
+                else:
+                    logger.warning("No valid columns found in others_columns list, skipping OTHERS column")
+            else:
+                # Auto-detect party columns from unselected columns
+                # Initialize PartyNormalizer to identify party columns
+                party_normalizer = PartyNormalizer()
+
+                # Get all unselected columns
+                unselected_columns = [col for col in available_columns if col not in requested_columns]
+
+                # Filter to only party columns (excluding administrative columns like SL.NO, Total, etc.)
+                party_unselected = []
+                for col in unselected_columns:
+                    # Check if this is a party column (DMK, BJP, AIADMK, etc.)
+                    if party_normalizer.is_party_column(col):
+                        # Also verify it's numeric (contains vote data)
+                        sample_values = df[col].dropna().head(10)
+                        if len(sample_values) > 0:
+                            numeric_count = pd.to_numeric(sample_values, errors='coerce').notna().sum()
+                            if numeric_count / len(sample_values) >= 0.5:  # At least 50% numeric
+                                party_unselected.append(col)
+
+                if party_unselected:
+                    logger.info(f"Adding OTHERS column with sum of auto-detected unselected PARTY columns: {party_unselected}")
+                    # Calculate sum of unselected party columns (convert to numeric, treating NaN as 0)
+                    others_sum = pd.Series(0, index=df.index)
+                    for col in party_unselected:
+                        others_sum += pd.to_numeric(df[col], errors='coerce').fillna(0)
+
+                    filtered_df['OTHERS'] = others_sum.astype(int)
+                    others_columns_used = party_unselected
 
         # Apply output header overrides (display names) AFTER selecting data by original headers
         header_overrides = header_overrides or {}
@@ -212,7 +244,7 @@ class ColumnFilterService:
             "total_rows": len(filtered_df),
             "columns_removed": len(available_columns) - len(requested_columns),
             "include_others": include_others,
-            "others_columns": others_columns if include_others else [],
+            "others_columns": others_columns_used if include_others else [],
         }
 
         logger.info(f"Filtering complete: {len(requested_columns)} columns, {len(filtered_df)} rows")

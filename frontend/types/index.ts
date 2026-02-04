@@ -108,3 +108,35 @@ export interface DownloadModifiedRequest {
 }
 
 export type CellValue = string | number | null;
+
+// Geocoding Types
+
+export interface GeocodeStartResponse {
+  geocode_task_id: string;
+  total_addresses: number;
+  message: string;
+}
+
+export interface GeocodeProgressEvent {
+  current: number;
+  total: number;
+  status: "geocoding" | "completed" | "failed" | "cancelled";
+  message: string;
+  success_count: number;
+  failed_count: number;
+}
+
+export interface GeocodeApplyRequest {
+  geocode_task_id: string;
+  task_id: string;
+  headers: string[];
+  rows: CellValue[][];
+}
+
+export interface GeocodeApplyResponse {
+  headers: string[];
+  rows: CellValue[][];
+  total_geocoded: number;
+  successful: number;
+  failed: number;
+}

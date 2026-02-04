@@ -17,6 +17,8 @@ from fastapi.responses import FileResponse
 from sse_starlette.sse import EventSourceResponse
 
 from .column_filter import ColumnFilterService
+from .constituency_excel_creator import ConstituencyExcelCreator
+from .constituency_processor import ConstituencyProcessor
 from .excel_creator import ExcelCreator
 from .models import (
     ConversionTask,
@@ -26,11 +28,17 @@ from .models import (
     FilterColumnsResponse,
     FilterExcelRequest,
     FullPreviewData,
+    GeocodeApplyRequest,
+    GeocodeApplyResponse,
+    GeocodeProgressEvent,
+    GeocodeRequest,
+    GeocodeStartResponse,
     PreviewData,
     ProgressEvent,
     StatusResponse,
     UploadResponse,
 )
+from .geocoding_service import GeocodingService, extract_addresses_from_column
 from .pdf_processor import PDFProcessor
 from .utils import cleanup_file, validate_pdf_file
 
@@ -53,6 +61,9 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # In-memory task storage (use Redis for production)
 tasks: Dict[str, ConversionTask] = {}
+
+# Geocoding task storage
+geocode_tasks: Dict[str, dict] = {}  # {geocode_task_id: {status, results, progress, ...}}
 
 # Create FastAPI app
 app = FastAPI(
@@ -78,15 +89,17 @@ def update_task_progress(task_id: str, progress: int, message: str, step: str = 
         tasks[task_id].message = message
 
 
-async def process_conversion(task_id: str, file_path: Path):
+async def process_conversion(task_id: str, file_path: Path, use_constituency_processor: bool = False):
     """Simplified background task for PDF to Excel conversion."""
     try:
         tasks[task_id].status = "processing"
         tasks[task_id].message = "Starting conversion..."
 
         update_task_progress(task_id, 10, "Extracting tables from PDF...")
-        logger.info(f"Processing task {task_id}")
+        logger.info(f"Processing task {task_id} (constituency={use_constituency_processor})")
 
+        # Use PDFProcessor for extraction in both cases
+        # The constituency endpoint only differs in Excel formatting, not extraction
         processor = PDFProcessor(str(file_path))
 
         def progress_callback(progress: int, message: str):
@@ -97,12 +110,17 @@ async def process_conversion(task_id: str, file_path: Path):
         extraction_result = await processor.extract_tables(progress_callback=progress_callback)
 
         if not extraction_result.tables or all(t.is_empty for t in extraction_result.tables):
-            raise ValueError("No tables found in the PDF")
+            error_msg = "No tables found in the constituency PDF" if use_constituency_processor else "No tables found in the PDF"
+            raise ValueError(error_msg)
 
         update_task_progress(task_id, 85, "Creating Excel file...")
 
-        # Create Excel file
-        creator = ExcelCreator()
+        # Create Excel file - use constituency creator if using constituency processor
+        if use_constituency_processor:
+            creator = ConstituencyExcelCreator()
+        else:
+            creator = ExcelCreator()
+        
         output_filename = f"{task_id}.xlsx"
         output_path = OUTPUT_DIR / output_filename
 
@@ -194,13 +212,77 @@ async def upload_pdf(
     )
 
     # Start background conversion
-    background_tasks.add_task(process_conversion, task_id, file_path)
+    background_tasks.add_task(process_conversion, task_id, file_path, False)
 
     return UploadResponse(
         task_id=task_id,
         filename=file.filename,
         size=len(content),
         message="File uploaded successfully. Conversion started.",
+    )
+
+
+@app.post("/api/booth/upload", response_model=UploadResponse)
+async def upload_booth_pdf(
+    file: UploadFile = File(...),
+    background_tasks: BackgroundTasks = None,
+):
+    """
+    Upload a PDF file for booth-specific conversion to Excel.
+
+    NOTE: Extraction logic has been cleared. Ready for new implementation.
+
+    - **file**: PDF file to convert (max 10MB)
+
+    Returns task ID for tracking conversion progress.
+    """
+    # Validate file
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(
+            status_code=400,
+            detail="Only PDF files are accepted",
+        )
+
+    # Read file content
+    content = await file.read()
+
+    # Check file size
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=400,
+            detail=f"File too large. Maximum size is {MAX_FILE_SIZE // 1024 // 1024}MB",
+        )
+
+    # Validate PDF content
+    validation_error = validate_pdf_file(content)
+    if validation_error:
+        raise HTTPException(status_code=400, detail=validation_error)
+
+    # Generate task ID
+    task_id = str(uuid.uuid4())
+
+    # Save file
+    file_path = UPLOAD_DIR / f"{task_id}.pdf"
+    async with aiofiles.open(file_path, "wb") as f:
+        await f.write(content)
+
+    # Create task
+    tasks[task_id] = ConversionTask(
+        task_id=task_id,
+        filename=file.filename,
+        status="pending",
+        progress=0,
+        message="File uploaded, starting booth conversion...",
+    )
+
+    # Start background conversion with constituency processor
+    background_tasks.add_task(process_conversion, task_id, file_path, True)
+
+    return UploadResponse(
+        task_id=task_id,
+        filename=file.filename,
+        size=len(content),
+        message="File uploaded successfully. Booth conversion started.",
     )
 
 
@@ -330,22 +412,37 @@ async def get_preview(task_id: str):
                     data_start_row = row
                     break
 
+        # Find where actual data starts (first row with numeric data in first column)
+        # This helps us know how many header rows there are
+        first_data_row = data_start_row + 1
+        for row in range(data_start_row + 1, min(data_start_row + 10, actual_max_row + 1)):
+            cell_val = ws.cell(row, 1).value
+            # Check if this looks like data (numeric or starts with a number)
+            if cell_val is not None:
+                if isinstance(cell_val, (int, float)) or (isinstance(cell_val, str) and cell_val.strip().isdigit()):
+                    first_data_row = row
+                    break
+
+        # Calculate how many header rows we have (between data_start_row and first_data_row)
+        num_header_rows = first_data_row - data_start_row
+
         # Get headers by merging multi-row headers
         # Many election PDFs have 2-3 header rows (main header + candidate name + party)
+        # But constituency data typically has only 1 header row
         headers = []
         for col in range(1, actual_max_col + 1):
-            # Get values from up to 3 header rows
+            # Get values from header rows only (not data rows)
             header_parts = []
-            
-            # Check up to 3 rows for header information
-            for header_row in range(data_start_row, min(data_start_row + 3, actual_max_row + 1)):
+
+            # Only check actual header rows (not data rows)
+            for header_row in range(data_start_row, data_start_row + num_header_rows):
                 value = ws.cell(header_row, col).value
                 if value is not None and str(value).strip():
                     clean_value = str(value).strip()
                     # Skip generic phrases and party abbreviation labels
                     if clean_value.upper() not in ['PARTY ABBREVIATION', 'NO. OF VALID VOTES CAST IN FAVOUR OF']:
                         header_parts.append(clean_value)
-            
+
             # Combine header parts into a single name
             if header_parts:
                 # Use the last non-empty part (usually the party name or most specific info)
@@ -367,18 +464,7 @@ async def get_preview(task_id: str):
             for col in range(1, min(actual_max_col + 1, 50)):
                 headers.append(f"Column {col}")
 
-        # Get first 10 data rows - read all columns up to actual_max_col
-        # Skip up to 3 header rows (data_start_row, data_start_row+1, data_start_row+2)
-        # Find where actual data starts (first row with numeric data in first column)
-        first_data_row = data_start_row + 1
-        for row in range(data_start_row + 1, min(data_start_row + 10, actual_max_row + 1)):
-            cell_val = ws.cell(row, 1).value
-            # Check if this looks like data (numeric or starts with a number)
-            if cell_val is not None:
-                if isinstance(cell_val, (int, float)) or (isinstance(cell_val, str) and cell_val.strip().isdigit()):
-                    first_data_row = row
-                    break
-        
+        # Get first 10 data rows (first_data_row was already calculated above)
         rows = []
         preview_row_count = min(10, actual_max_row - first_data_row + 1)
         for row_idx in range(first_data_row, first_data_row + preview_row_count):
@@ -484,21 +570,33 @@ async def get_columns(task_id: str):
                     data_start_row = row
                     break
 
+        # Find where actual data starts (first row with numeric data in first column)
+        first_data_row = data_start_row + 1
+        for row in range(data_start_row + 1, min(data_start_row + 10, actual_max_row + 1)):
+            cell_val = ws.cell(row, 1).value
+            if cell_val is not None:
+                if isinstance(cell_val, (int, float)) or (isinstance(cell_val, str) and cell_val.strip().isdigit()):
+                    first_data_row = row
+                    break
+
+        # Calculate how many header rows we have
+        num_header_rows = first_data_row - data_start_row
+
         # Get headers by reading from the header row(s)
         # Many Excel files have headers in a single row, but some have multi-row headers
         columns = []
         for col in range(1, actual_max_col + 1):
-            # Get values from up to 3 header rows (data_start_row, data_start_row+1, data_start_row+2)
+            # Get values from actual header rows only (not data rows)
             header_parts = []
-            
-            for header_row in range(data_start_row, min(data_start_row + 3, actual_max_row + 1)):
+
+            for header_row in range(data_start_row, data_start_row + num_header_rows):
                 value = ws.cell(header_row, col).value
                 if value is not None and str(value).strip():
                     clean_value = str(value).strip()
                     # Skip generic phrases
                     if clean_value.upper() not in ['PARTY ABBREVIATION', 'NO. OF VALID VOTES CAST IN FAVOUR OF']:
                         header_parts.append(clean_value)
-            
+
             # Combine header parts into a single name
             if header_parts:
                 # Use the last non-empty part (usually the party name or most specific info)
@@ -697,9 +795,12 @@ async def filter_excel(request: FilterExcelRequest):
         )
 
     try:
+        # Auto-set include_others if others_columns is provided
+        include_others = request.include_others or (request.others_columns is not None and len(request.others_columns) > 0)
+        
         logger.info(
             f"Filtering columns for task {request.task_id}: {request.selected_columns}, "
-            f"include_others: {request.include_others}"
+            f"include_others: {include_others}, others_columns: {request.others_columns}"
         )
 
         # Create filter service
@@ -711,8 +812,9 @@ async def filter_excel(request: FilterExcelRequest):
             task.output_file,
             request.selected_columns,
             str(OUTPUT_DIR),
-            request.include_others,
+            include_others,
             request.header_overrides,
+            request.others_columns,
         )
 
         logger.info(f"Column filtering completed: {filtered_file}")
@@ -832,23 +934,35 @@ async def get_full_preview(task_id: str):
                     data_start_row = row
                     break
 
+        # Find where actual data starts (first row with numeric data in first column)
+        first_data_row = data_start_row + 1
+        for row in range(data_start_row + 1, min(data_start_row + 10, actual_max_row + 1)):
+            cell_val = ws.cell(row, 1).value
+            if cell_val is not None:
+                if isinstance(cell_val, (int, float)) or (isinstance(cell_val, str) and cell_val.strip().isdigit()):
+                    first_data_row = row
+                    break
+
+        # Calculate how many header rows we have
+        num_header_rows = first_data_row - data_start_row
+
         # Get headers by merging multi-row headers and fix reversed text
         from .header_fixer import HeaderFixer
-        
+
         headers = []
         for col in range(1, actual_max_col + 1):
-            # Get values from up to 3 header rows
+            # Get values from actual header rows only (not data rows)
             header_parts = []
-            
-            # Check up to 3 rows for header information
-            for header_row in range(data_start_row, min(data_start_row + 3, actual_max_row + 1)):
+
+            # Only check actual header rows
+            for header_row in range(data_start_row, data_start_row + num_header_rows):
                 value = ws.cell(header_row, col).value
                 if value is not None and str(value).strip():
                     clean_value = str(value).strip()
                     # Skip generic phrases and party abbreviation labels
                     if clean_value.upper() not in ['PARTY ABBREVIATION', 'NO. OF VALID VOTES CAST IN FAVOUR OF']:
                         header_parts.append(clean_value)
-            
+
             # Combine header parts into a single name
             if header_parts:
                 # Use the last non-empty part (usually the party name or most specific info)
@@ -862,24 +976,24 @@ async def get_full_preview(task_id: str):
                 # Fallback for empty columns
                 headers.append(f"Column {col}")
         
-        # Fix reversed text in headers
-        headers = HeaderFixer.fix_header_list(headers)
+        # Only fix headers if they're clearly reversed (conservative approach)
+        # For polling station PDFs, headers are usually correct as-is
+        # Check if headers look correct first
+        needs_fixing = False
+        for header in headers:
+            # Check if any header looks clearly reversed
+            if any(pattern.lower() in header.lower() for pattern in HeaderFixer.KNOWN_REVERSED_PATTERNS):
+                needs_fixing = True
+                break
+        
+        if needs_fixing:
+            headers = HeaderFixer.fix_header_list(headers)
 
         if not headers:
             for col in range(1, min(actual_max_col + 1, 50)):
                 headers.append(f"Column {col}")
 
-        # Get ALL data rows (not just first 10)
-        # Find where actual data starts (first row with numeric data in first column)
-        first_data_row = data_start_row + 1
-        for row in range(data_start_row + 1, min(data_start_row + 10, actual_max_row + 1)):
-            cell_val = ws.cell(row, 1).value
-            # Check if this looks like data (numeric or starts with a number)
-            if cell_val is not None:
-                if isinstance(cell_val, (int, float)) or (isinstance(cell_val, str) and cell_val.strip().isdigit()):
-                    first_data_row = row
-                    break
-        
+        # Get ALL data rows (first_data_row was already calculated above)
         rows = []
         for row_idx in range(first_data_row, actual_max_row + 1):
             row_data = []
@@ -1013,6 +1127,349 @@ async def download_modified_excel(request: DownloadModifiedRequest):
             status_code=500,
             detail=f"Failed to create modified Excel: {str(e)}",
         )
+
+
+# ============================================================================
+# Geocoding Endpoints
+# ============================================================================
+
+async def process_geocoding(geocode_task_id: str, addresses: list, region_hint: str):
+    """Background task for geocoding addresses."""
+    try:
+        geocode_tasks[geocode_task_id]["status"] = "geocoding"
+
+        service = GeocodingService()
+
+        def progress_callback(current, total, message, success_count, failed_count):
+            geocode_tasks[geocode_task_id].update({
+                "current": current,
+                "total": total,
+                "message": message,
+                "success_count": success_count,
+                "failed_count": failed_count,
+            })
+
+        def cancel_check():
+            return geocode_tasks.get(geocode_task_id, {}).get("cancelled", False)
+
+        results = await service.geocode_batch(
+            addresses,
+            region_hint=region_hint,
+            progress_callback=progress_callback,
+            cancel_check=cancel_check,
+        )
+
+        # Store results
+        geocode_tasks[geocode_task_id]["results"] = [
+            {
+                "row_index": r.row_index,
+                "latitude": r.latitude,
+                "longitude": r.longitude,
+                "status": r.status,
+                "error": r.error,
+            }
+            for r in results
+        ]
+        geocode_tasks[geocode_task_id]["status"] = "completed"
+        geocode_tasks[geocode_task_id]["message"] = "Geocoding completed"
+
+        logger.info(f"Geocoding completed for task {geocode_task_id}")
+
+    except Exception as e:
+        logger.error(f"Geocoding failed for task {geocode_task_id}: {e}", exc_info=True)
+        geocode_tasks[geocode_task_id]["status"] = "failed"
+        geocode_tasks[geocode_task_id]["error"] = str(e)
+        geocode_tasks[geocode_task_id]["message"] = f"Geocoding failed: {str(e)}"
+
+
+@app.post("/api/geocode/start", response_model=GeocodeStartResponse)
+async def start_geocoding(
+    request: GeocodeRequest,
+    background_tasks: BackgroundTasks,
+):
+    """
+    Start geocoding addresses from a converted Excel file.
+
+    Reads addresses from the specified column and starts geocoding in the background.
+    Use /api/geocode/progress/{geocode_task_id} to track progress via SSE.
+    """
+    # Validate task exists and is completed
+    if request.task_id not in tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    task = tasks[request.task_id]
+
+    if task.status != "completed":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Task not completed. Current status: {task.status}",
+        )
+
+    if not task.output_file or not Path(task.output_file).exists():
+        raise HTTPException(status_code=404, detail="Output file not found")
+
+    try:
+        import openpyxl
+
+        # Read Excel file to get headers and rows
+        wb = openpyxl.load_workbook(task.output_file, data_only=True)
+        ws = wb.active
+
+        # Find data range (similar logic to get_full_preview)
+        actual_max_row = ws.max_row if ws.max_row else 0
+        actual_max_col = ws.max_column if ws.max_column else 0
+
+        # Scan to find actual data boundaries
+        last_data_row = actual_max_row
+        for row in range(1, min(actual_max_row + 100, 2000)):
+            for col in range(1, min(actual_max_col + 100, 200)):
+                cell = ws.cell(row, col)
+                if cell.value is not None and str(cell.value).strip():
+                    actual_max_row = max(actual_max_row, row)
+                    actual_max_col = max(actual_max_col, col)
+                    last_data_row = row
+            if row > last_data_row + 50:
+                break
+
+        # Find data start row
+        data_start_row = 1
+        for row in range(1, min(20, actual_max_row + 1)):
+            cell_value = ws.cell(row, 1).value
+            if cell_value and str(cell_value).strip():
+                non_empty_count = sum(
+                    1 for col in range(1, min(actual_max_col + 1, 20))
+                    if ws.cell(row, col).value and str(ws.cell(row, col).value).strip()
+                )
+                if non_empty_count >= 2:
+                    data_start_row = row
+                    break
+
+        # Find first data row
+        first_data_row = data_start_row + 1
+        for row in range(data_start_row + 1, min(data_start_row + 10, actual_max_row + 1)):
+            cell_val = ws.cell(row, 1).value
+            if cell_val is not None:
+                if isinstance(cell_val, (int, float)) or (isinstance(cell_val, str) and cell_val.strip().isdigit()):
+                    first_data_row = row
+                    break
+
+        num_header_rows = first_data_row - data_start_row
+
+        # Get headers
+        headers = []
+        for col in range(1, actual_max_col + 1):
+            header_parts = []
+            for header_row in range(data_start_row, data_start_row + num_header_rows):
+                value = ws.cell(header_row, col).value
+                if value is not None and str(value).strip():
+                    header_parts.append(str(value).strip())
+            if header_parts:
+                headers.append(header_parts[-1] if len(header_parts) == 1 else " - ".join(header_parts[-2:]))
+            else:
+                headers.append(f"Column {col}")
+
+        # Get rows
+        rows = []
+        for row_idx in range(first_data_row, actual_max_row + 1):
+            row_data = []
+            for col in range(1, actual_max_col + 1):
+                value = ws.cell(row_idx, col).value
+                row_data.append(value)
+            rows.append(row_data)
+
+        wb.close()
+
+        # Extract addresses from specified column
+        addresses = extract_addresses_from_column(headers, rows, request.address_column)
+
+        if not addresses:
+            raise HTTPException(
+                status_code=400,
+                detail=f"No addresses found in column '{request.address_column}'",
+            )
+
+        # Generate geocode task ID
+        geocode_task_id = str(uuid.uuid4())
+
+        # Initialize geocode task
+        geocode_tasks[geocode_task_id] = {
+            "status": "pending",
+            "current": 0,
+            "total": len(addresses),
+            "message": "Starting geocoding...",
+            "success_count": 0,
+            "failed_count": 0,
+            "results": [],
+            "cancelled": False,
+            "created_at": datetime.utcnow(),
+        }
+
+        # Start background geocoding
+        background_tasks.add_task(
+            process_geocoding,
+            geocode_task_id,
+            addresses,
+            request.region_hint,
+        )
+
+        logger.info(f"Started geocoding task {geocode_task_id} with {len(addresses)} addresses")
+
+        return GeocodeStartResponse(
+            geocode_task_id=geocode_task_id,
+            total_addresses=len(addresses),
+            message=f"Geocoding started for {len(addresses)} addresses",
+        )
+
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Failed to start geocoding: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to start geocoding: {str(e)}",
+        )
+
+
+@app.get("/api/geocode/progress/{geocode_task_id}")
+async def geocode_progress_stream(geocode_task_id: str):
+    """
+    Server-Sent Events endpoint for real-time geocoding progress updates.
+
+    Connect to this endpoint to receive live progress updates during geocoding.
+    """
+    if geocode_task_id not in geocode_tasks:
+        raise HTTPException(status_code=404, detail="Geocoding task not found")
+
+    async def event_generator():
+        last_current = -1
+        while True:
+            if geocode_task_id in geocode_tasks:
+                task = geocode_tasks[geocode_task_id]
+
+                # Only send update if progress changed
+                if task["current"] != last_current or task["status"] in ["completed", "failed", "cancelled"]:
+                    last_current = task["current"]
+                    event = GeocodeProgressEvent(
+                        current=task["current"],
+                        total=task["total"],
+                        status=task["status"],
+                        message=task["message"],
+                        success_count=task["success_count"],
+                        failed_count=task["failed_count"],
+                    )
+                    yield {
+                        "event": "progress",
+                        "data": json.dumps(event.model_dump()),
+                    }
+
+                # Stop streaming when complete or failed
+                if task["status"] in ["completed", "failed", "cancelled"]:
+                    break
+
+            await asyncio.sleep(0.3)
+
+    return EventSourceResponse(event_generator())
+
+
+@app.post("/api/geocode/cancel/{geocode_task_id}")
+async def cancel_geocoding(geocode_task_id: str):
+    """Cancel an ongoing geocoding operation."""
+    if geocode_task_id not in geocode_tasks:
+        raise HTTPException(status_code=404, detail="Geocoding task not found")
+
+    geocode_tasks[geocode_task_id]["cancelled"] = True
+    geocode_tasks[geocode_task_id]["status"] = "cancelled"
+    geocode_tasks[geocode_task_id]["message"] = "Geocoding cancelled by user"
+
+    return {"message": "Geocoding cancelled"}
+
+
+@app.post("/api/geocode/apply", response_model=GeocodeApplyResponse)
+async def apply_geocoding(request: GeocodeApplyRequest):
+    """
+    Apply geocoding results to spreadsheet data.
+
+    Adds Latitude and Longitude columns to the provided headers and rows
+    using the results from a completed geocoding operation.
+    """
+    if request.geocode_task_id not in geocode_tasks:
+        raise HTTPException(status_code=404, detail="Geocoding task not found")
+
+    geocode_task = geocode_tasks[request.geocode_task_id]
+
+    if geocode_task["status"] not in ["completed", "cancelled"]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Geocoding not completed. Current status: {geocode_task['status']}",
+        )
+
+    try:
+        results = geocode_task.get("results", [])
+
+        # Create a mapping of row_index to coordinates
+        coords_map = {
+            r["row_index"]: (r["latitude"], r["longitude"], r["status"])
+            for r in results
+        }
+
+        # Add new headers
+        new_headers = request.headers + ["Latitude", "Longitude"]
+
+        # Add coordinates to each row
+        new_rows = []
+        successful = 0
+        failed = 0
+
+        for row_idx, row in enumerate(request.rows):
+            coords = coords_map.get(row_idx)
+            if coords:
+                lat, lng, status = coords
+                new_row = list(row) + [lat, lng]
+                if status == "success":
+                    successful += 1
+                else:
+                    failed += 1
+            else:
+                # No geocoding result for this row
+                new_row = list(row) + [None, None]
+                failed += 1
+            new_rows.append(new_row)
+
+        logger.info(
+            f"Applied geocoding results: {successful} successful, {failed} failed"
+        )
+
+        return GeocodeApplyResponse(
+            headers=new_headers,
+            rows=new_rows,
+            total_geocoded=len(results),
+            successful=successful,
+            failed=failed,
+        )
+
+    except Exception as e:
+        logger.error(f"Failed to apply geocoding: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to apply geocoding: {str(e)}",
+        )
+
+
+@app.get("/api/geocode/status/{geocode_task_id}")
+async def get_geocode_status(geocode_task_id: str):
+    """Get the current status of a geocoding task."""
+    if geocode_task_id not in geocode_tasks:
+        raise HTTPException(status_code=404, detail="Geocoding task not found")
+
+    task = geocode_tasks[geocode_task_id]
+    return {
+        "status": task["status"],
+        "current": task["current"],
+        "total": task["total"],
+        "message": task["message"],
+        "success_count": task["success_count"],
+        "failed_count": task["failed_count"],
+    }
 
 
 # Startup event for cleanup task

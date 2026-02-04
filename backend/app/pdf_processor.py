@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import os
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
@@ -281,7 +282,12 @@ class PDFProcessor:
 
                     # FIRST PAGE: Extract headers and data rows
                     if page_num == 1:
-                        headers, data_rows = self._split_table(table)
+                        # Try AI-powered header extraction first
+                        headers, data_rows = self._split_table_with_ai(page, table)
+                        if not headers:
+                            # Fallback to regular extraction
+                            headers, data_rows = self._split_table(table)
+                        
                         if headers:
                             first_page_headers = headers  # Store headers from first page
                             logger.info(f"Page 1: Extracted headers: {len(headers)} columns")
@@ -320,37 +326,88 @@ class PDFProcessor:
         logger.info(f"Extracted {len(all_tables)} tables from {total_pages} pages")
         return all_tables
 
+    def _is_column_number_row(self, row: List[str]) -> bool:
+        """
+        Check if a row is a column number indicator row (e.g., 1, 2, 3, 4, 5).
+
+        These rows appear at the top of PDF pages as column number markers
+        and should be skipped during extraction.
+
+        Args:
+            row: Cleaned row data
+
+        Returns:
+            True if this is a column number row
+        """
+        if not row:
+            return False
+
+        # Get non-empty cells
+        non_empty = [cell.strip() for cell in row if cell and cell.strip()]
+
+        if len(non_empty) < 3:
+            return False
+
+        # Check if cells are sequential small integers starting from 1
+        # Pattern: 1, 2, 3, 4, 5 or similar
+        try:
+            numbers = []
+            for cell in non_empty:
+                # Try to parse as integer
+                num = int(cell)
+                numbers.append(num)
+
+            # Check if they form a sequential pattern starting from 1 or 2
+            if len(numbers) >= 3:
+                # Check if it's a sequence like 1,2,3,4,5 or 2,3,4,5
+                is_sequential = all(
+                    numbers[i] == numbers[i-1] + 1
+                    for i in range(1, len(numbers))
+                )
+                # Must start with a small number (1-5) and be sequential
+                if is_sequential and numbers[0] <= 5 and numbers[-1] <= 20:
+                    logger.debug(f"Detected column number row: {non_empty[:5]}")
+                    return True
+        except (ValueError, TypeError):
+            pass
+
+        return False
+
     def _extract_data_rows_only(
-        self, 
-        table: List[List], 
+        self,
+        table: List[List],
         expected_headers: List[str]
     ) -> List[List[str]]:
         """
         Extract only data rows from a table, skipping header rows.
-        
+
         This is used for subsequent pages where headers have already been
         extracted from the first page. It identifies and skips header rows
         that appear on each page.
-        
+
         Args:
             table: Raw table data from pdfplumber
             expected_headers: Headers from first page (used for row normalization)
-            
+
         Returns:
             List of data rows (headers skipped)
         """
         if not table or len(table) < 2:
             return []
-        
+
         data_rows = []
-        
+
         for row in table:
             cleaned_row = [self._clean_cell(cell) for cell in row]
-            
+
             # Skip completely empty rows
             if not any(cell.strip() for cell in cleaned_row if cell):
                 continue
-            
+
+            # Skip column number indicator rows (e.g., 1, 2, 3, 4, 5)
+            if self._is_column_number_row(cleaned_row):
+                continue
+
             # Check if this looks like a header row
             # First check: if first cell is numeric, it's likely a data row
             first_cell = cleaned_row[0].strip() if cleaned_row and cleaned_row[0] else ""
@@ -433,8 +490,17 @@ class PDFProcessor:
         if not table or len(table) < 2:
             return [], []
 
-        # Detect header rows (typically 2-4 rows at the top)
-        # Headers are rows with mostly text, not numbers
+        # Header keywords that indicate a header row
+        HEADER_KEYWORDS = [
+            "sl.", "sl ", "serial", "no.", "number",
+            "polling", "station", "location", "building",
+            "area", "areas", "type", "voter", "voters",
+            "candidate", "party", "abbreviation",
+            "valid", "votes", "total", "rejected", "tendered",
+            "nota"
+        ]
+        
+        # Detect header rows (typically 1-3 rows at the top)
         header_rows = []
         data_start_idx = 0
         
@@ -447,21 +513,48 @@ class PDFProcessor:
             
             if not non_empty:
                 continue
+
+            # Skip column number indicator rows (e.g., 1, 2, 3, 4, 5)
+            if self._is_column_number_row(cleaned_row):
+                data_start_idx = idx + 1
+                continue
+
+            # Check if first cell is numeric - if so, it's definitely a data row
+            first_cell = cleaned_row[0].strip() if cleaned_row and cleaned_row[0] else ""
+            if first_cell and self._is_numeric_string(first_cell):
+                # First cell is numeric, this is a data row, not a header
+                break
             
-            # Check if this looks like a header row
-            # Headers typically have more text than numbers
+            # Check for header keywords in the row
+            row_text = " ".join(str(cell).lower() for cell in cleaned_row if cell).lower()
+            has_header_keywords = any(keyword in row_text for keyword in HEADER_KEYWORDS)
+            
+            # Count numeric vs text cells
             numeric_count = sum(1 for cell in non_empty if self._is_numeric_string(cell))
             text_count = len(non_empty) - numeric_count
+            text_ratio = text_count / len(non_empty) if non_empty else 0
             
-            # If mostly text (at least 60% text), it's likely a header row
-            if len(non_empty) > 0 and text_count / len(non_empty) >= 0.6:
+            # Row is a header if:
+            # 1. It has header keywords, OR
+            # 2. It has high text ratio (80%+) AND no numeric values in first column
+            is_header = False
+            if has_header_keywords:
+                is_header = True
+            elif text_ratio >= 0.8 and numeric_count == 0:
+                # Very high text ratio with no numbers - likely header
+                is_header = True
+            elif idx == 0 and text_ratio >= 0.7:
+                # First row with high text ratio - likely header
+                is_header = True
+            
+            if is_header:
                 header_rows.append(cleaned_row)
                 data_start_idx = idx + 1
             else:
                 # Found first data row
                 break
         
-        # If no header rows detected, use first row as headers
+        # If no header rows detected, use first row as headers (fallback)
         if not header_rows:
             header_rows = [[self._clean_cell(cell) for cell in table[0]]]
             data_start_idx = 1
@@ -469,12 +562,19 @@ class PDFProcessor:
         # Combine multi-row headers intelligently
         headers = self._combine_header_rows(header_rows)
         
+        # Log detected headers for debugging
+        logger.info(f"Detected {len(header_rows)} header row(s), data starts at row {data_start_idx + 1}")
+        logger.debug(f"Headers: {headers[:5]}...")  # Log first 5 headers
+        
         # Extract data rows
         data_rows = []
         for row in table[data_start_idx:]:
             cleaned_row = [self._clean_cell(cell) for cell in row]
             # Skip completely empty rows
             if any(cell.strip() for cell in cleaned_row if cell):
+                # Skip column number indicator rows (e.g., 1, 2, 3, 4, 5)
+                if self._is_column_number_row(cleaned_row):
+                    continue
                 # Skip duplicate header rows (headers that appear again mid-table)
                 if self._is_duplicate_header(cleaned_row, header_rows):
                     continue
@@ -485,7 +585,73 @@ class PDFProcessor:
                     cleaned_row = cleaned_row[:len(headers)]
                 data_rows.append(cleaned_row)
 
+        logger.info(f"Extracted {len(data_rows)} data rows with {len(headers)} columns")
         return headers, data_rows
+    
+    def _split_table_with_ai(self, page, table: List[List]) -> tuple[List[str], List[List[str]]]:
+        """
+        Split table into headers and data rows using AI-powered extraction.
+        
+        Args:
+            page: pdfplumber page object (for text extraction)
+            table: Raw table data from pdfplumber
+            
+        Returns:
+            Tuple of (headers, data_rows)
+        """
+        if not table or len(table) < 2:
+            return [], []
+        
+        # Check if Claude AI is available
+        try:
+            from .claude_processor import ClaudeProcessor
+            
+            api_key = os.getenv("ANTHROPIC_API_KEY")
+            if not api_key:
+                logger.info("ANTHROPIC_API_KEY not set, using regular header extraction")
+                return self._split_table(table)
+            
+            # Initialize Claude processor
+            claude = ClaudeProcessor(api_key=api_key)
+            
+            if not claude.enabled:
+                logger.info("Claude AI not enabled, using regular header extraction")
+                return self._split_table(table)
+            
+            # Extract page text for context
+            page_text = page.extract_text() or ""
+            
+            # Use AI to extract headers
+            headers, data_start_idx, confidence = claude.extract_headers_with_ai(page_text, table)
+            
+            if headers and confidence > 0.5:
+                logger.info(f"AI extracted headers with confidence {confidence:.2f}")
+                
+                # Extract data rows starting from data_start_idx
+                data_rows = []
+                for row in table[data_start_idx:]:
+                    cleaned_row = [self._clean_cell(cell) for cell in row]
+                    # Skip completely empty rows
+                    if any(cell.strip() for cell in cleaned_row if cell):
+                        # Skip column number indicator rows (e.g., 1, 2, 3, 4, 5)
+                        if self._is_column_number_row(cleaned_row):
+                            continue
+                        # Normalize row length to match headers
+                        if len(cleaned_row) < len(headers):
+                            cleaned_row.extend([""] * (len(headers) - len(cleaned_row)))
+                        elif len(cleaned_row) > len(headers):
+                            cleaned_row = cleaned_row[:len(headers)]
+                        data_rows.append(cleaned_row)
+                
+                logger.info(f"AI extraction: {len(headers)} headers, {len(data_rows)} data rows")
+                return headers, data_rows
+            else:
+                logger.warning(f"AI header extraction low confidence ({confidence:.2f}), falling back to regular extraction")
+                return self._split_table(table)
+                
+        except Exception as e:
+            logger.warning(f"AI header extraction failed: {e}, falling back to regular extraction")
+            return self._split_table(table)
     
     def _combine_header_rows(self, header_rows: List[List[str]]) -> List[str]:
         """
@@ -747,12 +913,158 @@ class PDFProcessor:
                     all_rows.append(normalized_row)
 
         logger.info(f"Merged {len(tables)} tables into single table: {len(all_rows)} rows, {len(headers)} columns")
-        
+
+        # Remove duplicate sequential number columns (e.g., PS No. and Sl.No with same values)
+        headers, all_rows = self._remove_duplicate_serial_columns(headers, all_rows)
+
         return TableData(
             headers=headers,
             rows=all_rows,
             page_number=1,  # Merged table
         )
+
+    def _remove_duplicate_serial_columns(
+        self, headers: List[str], rows: List[List[str]]
+    ) -> tuple[List[str], List[List[str]]]:
+        """
+        Remove duplicate sequential number columns from the table.
+
+        Some PDFs have duplicate serial number columns (e.g., 'PS No.' and 'Sl.No')
+        that contain identical sequential values. This method detects and removes
+        such duplicates.
+
+        Args:
+            headers: List of column headers
+            rows: List of data rows
+
+        Returns:
+            Tuple of (cleaned_headers, cleaned_rows) with duplicates removed
+        """
+        if len(headers) < 2 or len(rows) < 3:
+            return headers, rows
+
+        columns_to_remove = set()
+
+        # Check consecutive column pairs for duplicate sequential patterns
+        for col_idx in range(len(headers) - 1):
+            if col_idx in columns_to_remove:
+                continue
+
+            # Get values from both columns
+            col1_values = [row[col_idx] if col_idx < len(row) else "" for row in rows[:20]]
+            col2_values = [row[col_idx + 1] if col_idx + 1 < len(row) else "" for row in rows[:20]]
+
+            # Check if both columns have sequential numbers
+            if self._is_sequential_number_column(col1_values) and self._is_sequential_number_column(col2_values):
+                # Check if values are identical or nearly identical
+                if self._columns_have_identical_values(col1_values, col2_values):
+                    header1 = headers[col_idx].upper() if headers[col_idx] else ""
+                    header2 = headers[col_idx + 1].upper() if headers[col_idx + 1] else ""
+
+                    # Only remove if BOTH headers are serial number type columns
+                    # DO NOT remove columns with meaningful names like "Polling Station No."
+                    meaningful_keywords = ["POLLING", "STATION", "LOCATION", "BOOTH", "BUILDING", "AREA"]
+                    serial_keywords = ["SL.", "SL ", "SERIAL", "S.NO", "PS NO", "P.S.", "PS."]
+
+                    # Check if either header has meaningful content (not just serial numbers)
+                    header1_is_meaningful = any(kw in header1 for kw in meaningful_keywords)
+                    header2_is_meaningful = any(kw in header2 for kw in meaningful_keywords)
+
+                    # If either column has meaningful header, don't remove it
+                    if header1_is_meaningful or header2_is_meaningful:
+                        logger.debug(f"Keeping both columns - meaningful headers: '{headers[col_idx]}', '{headers[col_idx + 1]}'")
+                        continue
+
+                    # Both are serial-type columns - check which to remove
+                    header1_is_serial = any(kw in header1 for kw in serial_keywords)
+                    header2_is_serial = any(kw in header2 for kw in serial_keywords)
+
+                    # Only remove if both are serial-type columns
+                    if header1_is_serial and header2_is_serial:
+                        # Prefer keeping "Sl.No" over "PS No."
+                        if "SL" in header2 and "PS" in header1:
+                            columns_to_remove.add(col_idx)
+                            logger.info(f"Removing duplicate column '{headers[col_idx]}' (keeping '{headers[col_idx + 1]}')")
+                        elif "SL" in header1 and "PS" in header2:
+                            columns_to_remove.add(col_idx + 1)
+                            logger.info(f"Removing duplicate column '{headers[col_idx + 1]}' (keeping '{headers[col_idx]}')")
+                        else:
+                            # Default: remove the first one
+                            columns_to_remove.add(col_idx)
+                            logger.info(f"Removing duplicate sequential column '{headers[col_idx]}'")
+
+        if not columns_to_remove:
+            return headers, rows
+
+        # Build new headers and rows without the duplicate columns
+        new_headers = [h for i, h in enumerate(headers) if i not in columns_to_remove]
+        new_rows = []
+        for row in rows:
+            new_row = [val for i, val in enumerate(row) if i not in columns_to_remove]
+            new_rows.append(new_row)
+
+        logger.info(f"Removed {len(columns_to_remove)} duplicate column(s)")
+        return new_headers, new_rows
+
+    def _is_sequential_number_column(self, values: List[str]) -> bool:
+        """
+        Check if column values form a sequential number pattern.
+
+        Args:
+            values: List of column values
+
+        Returns:
+            True if values are sequential numbers (1, 2, 3, ...)
+        """
+        numbers = []
+        for val in values:
+            if val and str(val).strip():
+                try:
+                    num = int(str(val).strip())
+                    numbers.append(num)
+                except (ValueError, TypeError):
+                    # If any non-numeric value, not a sequential number column
+                    if len(numbers) < 3:
+                        return False
+
+        if len(numbers) < 3:
+            return False
+
+        # Check if mostly sequential (allowing some gaps)
+        sequential_count = sum(
+            1 for i in range(1, len(numbers))
+            if numbers[i] == numbers[i-1] + 1 or numbers[i] == numbers[i-1]
+        )
+
+        return sequential_count >= len(numbers) * 0.7
+
+    def _columns_have_identical_values(self, col1: List[str], col2: List[str]) -> bool:
+        """
+        Check if two columns have identical or nearly identical values.
+
+        Args:
+            col1: First column values
+            col2: Second column values
+
+        Returns:
+            True if columns have identical values
+        """
+        matches = 0
+        comparisons = 0
+
+        for v1, v2 in zip(col1, col2):
+            v1_clean = str(v1).strip() if v1 else ""
+            v2_clean = str(v2).strip() if v2 else ""
+
+            if v1_clean or v2_clean:
+                comparisons += 1
+                if v1_clean == v2_clean:
+                    matches += 1
+
+        if comparisons < 3:
+            return False
+
+        return matches / comparisons >= 0.8
 
     def get_page_count(self) -> int:
         """Get the number of pages in the PDF."""

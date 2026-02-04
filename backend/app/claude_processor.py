@@ -274,6 +274,164 @@ Important:
                 return mapping, 0.0
             return {}, 0.0
 
+    def extract_headers_with_ai(
+        self,
+        page_text: str,
+        raw_table: List[List[str]],
+    ) -> Tuple[List[str], int, float]:
+        """
+        Use Claude AI to identify column headers from raw table data.
+        
+        This method analyzes the first page of a PDF table and uses AI to:
+        1. Identify which rows are headers vs data rows
+        2. Extract the exact column header names
+        3. Determine where data rows start
+        
+        Args:
+            page_text: Raw text extracted from the first page
+            raw_table: Raw table data from pdfplumber (all rows including potential headers)
+            
+        Returns:
+            Tuple of (headers_list, data_start_row_index, confidence_score)
+        """
+        if not self.enabled or not raw_table or len(raw_table) < 2:
+            # Fallback: use first row as headers
+            if raw_table:
+                headers = [self._clean_cell(cell) for cell in raw_table[0]]
+                return headers, 1, 0.0
+            return [], 0, 0.0
+        
+        try:
+            # Prepare table preview (first 10 rows)
+            table_preview = []
+            for idx, row in enumerate(raw_table[:10]):
+                cleaned_row = [self._clean_cell(cell) for cell in row]
+                table_preview.append({
+                    "row_index": idx,
+                    "cells": cleaned_row
+                })
+            
+            # Create prompt for Claude
+            prompt = f"""You are analyzing a PDF table to identify the column headers. The table may have:
+- Title rows at the top
+- Header rows with column names
+- Data rows starting with numbers or actual data
+
+Raw table data (first 10 rows):
+{json.dumps(table_preview, indent=2)}
+
+Page text context (first 1000 characters):
+{page_text[:1000]}
+
+Your task:
+1. Identify which row(s) contain the ACTUAL column headers (not data rows)
+2. Extract the exact column header names as they appear in the PDF
+3. Determine the row index where data rows start (after headers)
+
+CRITICAL RULES:
+- Headers are typically rows with descriptive text like "Sl.No", "Polling Station No.", "Location", etc.
+- Data rows usually start with numbers (like "1", "2", "3") in the first column
+- If the first row starts with a number, it's likely a data row, NOT a header
+- Headers may span multiple rows (e.g., one row with "No. of valid votes" and another with candidate names)
+- Preserve the EXACT header text from the PDF - do NOT modify, translate, or abbreviate
+- If headers span multiple rows, combine them intelligently (e.g., "Candidate Name" + "Party" = "Candidate Name (Party)")
+
+Return ONLY valid JSON in this exact format (no markdown, no explanations):
+{{
+  "header_row_indices": [0, 1],  // List of row indices that are headers (0-based)
+  "headers": ["Sl.No", "Polling Station No.", "Location", ...],  // Final combined header names
+  "data_start_row": 2,  // Row index where data starts (0-based)
+  "confidence": 0.95,  // Confidence score 0.0-1.0
+  "reasoning": "Brief explanation of why these are headers"
+}}
+
+Important:
+- header_row_indices: List of 0-based indices of rows that contain headers
+- headers: Final list of column header names (one per column)
+- data_start_row: 0-based index of first data row
+- Return only the JSON object, no additional text or code blocks"""
+            
+            # Call Claude API
+            message = self.client.messages.create(
+                model=self.model,
+                max_tokens=2000,
+                temperature=0.1,  # Low temperature for consistent results
+                messages=[
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    }
+                ],
+            )
+            
+            # Extract JSON from response
+            content = message.content[0].text.strip()
+            
+            # Remove markdown code blocks if present
+            if content.startswith("```"):
+                content = content.split("```")[1]
+                if content.startswith("json"):
+                    content = content[4:]
+                content = content.strip()
+            
+            # Parse JSON response
+            result = json.loads(content)
+            
+            # Extract headers and data start index
+            header_row_indices = result.get("header_row_indices", [0])
+            headers = result.get("headers", [])
+            data_start_row = result.get("data_start_row", len(header_row_indices))
+            confidence = result.get("confidence", 0.8)
+            
+            # Validate headers
+            if not headers:
+                # Fallback: extract from first row
+                if raw_table:
+                    headers = [self._clean_cell(cell) for cell in raw_table[0]]
+                    logger.warning("Claude returned empty headers, using first row as fallback")
+                    return headers, 1, 0.3
+            
+            # Ensure data_start_row is valid
+            if data_start_row < len(header_row_indices):
+                data_start_row = len(header_row_indices)
+            
+            logger.info(
+                f"Claude extracted {len(headers)} headers from rows {header_row_indices}, "
+                f"data starts at row {data_start_row} (confidence: {confidence:.2f})"
+            )
+            logger.debug(f"Headers: {headers}")
+            
+            return headers, data_start_row, confidence
+            
+        except (AnthropicError, json.JSONDecodeError, ValueError) as e:
+            logger.error(f"Error during AI header extraction: {e}")
+            # Fallback: use first row as headers
+            if raw_table:
+                headers = [self._clean_cell(cell) for cell in raw_table[0]]
+                return headers, 1, 0.0
+            return [], 0, 0.0
+        except Exception as e:
+            logger.error(f"Unexpected error during AI header extraction: {e}")
+            # Fallback: use first row as headers
+            if raw_table:
+                headers = [self._clean_cell(cell) for cell in raw_table[0]]
+                return headers, 1, 0.0
+            return [], 0, 0.0
+    
+    def _clean_cell(self, value) -> str:
+        """Clean a cell value."""
+        if value is None:
+            return ""
+        text = str(value).strip()
+        # Remove null bytes and control characters
+        text = text.replace("\x00", "")
+        text = "".join(char for char in text if ord(char) >= 32 or char in "\n\t")
+        # Replace newlines with spaces
+        text = text.replace("\n", " ").replace("\r", " ")
+        # Normalize whitespace
+        text = " ".join(text.split())
+        return text.strip()
+
     def analyze_table_structure(
         self,
         page_text: str,

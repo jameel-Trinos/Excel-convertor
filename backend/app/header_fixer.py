@@ -45,6 +45,9 @@ class HeaderFixer:
         - Word-by-word reversal (for Tamil party names)
         - Party name specific fixes
 
+        IMPORTANT: This function is now more conservative - it only fixes text
+        if it's CLEARLY reversed, not if it looks correct.
+
         Args:
             text: Potentially reversed text
 
@@ -56,6 +59,27 @@ class HeaderFixer:
 
         original = text.strip()
         
+        # First, check if text already starts with known correct patterns
+        # If it does, it's likely already correct - don't modify it
+        for pattern in HeaderFixer.KNOWN_CORRECT_STARTS:
+            if original.upper().startswith(pattern.upper()):
+                return original  # Already correct, don't touch it
+        
+        # Check for common correct patterns in the text (not just at start)
+        # This helps identify headers like "PS No." or "Polling Station No."
+        common_correct_patterns = [
+            "PS", "No.", "NO.", "Station", "Polling", "Location", "Building",
+            "Area", "Type", "Sl.", "Serial", "Voter", "Voters"
+        ]
+        for pattern in common_correct_patterns:
+            if pattern.upper() in original.upper():
+                # Text contains correct patterns, likely already correct
+                # Only proceed if we find clear evidence of reversal
+                break
+        else:
+            # No common correct patterns found, might be reversed
+            pass
+        
         # First, check if this is a party name and fix it using party-specific logic
         if PartyNameFixer.is_likely_party_name(original):
             fixed_party = PartyNameFixer.fix_reversed_party_name(original)
@@ -63,48 +87,63 @@ class HeaderFixer:
                 logger.debug(f"Fixed party name: '{original}' -> '{fixed_party}'")
                 return fixed_party
         
-        # Check if text matches known reversed patterns
+        # Check if text matches known reversed patterns (definitive evidence)
         for pattern in HeaderFixer.KNOWN_REVERSED_PATTERNS:
             if pattern.lower() in original.lower():
                 # Definitely reversed, fix it
+                logger.debug(f"Fixed reversed text (known pattern): '{original}' -> '{original[::-1]}'")
                 return original[::-1]
         
-        # Check if text already starts with known correct patterns
-        for pattern in HeaderFixer.KNOWN_CORRECT_STARTS:
-            if original.upper().startswith(pattern.upper()):
-                return original  # Already correct
-        
         # Try word-by-word reversal for longer text (likely party names or multi-word headers)
+        # But only if original doesn't look natural
         if len(original) > 10 and ' ' in original:
-            word_fixed = HeaderFixer._fix_word_reversed_text(original)
-            if word_fixed != original:
-                # Verify the word-fixed version is better
-                original_score = HeaderFixer._english_score(original)
-                word_fixed_score = HeaderFixer._english_score(word_fixed)
-                if word_fixed_score > original_score:
-                    logger.debug(f"Fixed word-reversed text: '{original}' -> '{word_fixed}'")
-                    return word_fixed
+            original_score = HeaderFixer._english_score(original)
+            # Only try fixing if original score is very low (likely reversed)
+            if original_score < 2:
+                word_fixed = HeaderFixer._fix_word_reversed_text(original)
+                if word_fixed != original:
+                    word_fixed_score = HeaderFixer._english_score(word_fixed)
+                    # Only use if significantly better
+                    if word_fixed_score > original_score + 2:
+                        logger.debug(f"Fixed word-reversed text: '{original}' -> '{word_fixed}'")
+                        return word_fixed
         
         # Heuristic checks for character-level reversed text
+        # Only apply if original doesn't look natural
+        original_score = HeaderFixer._english_score(original)
+        if original_score >= 2:
+            # Original looks natural, don't reverse it
+            return original
+        
         reversed_text = original[::-1]
         
         # Check 1: Does it start with punctuation but reversed version doesn't?
         if original[0] in ".," and reversed_text[0] not in ".,":
             if HeaderFixer._looks_natural(reversed_text):
-                return reversed_text
+                reversed_score = HeaderFixer._english_score(reversed_text)
+                # Only use if significantly better
+                if reversed_score > original_score + 2:
+                    logger.debug(f"Fixed reversed text (punctuation check): '{original}' -> '{reversed_text}'")
+                    return reversed_text
         
         # Check 2: Does reversed version start with known patterns?
         for pattern in HeaderFixer.KNOWN_CORRECT_STARTS:
             if reversed_text.upper().startswith(pattern.upper()):
-                return reversed_text
+                reversed_score = HeaderFixer._english_score(reversed_text)
+                # Only use if significantly better
+                if reversed_score > original_score + 2:
+                    logger.debug(f"Fixed reversed text (pattern match): '{original}' -> '{reversed_text}'")
+                    return reversed_text
         
         # Check 3: Count common English word patterns
-        original_score = HeaderFixer._english_score(original)
         reversed_score = HeaderFixer._english_score(reversed_text)
         
-        if reversed_score > original_score and reversed_score >= 2:
+        # Only reverse if reversed version is SIGNIFICANTLY better
+        if reversed_score > original_score + 3 and reversed_score >= 3:
+            logger.debug(f"Fixed reversed text (score check): '{original}' -> '{reversed_text}'")
             return reversed_text
 
+        # Default: keep original (it's likely correct)
         return original
     
     @staticmethod

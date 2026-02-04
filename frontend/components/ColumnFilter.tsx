@@ -10,7 +10,7 @@ import {
   DialogFooter,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
-import { Loader2, Columns, CheckSquare, Square, Search } from "lucide-react";
+import { Loader2, X, Download, Info } from "lucide-react";
 import { filterExcel } from "@/lib/api";
 import { matchPartyLabel } from "@/lib/partyHeaderMapper";
 
@@ -22,7 +22,27 @@ interface ColumnFilterProps {
   filename: string;
 }
 
-// Party label mapping (high-precision). If we’re not confident, we keep the original header.
+// Color schemes for different party types
+const PARTY_COLORS: Record<string, { border: string; bg: string; badge: string; badgeText: string }> = {
+  "BJP Votes": { border: "border-blue-200", bg: "bg-blue-50", badge: "bg-blue-100", badgeText: "text-blue-700" },
+  "AIADMK Votes": { border: "border-green-200", bg: "bg-green-50", badge: "bg-green-100", badgeText: "text-green-700" },
+  "BSP Votes": { border: "border-purple-200", bg: "bg-purple-50", badge: "bg-purple-100", badgeText: "text-purple-700" },
+  "NMK Votes": { border: "border-yellow-200", bg: "bg-yellow-50", badge: "bg-yellow-100", badgeText: "text-yellow-700" },
+  "VCK Votes": { border: "border-red-200", bg: "bg-red-50", badge: "bg-red-100", badgeText: "text-red-700" },
+  "NTK Votes": { border: "border-pink-200", bg: "bg-pink-50", badge: "bg-pink-100", badgeText: "text-pink-700" },
+  "IND Votes": { border: "border-gray-200", bg: "bg-gray-50", badge: "bg-gray-100", badgeText: "text-gray-700" },
+  "NOTA Votes": { border: "border-orange-200", bg: "bg-orange-50", badge: "bg-orange-100", badgeText: "text-orange-700" },
+  "DMK Votes": { border: "border-indigo-200", bg: "bg-indigo-50", badge: "bg-indigo-100", badgeText: "text-indigo-700" },
+  "CONGRESS Votes": { border: "border-cyan-200", bg: "bg-cyan-50", badge: "bg-cyan-100", badgeText: "text-cyan-700" },
+  "PMK Votes": { border: "border-lime-200", bg: "bg-lime-50", badge: "bg-lime-100", badgeText: "text-lime-700" },
+  "TOTAL": { border: "border-indigo-200", bg: "bg-indigo-50", badge: "bg-indigo-100", badgeText: "text-indigo-700" },
+  "default": { border: "border-gray-200", bg: "bg-white", badge: "bg-gray-100", badgeText: "text-gray-700" },
+};
+
+// Helper to get color scheme for a party
+function getPartyColors(groupKey: string) {
+  return PARTY_COLORS[groupKey] || PARTY_COLORS.default;
+}
 
 export function ColumnFilter({
   isOpen,
@@ -36,6 +56,8 @@ export function ColumnFilter({
   const [includeOthers, setIncludeOthers] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [showOthersDialog, setShowOthersDialog] = useState(false);
+  const [selectedOthersColumns, setSelectedOthersColumns] = useState<Set<string>>(new Set());
 
   // Initialize all columns as selected by default
   useEffect(() => {
@@ -44,6 +66,8 @@ export function ColumnFilter({
       setSearchQuery("");
       setIncludeOthers(false);
       setError(null);
+      setShowOthersDialog(false);
+      setSelectedOthersColumns(new Set());
     }
   }, [isOpen, columns]);
 
@@ -141,12 +165,31 @@ export function ColumnFilter({
     }
   };
 
+  // Get unselected columns for OTHERS dialog
+  const unselectedColumns = useMemo(() => {
+    return columns.filter(col => !selectedColumns.has(col));
+  }, [columns, selectedColumns]);
+
   const handleSubmit = async () => {
-    if (selectedColumns.size === 0 && !includeOthers) {
+    if (selectedColumns.size === 0) {
       setError("Please select at least one column");
       return;
     }
 
+    // If there are unselected columns, show dialog to ask about OTHERS
+    if (unselectedColumns.length > 0) {
+      // Initialize with all unselected columns selected by default
+      setSelectedOthersColumns(new Set(unselectedColumns));
+      setError(null);
+      setShowOthersDialog(true);
+      return;
+    }
+
+    // If all columns are selected, proceed with normal download
+    await performFilter([]);
+  };
+
+  const performFilter = async (othersColumns: string[]) => {
     setLoading(true);
     setError(null);
 
@@ -162,7 +205,7 @@ export function ColumnFilter({
         }
       }
 
-      await filterExcel(taskId, columnsToInclude, filename, includeOthers, headerOverrides);
+      await filterExcel(taskId, columnsToInclude, filename, othersColumns, headerOverrides);
       onClose();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to filter Excel");
@@ -171,62 +214,94 @@ export function ColumnFilter({
     }
   };
 
+  const handleOthersDialogConfirm = () => {
+    if (selectedOthersColumns.size === 0) {
+      setError("Please select at least one column to include in OTHERS");
+      return;
+    }
+    setShowOthersDialog(false);
+    performFilter(Array.from(selectedOthersColumns));
+  };
+
   const allSelected = selectedColumns.size === columns.length;
   const someSelected = selectedColumns.size > 0 && selectedColumns.size < columns.length;
   const totalColumnsToDownload = selectedColumns.size + (includeOthers ? 1 : 0);
 
   return (
-    <Dialog open={isOpen} onOpenChange={onClose}>
-      <DialogContent className="max-w-2xl max-h-[80vh] overflow-hidden flex flex-col">
-        <DialogHeader>
-          <DialogTitle className="flex items-center gap-2">
-            <Columns className="h-5 w-5" />
-            Filter Columns
-          </DialogTitle>
-          <DialogDescription>
-            Search and select columns to include in the filtered Excel file.
-          </DialogDescription>
-        </DialogHeader>
+    <>
+      {isOpen && (
+        <>
+          {/* Backdrop with blur */}
+          <div
+            className="fixed inset-0 bg-black/50 backdrop-blur-sm z-40"
+            onClick={onClose}
+          />
 
-        <div className="flex-1 overflow-hidden flex flex-col gap-4">
-          {/* Search Box */}
-          <div className="relative">
-            <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-gray-400" />
+          {/* Modal Content */}
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 pointer-events-none">
+            <div className="w-full max-w-lg max-h-[80vh] bg-white rounded-xl shadow-2xl overflow-hidden flex flex-col pointer-events-auto">
+              {/* Header */}
+              <div className="px-4 py-3 border-b border-gray-200 flex items-center justify-between">
+                <div>
+                  <h2 className="text-base font-bold text-gray-900">
+                    Select Columns to Export
+                  </h2>
+                  <p className="text-xs text-gray-600 mt-0.5">
+                    Choose which columns to include in your Excel file
+                  </p>
+                </div>
+                <button
+                  onClick={onClose}
+                  className="text-gray-400 hover:text-gray-600 p-1 hover:bg-gray-100 rounded-lg transition-colors"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              {/* Content */}
+              <div className="flex-1 overflow-hidden flex flex-col gap-3 px-4 py-3">
+                {/* Search Box */}
+                <div className="relative">
+            <svg
+              className="absolute left-2.5 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400"
+              fill="none"
+              stroke="currentColor"
+              viewBox="0 0 24 24"
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth={2}
+                d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"
+              />
+            </svg>
             <input
               type="text"
               placeholder="Search columns or parties..."
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              className="w-full pl-10 pr-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+              className="w-full pl-9 pr-3 py-2 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
             />
           </div>
 
-          {/* Select All / Deselect All */}
-          <div className="border-b pb-3">
+                {/* Select All / Deselect All */}
+                <div className="flex items-center justify-between">
             <button
               onClick={toggleAll}
-              className="flex items-center gap-2 text-sm font-medium text-gray-700 hover:text-gray-900 transition-colors"
+              className="text-xs text-blue-600 hover:text-blue-700 font-medium transition-colors"
             >
-              {allSelected ? (
-                <CheckSquare className="h-5 w-5 text-blue-600" />
-              ) : someSelected ? (
-                <div className="h-5 w-5 border-2 border-blue-600 rounded bg-blue-100 flex items-center justify-center">
-                  <div className="w-2.5 h-0.5 bg-blue-600" />
-                </div>
-              ) : (
-                <Square className="h-5 w-5 text-gray-400" />
-              )}
-              <span>
-                {allSelected ? "Deselect All" : "Select All"} ({selectedColumns.size}/{columns.length} columns)
-              </span>
+              {allSelected ? "Deselect All" : "Select All"}
             </button>
+            <span className="text-xs text-gray-600">
+              <span className="font-semibold text-gray-900">{selectedColumns.size}</span> of {columns.length} selected
+            </span>
           </div>
 
-          {/* Column List */}
-          <div className="flex-1 overflow-auto">
+                {/* Column List */}
+                <div className="flex-1 overflow-auto">
             {filteredGroupKeys.length === 0 ? (
-              <div className="text-center py-8 text-gray-500">
-                <p>No columns match "{searchQuery}"</p>
+              <div className="text-center py-6 text-gray-500">
+                <p className="text-sm">No columns match "{searchQuery}"</p>
               </div>
             ) : (
               <div className="space-y-2">
@@ -242,40 +317,49 @@ export function ColumnFilter({
 
                   // If groupKey is exactly an original column (no match), treat as single-column entry
                   const isSingle = cols.length === 1 && cols[0] === groupKey;
-                  
+                  const colors = getPartyColors(groupKey);
+
+                  // Determine badge type
+                  let badgeText = "Numeric";
+                  let badgeColor = colors.badge + " " + colors.badgeText;
+
+                  if (groupKey.includes("TOTAL")) {
+                    badgeText = "Calculated";
+                    badgeColor = "bg-indigo-100 text-indigo-700";
+                  } else if (!isSingle) {
+                    badgeText = `${cols.length} columns`;
+                    badgeColor = "bg-gray-100 text-gray-700";
+                  }
+
                   return (
                     <label
                       key={groupKey}
-                      className={`flex items-center gap-3 p-3 rounded-lg border-2 cursor-pointer transition-all ${
+                      className={`flex items-start gap-2.5 p-3 rounded-lg border cursor-pointer transition-all ${
                         selected
-                          ? "border-blue-500 bg-blue-50"
-                          : partial
-                          ? "border-blue-300 bg-blue-25"
-                          : "border-gray-200 bg-white hover:border-gray-300 hover:bg-gray-50"
-                      } ${isHighlighted ? "ring-2 ring-yellow-300" : ""}`}
+                          ? `${colors.border} ${colors.bg}`
+                          : `${colors.border} bg-white hover:${colors.bg}`
+                      } ${isHighlighted ? "ring-1 ring-yellow-300" : ""}`}
                     >
                       <input
                         type="checkbox"
                         checked={selected}
                         onChange={() => (isSingle ? toggleColumn(groupKey) : toggleGroup(groupKey))}
-                        className="sr-only"
+                        className="w-4 h-4 text-blue-600 rounded mt-0.5"
                       />
-                      {selected ? (
-                        <CheckSquare className="h-5 w-5 text-blue-600 flex-shrink-0" />
-                      ) : partial ? (
-                        <div className="h-5 w-5 border-2 border-blue-600 rounded bg-blue-100 flex items-center justify-center">
-                          <div className="w-2.5 h-0.5 bg-blue-600" />
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-1.5 mb-0.5">
+                          <h3 className="font-semibold text-gray-900 text-sm truncate">{groupKey}</h3>
+                          <span className={`px-1.5 py-0.5 ${badgeColor} text-xs font-medium rounded flex-shrink-0`}>
+                            {badgeText}
+                          </span>
                         </div>
-                      ) : (
-                        <Square className="h-5 w-5 text-gray-400 flex-shrink-0" />
-                      )}
-                      <div className="flex-1">
-                        <span className={`text-sm font-medium ${selected ? "text-gray-900" : "text-gray-700"}`}>
-                          {groupKey}
-                        </span>
+                        {isSingle && cols[0] !== groupKey && (
+                          <p className="text-xs text-gray-600 truncate">{cols[0]}</p>
+                        )}
                         {!isSingle && cols.length > 1 && (
-                          <p className="text-xs text-gray-500 mt-0.5">
-                            {cols.length} columns (e.g. {group.examples.join(" • ")})
+                          <p className="text-xs text-gray-600 truncate">
+                            {group.examples.slice(0, 2).join(", ")}
+                            {cols.length > 2 && ` +${cols.length - 2} more`}
                           </p>
                         )}
                       </div>
@@ -283,76 +367,291 @@ export function ColumnFilter({
                   );
                 })}
 
-                {/* OTHERS Checkbox */}
-                {selectedColumns.size < columns.length && (
-                  <div className="pt-2 mt-2 border-t">
-                    <label
-                      className={`flex items-center gap-3 p-3 rounded-lg border-2 cursor-pointer transition-all ${
-                        includeOthers
-                          ? "border-green-500 bg-green-50"
-                          : "border-gray-200 bg-white hover:border-gray-300 hover:bg-gray-50"
-                      }`}
-                    >
-                      <input
-                        type="checkbox"
-                        checked={includeOthers}
-                        onChange={() => setIncludeOthers(!includeOthers)}
-                        className="sr-only"
-                      />
-                      {includeOthers ? (
-                        <CheckSquare className="h-5 w-5 text-green-600 flex-shrink-0" />
-                      ) : (
-                        <Square className="h-5 w-5 text-gray-400 flex-shrink-0" />
-                      )}
-                      <div className="flex-1">
-                        <span className={`text-sm font-medium ${includeOthers ? "text-gray-900" : "text-gray-700"}`}>
-                          OTHERS
-                        </span>
-                        <p className="text-xs text-gray-600 mt-1">
-                          Sum of unselected numeric columns
-                        </p>
-                      </div>
-                    </label>
-                  </div>
-                )}
               </div>
             )}
           </div>
 
-          {/* Selected Count */}
-          <div className="text-sm text-gray-600 border-t pt-3">
-            Selected: <strong>{selectedColumns.size}</strong> column{selectedColumns.size !== 1 ? 's' : ''}
-            {includeOthers && <span> + OTHERS</span>}
-          </div>
-
-          {/* Error Message */}
-          {error && (
-            <div className="bg-red-50 border border-red-200 rounded-lg p-3">
-              <p className="text-sm text-red-600">{error}</p>
+                {/* Unselected Info */}
+                {unselectedColumns.length > 0 && (
+                  <div className="p-2.5 bg-blue-50 border border-blue-200 rounded-lg">
+              <div className="flex items-start gap-1.5">
+                <Info className="w-4 h-4 text-blue-600 flex-shrink-0 mt-0.5" />
+                <div className="flex-1">
+                  <p className="text-xs font-medium text-blue-900">
+                    {unselectedColumns.length} unselected column{unselectedColumns.length !== 1 ? 's' : ''}
+                  </p>
+                  <p className="text-xs text-blue-700 mt-0.5">
+                    Sum them into an "OTHERS" column?
+                  </p>
+                </div>
+              </div>
             </div>
           )}
-        </div>
 
-        <DialogFooter className="border-t pt-4">
-          <Button variant="outline" onClick={onClose} disabled={loading}>
-            Cancel
-          </Button>
-          <Button 
-            onClick={handleSubmit} 
-            disabled={loading || (selectedColumns.size === 0 && !includeOthers)}
-          >
-            {loading ? (
-              <>
-                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                Processing...
-              </>
-            ) : (
-              `Apply Filter & Download`
+                {/* Error Message */}
+                {error && (
+                  <div className="bg-red-50 border border-red-200 rounded-lg p-2.5">
+              <div className="flex items-start gap-1.5">
+                <svg
+                  className="w-4 h-4 text-red-600 flex-shrink-0 mt-0.5"
+                  fill="none"
+                  stroke="currentColor"
+                  viewBox="0 0 24 24"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth={2}
+                    d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
+                  />
+                </svg>
+                <p className="text-xs text-red-600">{error}</p>
+              </div>
+            </div>
+          )}
+              </div>
+
+              {/* Footer */}
+              <div className="flex items-center gap-2 px-4 py-3 border-t border-gray-200">
+                <Button
+                  variant="outline"
+                  onClick={onClose}
+                  disabled={loading}
+                  className="px-3 py-2 text-xs h-8"
+                >
+                  Cancel
+                </Button>
+                <Button
+                  onClick={handleSubmit}
+                  disabled={loading || selectedColumns.size === 0}
+                  className="flex-1 px-4 py-2 text-xs h-8 bg-blue-600 text-white hover:bg-blue-700 flex items-center justify-center gap-1.5"
+                >
+                  {loading ? (
+                    <>
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                      Processing...
+                    </>
+                  ) : (
+                    <>
+                      <Download className="h-4 w-4" />
+                      Continue
+                    </>
+                  )}
+                </Button>
+              </div>
+            </div>
+          </div>
+        </>
+      )}
+
+      {/* OTHERS Column Selection Dialog */}
+      {showOthersDialog && (
+        <>
+          {/* Backdrop with blur */}
+          <div
+            className="fixed inset-0 bg-black/50 backdrop-blur-sm z-40"
+            onClick={() => setShowOthersDialog(false)}
+          />
+
+          {/* Modal Content */}
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 pointer-events-none">
+            <div className="w-full max-w-md max-h-[75vh] bg-white rounded-xl shadow-2xl overflow-hidden flex flex-col pointer-events-auto">
+              {/* Header */}
+              <div className="px-4 py-2.5 border-b border-gray-200">
+                <div className="flex items-center justify-between mb-1">
+                  <h2 className="text-sm font-bold text-gray-900">
+                    Configure "OTHERS" Column
+                  </h2>
+                  <button
+                    onClick={() => setShowOthersDialog(false)}
+                    className="text-gray-400 hover:text-gray-600 p-1 hover:bg-gray-100 rounded transition-colors"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+                <p className="text-xs text-gray-600">
+                  Select which unselected columns to sum into the "OTHERS" column
+                </p>
+
+                {/* Summary Bar */}
+                <div className="mt-2 p-2 bg-gradient-to-r from-blue-50 to-purple-50 rounded-lg">
+                  <div className="flex items-center justify-between text-xs">
+                    <div className="flex items-center gap-1.5">
+                      <svg
+                        className="w-3.5 h-3.5 text-blue-600"
+                        fill="none"
+                        stroke="currentColor"
+                        viewBox="0 0 24 24"
+                      >
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth={2}
+                          d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
+                        />
+                      </svg>
+                      <span className="font-medium text-gray-900">
+                        {unselectedColumns.length} unselected
+                      </span>
+                    </div>
+                    <button
+                      onClick={() => {
+                        if (selectedOthersColumns.size === unselectedColumns.length) {
+                          setSelectedOthersColumns(new Set());
+                        } else {
+                          setSelectedOthersColumns(new Set(unselectedColumns));
+                        }
+                      }}
+                      className="text-blue-600 hover:text-blue-700 font-medium text-xs"
+                    >
+                      {selectedOthersColumns.size === unselectedColumns.length ? "Deselect All" : "Select All"}
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              {/* Content */}
+              <div className="flex-1 overflow-hidden flex flex-col gap-2.5 px-4 py-3">
+                {/* Column List */}
+                <div className="flex-1 overflow-auto">
+              {unselectedColumns.length === 0 ? (
+                <div className="text-center py-8">
+                  <svg
+                    className="w-12 h-12 text-gray-300 mx-auto mb-3"
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth={2}
+                      d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
+                    />
+                  </svg>
+                  <p className="text-gray-600 font-medium text-sm">All columns are selected</p>
+                  <p className="text-xs text-gray-500 mt-1">Unselect columns to use the OTHERS feature</p>
+                </div>
+              ) : (
+                <div className="space-y-1.5">
+                  {unselectedColumns.map((col) => {
+                    const isSelected = selectedOthersColumns.has(col);
+                    const match = matchPartyLabel(col);
+                    const displayLabel = match?.label || col;
+                    const colors = getPartyColors(displayLabel);
+
+                    return (
+                      <label
+                        key={col}
+                        className={`flex items-start gap-2 p-2.5 bg-gray-50 rounded-lg hover:bg-gray-100 cursor-pointer border ${
+                          isSelected
+                            ? "border-blue-300"
+                            : "border-gray-200"
+                        } hover:border-blue-300 transition-colors`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={isSelected}
+                          onChange={() => {
+                            setSelectedOthersColumns((prev) => {
+                              const next = new Set(prev);
+                              if (next.has(col)) {
+                                next.delete(col);
+                              } else {
+                                next.add(col);
+                              }
+                              return next;
+                            });
+                          }}
+                          className="w-4 h-4 text-blue-600 rounded mt-0.5"
+                        />
+                        <div className="flex-1 min-w-0">
+                          <p className="font-medium text-gray-900 text-sm truncate">{displayLabel}</p>
+                          {col !== displayLabel && (
+                            <p className="text-xs text-gray-600 mt-0.5 truncate">{col}</p>
+                          )}
+                        </div>
+                      </label>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+                {/* Info Box */}
+                <div className="p-2.5 bg-blue-50 border border-blue-200 rounded-lg">
+              <div className="flex items-start gap-1.5 text-xs">
+                <Info className="w-4 h-4 text-blue-600 flex-shrink-0 mt-0.5" />
+                <div className="flex-1">
+                  <p className="font-medium text-blue-900">
+                    {selectedOthersColumns.size} column{selectedOthersColumns.size !== 1 ? 's' : ''} will be summed into "OTHERS"
+                  </p>
+                  <p className="text-xs text-blue-700 mt-0.5">
+                    The OTHERS column will contain the sum of selected columns
+                  </p>
+                </div>
+              </div>
+            </div>
+
+                {/* Error Message */}
+                {error && (
+                  <div className="bg-red-50 border border-red-200 rounded-lg p-2.5">
+                <div className="flex items-start gap-1.5">
+                  <svg
+                    className="w-4 h-4 text-red-600 flex-shrink-0 mt-0.5"
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth={2}
+                      d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
+                    />
+                  </svg>
+                  <p className="text-xs text-red-600">{error}</p>
+                </div>
+              </div>
             )}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+              </div>
+
+              {/* Footer */}
+              <div className="flex items-center gap-2 px-4 py-2.5 border-t border-gray-200">
+                <Button
+                  variant="outline"
+                  onClick={() => {
+                    setShowOthersDialog(false);
+                    setError(null);
+                  }}
+                  disabled={loading}
+                  className="px-3 py-1.5 text-xs h-8"
+                >
+                  Skip
+                </Button>
+                <Button
+                  onClick={handleOthersDialogConfirm}
+                  disabled={loading || selectedOthersColumns.size === 0}
+                  className="flex-1 px-3 py-1.5 text-xs h-8 bg-gradient-to-r from-blue-600 to-purple-600 text-white hover:from-blue-700 hover:to-purple-700 flex items-center justify-center gap-1.5"
+                >
+                  {loading ? (
+                    <>
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                      Processing...
+                    </>
+                  ) : (
+                    <>
+                      <Download className="h-4 w-4" />
+                      Download with OTHERS
+                    </>
+                  )}
+                </Button>
+              </div>
+            </div>
+          </div>
+        </>
+      )}
+    </>
   );
 }
 

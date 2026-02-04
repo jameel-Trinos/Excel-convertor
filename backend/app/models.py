@@ -134,7 +134,14 @@ class FilterExcelRequest(BaseModel):
 
     task_id: str = Field(..., description="Task ID of the Excel file to filter")
     selected_columns: list[str] = Field(..., description="List of column names to keep (in desired order)")
-    include_others: bool = Field(default=False, description="Whether to include an OTHERS column with sum of unselected party columns")
+    include_others: bool = Field(
+        default=False,
+        description="If True, add an 'OTHERS' column with sum of unselected party columns"
+    )
+    others_columns: Optional[list[str]] = Field(
+        default=None,
+        description="List of unselected column names to sum into OTHERS column. If provided, OTHERS column will be added with sum of these columns."
+    )
     header_overrides: Optional[dict[str, str]] = Field(
         default=None,
         description="Optional mapping of original column name -> desired output header name",
@@ -179,3 +186,68 @@ class DownloadModifiedRequest(BaseModel):
     headers: list[str] = Field(..., description="Column headers")
     rows: list[list[Any]] = Field(..., description="All data rows (including edits)")
     document_title: Optional[str] = Field(default=None, description="Document title")
+
+
+# Geocoding Models
+
+class GeocodeRequest(BaseModel):
+    """Request model for starting geocoding operation."""
+
+    task_id: str = Field(..., description="Task ID of the Excel file")
+    address_column: str = Field(..., description="Column name containing addresses to geocode")
+    region_hint: str = Field(
+        default="Tamil Nadu, India",
+        description="Region hint to improve geocoding accuracy"
+    )
+
+
+class GeocodeProgressEvent(BaseModel):
+    """SSE event for geocoding progress updates."""
+
+    current: int = Field(..., description="Current address being processed (1-indexed)")
+    total: int = Field(..., description="Total number of addresses to geocode")
+    status: Literal["geocoding", "completed", "failed", "cancelled"] = Field(
+        ..., description="Current geocoding status"
+    )
+    message: str = Field(..., description="Human-readable progress message")
+    success_count: int = Field(default=0, description="Number of successfully geocoded addresses")
+    failed_count: int = Field(default=0, description="Number of failed geocoding attempts")
+
+
+class GeocodeStartResponse(BaseModel):
+    """Response after starting geocoding operation."""
+
+    geocode_task_id: str = Field(..., description="Task ID for tracking geocoding progress")
+    total_addresses: int = Field(..., description="Total number of addresses to geocode")
+    message: str = Field(default="Geocoding started")
+
+
+class GeocodeResultItem(BaseModel):
+    """Result of geocoding a single address."""
+
+    row_index: int = Field(..., description="Row index in the original data (0-indexed)")
+    latitude: Optional[float] = Field(default=None, description="Latitude coordinate")
+    longitude: Optional[float] = Field(default=None, description="Longitude coordinate")
+    status: Literal["success", "not_found", "error"] = Field(
+        ..., description="Geocoding status for this address"
+    )
+    error: Optional[str] = Field(default=None, description="Error message if geocoding failed")
+
+
+class GeocodeApplyRequest(BaseModel):
+    """Request model for applying geocoding results to spreadsheet data."""
+
+    geocode_task_id: str = Field(..., description="Geocoding task ID")
+    task_id: str = Field(..., description="Original conversion task ID")
+    headers: list[str] = Field(..., description="Current column headers")
+    rows: list[list[Any]] = Field(..., description="Current row data")
+
+
+class GeocodeApplyResponse(BaseModel):
+    """Response after applying geocoding results."""
+
+    headers: list[str] = Field(..., description="Updated headers with Latitude/Longitude columns")
+    rows: list[list[Any]] = Field(..., description="Updated rows with coordinate data")
+    total_geocoded: int = Field(..., description="Total addresses processed")
+    successful: int = Field(..., description="Successfully geocoded count")
+    failed: int = Field(..., description="Failed geocoding count")
