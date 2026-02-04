@@ -113,6 +113,12 @@ async def process_conversion(task_id: str, file_path: Path, use_constituency_pro
             error_msg = "No tables found in the constituency PDF" if use_constituency_processor else "No tables found in the PDF"
             raise ValueError(error_msg)
 
+        # Fix reversed headers (party names, candidate names, etc.) before creating Excel
+        from .header_fixer import HeaderFixer
+        for table in extraction_result.tables:
+            if table.headers:
+                table.headers = HeaderFixer.fix_header_list(table.headers)
+
         update_task_progress(task_id, 85, "Creating Excel file...")
 
         # Create Excel file - use constituency creator if using constituency processor
@@ -463,6 +469,25 @@ async def get_preview(task_id: str):
             # Fallback: try to detect columns by scanning first few data rows
             for col in range(1, min(actual_max_col + 1, 50)):
                 headers.append(f"Column {col}")
+
+        # Fix reversed headers (party names, candidate names, etc.)
+        from .header_fixer import HeaderFixer
+        from .party_name_fixer import PartyNameFixer
+
+        # Check if any header needs fixing
+        needs_fixing = False
+        for header in headers:
+            if any(pattern.lower() in header.lower() for pattern in HeaderFixer.KNOWN_REVERSED_PATTERNS):
+                needs_fixing = True
+                break
+            if PartyNameFixer.is_likely_party_name(header):
+                fixed = PartyNameFixer.fix_reversed_party_name(header)
+                if fixed != header:
+                    needs_fixing = True
+                    break
+
+        if needs_fixing:
+            headers = HeaderFixer.fix_header_list(headers)
 
         # Get first 10 data rows (first_data_row was already calculated above)
         rows = []
@@ -976,16 +1001,24 @@ async def get_full_preview(task_id: str):
                 # Fallback for empty columns
                 headers.append(f"Column {col}")
         
-        # Only fix headers if they're clearly reversed (conservative approach)
-        # For polling station PDFs, headers are usually correct as-is
-        # Check if headers look correct first
+        # Fix reversed headers (party names, candidate names, etc.)
+        # The fix_header_list function is conservative and only fixes things that need fixing
+        from .party_name_fixer import PartyNameFixer
+
+        # Check if any header needs fixing (reversed text patterns or reversed party names)
         needs_fixing = False
         for header in headers:
-            # Check if any header looks clearly reversed
+            # Check for basic reversed patterns
             if any(pattern.lower() in header.lower() for pattern in HeaderFixer.KNOWN_REVERSED_PATTERNS):
                 needs_fixing = True
                 break
-        
+            # Check for reversed party names (more comprehensive check)
+            if PartyNameFixer.is_likely_party_name(header):
+                fixed = PartyNameFixer.fix_reversed_party_name(header)
+                if fixed != header:
+                    needs_fixing = True
+                    break
+
         if needs_fixing:
             headers = HeaderFixer.fix_header_list(headers)
 
