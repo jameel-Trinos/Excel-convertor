@@ -36,10 +36,15 @@ from .models import (
     PreviewData,
     ProgressEvent,
     StatusResponse,
+    TranslateProgressEvent,
+    TranslateRequest,
+    TranslateStartResponse,
+    TranslateStatusResponse,
     UploadResponse,
 )
 from .geocoding_service import GeocodingService, extract_addresses_from_column
 from .pdf_processor import PDFProcessor
+from .translation_service import TranslationAPIError
 from .utils import cleanup_file, validate_pdf_file
 
 # Load environment variables from .env file
@@ -64,6 +69,9 @@ tasks: Dict[str, ConversionTask] = {}
 
 # Geocoding task storage
 geocode_tasks: Dict[str, dict] = {}  # {geocode_task_id: {status, results, progress, ...}}
+
+# Translation task storage
+translation_tasks: Dict[str, dict] = {}  # {translate_task_id: {status, progress, ...}}
 
 # Create FastAPI app
 app = FastAPI(
@@ -1503,6 +1511,456 @@ async def get_geocode_status(geocode_task_id: str):
         "success_count": task["success_count"],
         "failed_count": task["failed_count"],
     }
+
+
+# ============================================================================
+# Translation Endpoints
+# ============================================================================
+
+async def process_translation(
+    translate_task_id: str,
+    task_id: str,
+    input_file: str,
+    output_file: str,
+    target_lang: str,
+):
+    """Background task for translating Excel content."""
+    try:
+        from .excel_translator import ExcelTranslator
+
+        translation_tasks[translate_task_id]["status"] = "translating"
+        translation_tasks[translate_task_id]["message"] = "Starting translation..."
+
+        translator = ExcelTranslator()
+
+        def progress_callback(current: int, total: int, message: str):
+            translation_tasks[translate_task_id].update({
+                "current": current,
+                "total": total,
+                "message": message,
+            })
+
+        # Run synchronous translation in thread pool
+        result = await asyncio.to_thread(
+            translator.translate_excel_sync,
+            input_file,
+            output_file,
+            target_lang,
+            progress_callback,
+        )
+
+        translation_tasks[translate_task_id]["status"] = "completed"
+        translation_tasks[translate_task_id]["message"] = "Translation completed"
+        translation_tasks[translate_task_id]["result"] = result
+
+        logger.info(f"Translation completed for task {translate_task_id}: {result}")
+
+    except TranslationAPIError as e:
+        logger.error(f"Translation API error for task {translate_task_id}: {e.message}")
+        translation_tasks[translate_task_id]["status"] = "failed"
+        translation_tasks[translate_task_id]["error"] = e.message
+        translation_tasks[translate_task_id]["message"] = f"API Error: {e.message}"
+    except Exception as e:
+        logger.error(f"Translation failed for task {translate_task_id}: {e}", exc_info=True)
+        translation_tasks[translate_task_id]["status"] = "failed"
+        translation_tasks[translate_task_id]["error"] = str(e)
+        translation_tasks[translate_task_id]["message"] = f"Translation failed: {str(e)}"
+
+
+@app.post("/api/translate/start", response_model=TranslateStartResponse)
+async def start_translation(
+    request: TranslateRequest,
+    background_tasks: BackgroundTasks,
+):
+    """
+    Start translating an Excel file to Tamil, Hindi, or English.
+
+    Translates cell content while preserving all Excel formatting.
+    Use /api/translate/progress/{translate_task_id} to track progress via SSE.
+    """
+    # Validate task exists and is completed
+    if request.task_id not in tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    task = tasks[request.task_id]
+
+    if task.status != "completed":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Task not completed. Current status: {task.status}",
+        )
+
+    if not task.output_file or not Path(task.output_file).exists():
+        raise HTTPException(status_code=404, detail="Output file not found")
+
+    # Use target language for caching
+    target_lang = request.target_lang
+    cached_file = OUTPUT_DIR / f"{request.task_id}_{target_lang}.xlsx"
+
+    # Check if translation already exists (cached)
+    if cached_file.exists():
+        logger.info(f"Returning cached translation for task {request.task_id} ({target_lang})")
+        return TranslateStartResponse(
+            translate_task_id=f"cached_{request.task_id}_{target_lang}",
+            total_cells=0,
+            message=f"Translation already exists (cached)",
+        )
+
+    try:
+        import openpyxl
+
+        # Count cells to translate for progress tracking
+        wb = openpyxl.load_workbook(task.output_file, data_only=True)
+        ws = wb.active
+
+        cell_count = 0
+        for row in range(1, (ws.max_row or 0) + 1):
+            for col in range(1, (ws.max_column or 0) + 1):
+                cell = ws.cell(row=row, column=col)
+                if cell.value and isinstance(cell.value, str) and not cell.value.startswith("="):
+                    cell_count += 1
+
+        wb.close()
+
+        # Generate translate task ID
+        translate_task_id = str(uuid.uuid4())
+
+        # Initialize translation task
+        translation_tasks[translate_task_id] = {
+            "task_id": request.task_id,
+            "target_lang": request.target_lang,
+            "status": "pending",
+            "current": 0,
+            "total": cell_count,
+            "message": "Starting translation...",
+            "cancelled": False,
+            "created_at": datetime.utcnow(),
+            "output_file": str(cached_file),
+        }
+
+        # Start background translation
+        background_tasks.add_task(
+            process_translation,
+            translate_task_id,
+            request.task_id,
+            task.output_file,
+            str(cached_file),
+            request.target_lang,
+        )
+
+        logger.info(f"Started translation task {translate_task_id} with {cell_count} cells")
+
+        return TranslateStartResponse(
+            translate_task_id=translate_task_id,
+            total_cells=cell_count,
+            message=f"Translation started for {cell_count} cells",
+        )
+
+    except Exception as e:
+        logger.error(f"Failed to start translation: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to start translation: {str(e)}",
+        )
+
+
+@app.get("/api/translate/progress/{translate_task_id}")
+async def translate_progress_stream(translate_task_id: str):
+    """
+    Server-Sent Events endpoint for real-time translation progress updates.
+
+    Connect to this endpoint to receive live progress updates during translation.
+    """
+    # Handle cached translations
+    if translate_task_id.startswith("cached_"):
+        async def cached_event():
+            event = TranslateProgressEvent(
+                current=1,
+                total=1,
+                status="completed",
+                message="Translation loaded from cache",
+            )
+            yield {
+                "event": "progress",
+                "data": json.dumps(event.model_dump()),
+            }
+        return EventSourceResponse(cached_event())
+
+    if translate_task_id not in translation_tasks:
+        raise HTTPException(status_code=404, detail="Translation task not found")
+
+    async def event_generator():
+        last_current = -1
+        while True:
+            if translate_task_id in translation_tasks:
+                task = translation_tasks[translate_task_id]
+
+                # Only send update if progress changed
+                if task["current"] != last_current or task["status"] in ["completed", "failed", "cancelled"]:
+                    last_current = task["current"]
+                    event = TranslateProgressEvent(
+                        current=task["current"],
+                        total=task["total"],
+                        status=task["status"],
+                        message=task["message"],
+                    )
+                    yield {
+                        "event": "progress",
+                        "data": json.dumps(event.model_dump()),
+                    }
+
+                # Stop streaming when complete or failed
+                if task["status"] in ["completed", "failed", "cancelled"]:
+                    break
+
+            await asyncio.sleep(0.3)
+
+    return EventSourceResponse(event_generator())
+
+
+@app.get("/api/translate/status/{task_id}", response_model=TranslateStatusResponse)
+async def get_translate_status(task_id: str):
+    """
+    Check if translated versions exist for a task.
+
+    Returns availability of Tamil, Hindi, and English translations.
+    """
+    if task_id not in tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    tamil_file = OUTPUT_DIR / f"{task_id}_tamil.xlsx"
+    hindi_file = OUTPUT_DIR / f"{task_id}_hindi.xlsx"
+    english_file = OUTPUT_DIR / f"{task_id}_english.xlsx"
+
+    return TranslateStatusResponse(
+        task_id=task_id,
+        has_tamil_version=tamil_file.exists(),
+        has_hindi_version=hindi_file.exists(),
+        has_english_version=english_file.exists(),
+        tamil_file_path=str(tamil_file) if tamil_file.exists() else None,
+        hindi_file_path=str(hindi_file) if hindi_file.exists() else None,
+        english_file_path=str(english_file) if english_file.exists() else None,
+    )
+
+
+@app.post("/api/translate/cancel/{translate_task_id}")
+async def cancel_translation(translate_task_id: str):
+    """Cancel an ongoing translation operation."""
+    if translate_task_id not in translation_tasks:
+        raise HTTPException(status_code=404, detail="Translation task not found")
+
+    translation_tasks[translate_task_id]["cancelled"] = True
+    translation_tasks[translate_task_id]["status"] = "cancelled"
+    translation_tasks[translate_task_id]["message"] = "Translation cancelled by user"
+
+    return {"message": "Translation cancelled"}
+
+
+@app.get("/api/download/{task_id}/{language}")
+async def download_translated_excel(task_id: str, language: str):
+    """
+    Download Excel file by language.
+
+    Args:
+        task_id: Original conversion task ID
+        language: "original", "tamil", "hindi", or "english"
+
+    Returns:
+        FileResponse with the Excel file
+    """
+    if task_id not in tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    task = tasks[task_id]
+
+    if task.status != "completed":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Task not completed. Current status: {task.status}",
+        )
+
+    # Determine file path based on language
+    if language == "original":
+        file_path = Path(task.output_file) if task.output_file else None
+    elif language == "tamil":
+        file_path = OUTPUT_DIR / f"{task_id}_tamil.xlsx"
+    elif language == "hindi":
+        file_path = OUTPUT_DIR / f"{task_id}_hindi.xlsx"
+    elif language == "english":
+        file_path = OUTPUT_DIR / f"{task_id}_english.xlsx"
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid language: {language}. Must be 'original', 'tamil', 'hindi', or 'english'",
+        )
+
+    if not file_path or not file_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Translation file not found for language: {language}",
+        )
+
+    # Generate download filename
+    original_name = Path(task.filename).stem
+    lang_suffix = f"_{language}" if language != "original" else ""
+    download_name = f"{original_name}{lang_suffix}.xlsx"
+
+    return FileResponse(
+        str(file_path),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=download_name,
+    )
+
+
+@app.get("/api/preview-full/{task_id}/{language}")
+async def get_translated_full_preview(task_id: str, language: str):
+    """
+    Get full preview data for a translated Excel file.
+
+    Args:
+        task_id: Original conversion task ID
+        language: "original", "tamil", "hindi", or "english"
+
+    Returns:
+        FullPreviewData with all rows from the translated file
+    """
+    if task_id not in tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    task = tasks[task_id]
+
+    # Determine file path based on language
+    if language == "original":
+        file_path = Path(task.output_file) if task.output_file else None
+    elif language == "tamil":
+        file_path = OUTPUT_DIR / f"{task_id}_tamil.xlsx"
+    elif language == "hindi":
+        file_path = OUTPUT_DIR / f"{task_id}_hindi.xlsx"
+    elif language == "english":
+        file_path = OUTPUT_DIR / f"{task_id}_english.xlsx"
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid language: {language}. Must be 'original', 'tamil', 'hindi', or 'english'",
+        )
+
+    if not file_path or not file_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Translation file not found for language: {language}",
+        )
+
+    try:
+        import openpyxl
+
+        wb = openpyxl.load_workbook(str(file_path), data_only=True)
+        ws = wb.active
+
+        # Find actual data range
+        actual_max_row = ws.max_row if ws.max_row else 0
+        actual_max_col = ws.max_column if ws.max_column else 0
+
+        # Scan to find actual data boundaries
+        last_data_row = actual_max_row
+        for row in range(1, min(actual_max_row + 100, 2000)):
+            for col in range(1, min(actual_max_col + 100, 200)):
+                cell = ws.cell(row, col)
+                if cell.value is not None and str(cell.value).strip():
+                    actual_max_row = max(actual_max_row, row)
+                    actual_max_col = max(actual_max_col, col)
+                    last_data_row = row
+            if row > last_data_row + 50:
+                break
+
+        if actual_max_row == 0:
+            actual_max_row = ws.max_row if ws.max_row else 100
+        if actual_max_col == 0:
+            actual_max_col = ws.max_column if ws.max_column else 50
+
+        # Find data start row
+        data_start_row = 1
+        document_title = None
+        for row in range(1, min(20, actual_max_row + 1)):
+            cell_value = ws.cell(row, 1).value
+            if cell_value and str(cell_value).strip():
+                if row == 1 and "FORM" in str(cell_value).upper():
+                    document_title = str(cell_value).strip()
+                    continue
+                non_empty_count = sum(
+                    1 for col in range(1, min(actual_max_col + 1, 20))
+                    if ws.cell(row, col).value and str(ws.cell(row, col).value).strip()
+                )
+                if non_empty_count >= 2:
+                    data_start_row = row
+                    break
+
+        # Find first data row
+        first_data_row = data_start_row + 1
+        for row in range(data_start_row + 1, min(data_start_row + 10, actual_max_row + 1)):
+            cell_val = ws.cell(row, 1).value
+            if cell_val is not None:
+                if isinstance(cell_val, (int, float)) or (isinstance(cell_val, str) and cell_val.strip().isdigit()):
+                    first_data_row = row
+                    break
+
+        num_header_rows = first_data_row - data_start_row
+
+        # Get headers
+        headers = []
+        for col in range(1, actual_max_col + 1):
+            header_parts = []
+            for header_row in range(data_start_row, data_start_row + num_header_rows):
+                value = ws.cell(header_row, col).value
+                if value is not None and str(value).strip():
+                    clean_value = str(value).strip()
+                    if clean_value.upper() not in ['PARTY ABBREVIATION', 'NO. OF VALID VOTES CAST IN FAVOUR OF']:
+                        header_parts.append(clean_value)
+
+            if header_parts:
+                if len(header_parts) == 1:
+                    headers.append(header_parts[0])
+                else:
+                    combined = " - ".join(header_parts[-2:]) if len(header_parts) >= 2 else header_parts[-1]
+                    headers.append(combined)
+            else:
+                headers.append(f"Column {col}")
+
+        if not headers:
+            for col in range(1, min(actual_max_col + 1, 50)):
+                headers.append(f"Column {col}")
+
+        # Get ALL data rows
+        rows = []
+        for row_idx in range(first_data_row, actual_max_row + 1):
+            row_data = []
+            num_cols_to_read = max(len(headers), actual_max_col)
+            for col in range(1, num_cols_to_read + 1):
+                value = ws.cell(row_idx, col).value
+                row_data.append(value)
+            while len(row_data) < len(headers):
+                row_data.append(None)
+            if len(row_data) > len(headers):
+                row_data = row_data[:len(headers)]
+            rows.append(row_data)
+
+        total_rows = len(rows)
+        wb.close()
+
+        return FullPreviewData(
+            headers=headers,
+            rows=rows,
+            total_rows=total_rows,
+            total_columns=len(headers),
+            pages_processed=1,
+            document_title=document_title,
+        )
+
+    except Exception as e:
+        logger.error(f"Failed to read translated preview: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to read preview: {str(e)}",
+        )
 
 
 # Startup event for cleanup task

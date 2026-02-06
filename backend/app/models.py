@@ -251,3 +251,46 @@ class GeocodeApplyResponse(BaseModel):
     total_geocoded: int = Field(..., description="Total addresses processed")
     successful: int = Field(..., description="Successfully geocoded count")
     failed: int = Field(..., description="Failed geocoding count")
+
+
+# Translation Models
+
+class TranslateRequest(BaseModel):
+    """Request model for starting translation operation."""
+
+    task_id: str = Field(..., description="Task ID of the Excel file to translate")
+    target_lang: Literal["tamil", "hindi", "english"] = Field(
+        default="tamil",
+        description="Target language: 'tamil', 'hindi', or 'english'"
+    )
+
+
+class TranslateStartResponse(BaseModel):
+    """Response after starting translation operation."""
+
+    translate_task_id: str = Field(..., description="Task ID for tracking translation progress")
+    total_cells: int = Field(..., description="Total number of cells to translate")
+    message: str = Field(default="Translation started")
+
+
+class TranslateProgressEvent(BaseModel):
+    """SSE event for translation progress updates."""
+
+    current: int = Field(..., description="Current cell being processed")
+    total: int = Field(..., description="Total number of cells to translate")
+    status: Literal["translating", "completed", "failed", "cancelled"] = Field(
+        ..., description="Current translation status"
+    )
+    message: str = Field(..., description="Human-readable progress message")
+
+
+class TranslateStatusResponse(BaseModel):
+    """Response for checking translation availability."""
+
+    task_id: str = Field(..., description="Original task ID")
+    has_tamil_version: bool = Field(default=False, description="Whether Tamil version exists")
+    has_hindi_version: bool = Field(default=False, description="Whether Hindi version exists")
+    has_english_version: bool = Field(default=False, description="Whether English version exists")
+    tamil_file_path: Optional[str] = Field(default=None, description="Path to Tamil Excel file")
+    hindi_file_path: Optional[str] = Field(default=None, description="Path to Hindi Excel file")
+    english_file_path: Optional[str] = Field(default=None, description="Path to English Excel file")

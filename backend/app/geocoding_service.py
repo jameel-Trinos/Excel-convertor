@@ -2,14 +2,18 @@
 
 import asyncio
 import logging
+import re
 import time
 from dataclasses import dataclass
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from geopy.geocoders import Nominatim
 from geopy.exc import GeocoderTimedOut, GeocoderServiceError, GeocoderUnavailable
 
 logger = logging.getLogger(__name__)
+
+# Simple in-memory cache to avoid re-geocoding same addresses
+_geocode_cache: Dict[str, dict] = {}
 
 
 @dataclass
@@ -23,6 +27,42 @@ class GeocodeResult:
     original_address: str = ""
 
 
+def clean_address(address: str) -> str:
+    """
+    Clean and normalize an address for better geocoding results.
+
+    Args:
+        address: Raw address string
+
+    Returns:
+        Cleaned address string
+    """
+    if not address:
+        return ""
+
+    # Remove extra whitespace
+    cleaned = " ".join(address.split())
+
+    # Remove common noise patterns
+    noise_patterns = [
+        r'\bPS\s*No\.?\s*\d+\b',  # PS No. 123
+        r'\bBooth\s*No\.?\s*\d+\b',  # Booth No. 123
+        r'\bSlNo\.?\s*\d+\b',  # SlNo. 123
+        r'\bS\.?No\.?\s*\d+\b',  # S.No. 123
+        r'^\d+\s*[-\.]\s*',  # Leading numbers like "1. " or "1 - "
+        r'\(\s*\d+\s*\)',  # (123)
+    ]
+
+    for pattern in noise_patterns:
+        cleaned = re.sub(pattern, '', cleaned, flags=re.IGNORECASE)
+
+    # Clean up result
+    cleaned = " ".join(cleaned.split())
+    cleaned = cleaned.strip(' ,-.')
+
+    return cleaned
+
+
 class GeocodingService:
     """Service for geocoding addresses using OpenStreetMap Nominatim."""
 
@@ -33,7 +73,7 @@ class GeocodingService:
         Args:
             user_agent: User agent string for Nominatim API (required by their TOS)
         """
-        self.geolocator = Nominatim(user_agent=user_agent, timeout=10)
+        self.geolocator = Nominatim(user_agent=user_agent, timeout=15)
         self.rate_limit_delay = 1.1  # Nominatim requires max 1 request/second
         self.max_retries = 3
         self.retry_delay = 2.0
@@ -61,76 +101,83 @@ class GeocodingService:
                 "error": "Empty address"
             }
 
-        # Append region hint for better accuracy
-        full_address = f"{address.strip()}, {region_hint}" if region_hint else address.strip()
+        # Clean the address for better results
+        cleaned_address = clean_address(address)
+        if not cleaned_address:
+            return {
+                "latitude": None,
+                "longitude": None,
+                "status": "error",
+                "error": "Empty address after cleaning"
+            }
 
-        for attempt in range(self.max_retries):
-            try:
-                location = self.geolocator.geocode(full_address)
+        # Check cache first
+        cache_key = f"{cleaned_address.lower()}|{region_hint.lower() if region_hint else ''}"
+        if cache_key in _geocode_cache:
+            logger.debug(f"Cache hit for: {cleaned_address[:30]}...")
+            return _geocode_cache[cache_key]
 
-                if location:
-                    return {
-                        "latitude": location.latitude,
-                        "longitude": location.longitude,
-                        "status": "success",
-                        "error": None
-                    }
-                else:
-                    # Try without region hint as fallback
-                    if region_hint:
-                        location = self.geolocator.geocode(address.strip())
-                        if location:
-                            return {
-                                "latitude": location.latitude,
-                                "longitude": location.longitude,
-                                "status": "success",
-                                "error": None
-                            }
+        # Build query variations to try
+        queries_to_try = []
 
-                    return {
-                        "latitude": None,
-                        "longitude": None,
-                        "status": "not_found",
-                        "error": "Address not found"
-                    }
+        # Primary: cleaned address with region hint
+        if region_hint:
+            queries_to_try.append(f"{cleaned_address}, {region_hint}")
 
-            except GeocoderTimedOut:
-                if attempt < self.max_retries - 1:
-                    time.sleep(self.retry_delay * (attempt + 1))
-                    continue
-                return {
-                    "latitude": None,
-                    "longitude": None,
-                    "status": "error",
-                    "error": "Geocoding timed out"
-                }
+        # Fallback 1: cleaned address only
+        queries_to_try.append(cleaned_address)
 
-            except (GeocoderServiceError, GeocoderUnavailable) as e:
-                if attempt < self.max_retries - 1:
-                    time.sleep(self.retry_delay * (attempt + 1))
-                    continue
-                return {
-                    "latitude": None,
-                    "longitude": None,
-                    "status": "error",
-                    "error": f"Geocoding service error: {str(e)}"
-                }
+        # Fallback 2: original address with region hint (sometimes noise helps)
+        if region_hint and cleaned_address != address.strip():
+            queries_to_try.append(f"{address.strip()}, {region_hint}")
 
-            except Exception as e:
-                logger.error(f"Unexpected geocoding error: {e}")
-                return {
-                    "latitude": None,
-                    "longitude": None,
-                    "status": "error",
-                    "error": f"Unexpected error: {str(e)}"
-                }
+        for query in queries_to_try:
+            for attempt in range(self.max_retries):
+                try:
+                    location = self.geolocator.geocode(query)
 
-        return {
+                    if location:
+                        result = {
+                            "latitude": location.latitude,
+                            "longitude": location.longitude,
+                            "status": "success",
+                            "error": None
+                        }
+                        # Cache successful result
+                        _geocode_cache[cache_key] = result
+                        return result
+
+                    # No result, try next query
+                    break
+
+                except GeocoderTimedOut:
+                    if attempt < self.max_retries - 1:
+                        time.sleep(self.retry_delay * (attempt + 1))
+                        continue
+                    # On final attempt timeout, try next query
+                    break
+
+                except (GeocoderServiceError, GeocoderUnavailable) as e:
+                    if attempt < self.max_retries - 1:
+                        time.sleep(self.retry_delay * (attempt + 1))
+                        continue
+                    logger.warning(f"Geocoding service error for '{query[:30]}...': {e}")
+                    break
+
+                except Exception as e:
+                    logger.error(f"Unexpected geocoding error: {e}")
+                    break
+
+        # All queries failed
+        result = {
             "latitude": None,
             "longitude": None,
-            "status": "error",
-            "error": "Max retries exceeded"
+            "status": "not_found",
+            "error": "Address not found"
         }
+        # Cache negative result too to avoid repeated lookups
+        _geocode_cache[cache_key] = result
+        return result
 
     async def geocode_batch(
         self,
