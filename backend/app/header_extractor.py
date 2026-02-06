@@ -319,7 +319,7 @@ class HeaderExtractor:
         return re.sub(r'[\s.\-_]+', '', text.upper())
 
     def _clean_cell(self, value: str) -> str:
-        """Clean cell value."""
+        """Clean cell value, including fixing reversed text."""
         if not value:
             return ""
 
@@ -327,8 +327,10 @@ class HeaderExtractor:
         if value.lower() in ("nan", "none", "null"):
             return ""
 
-        # Normalize whitespace (handle vertical text)
-        text = " ".join(value.split())
+        # Use sanitize_text which handles RTL characters and reversed text detection
+        # This is critical for fixing corrupted polling area data
+        from .utils import sanitize_text
+        text = sanitize_text(value, single_line=False)
 
         # Handle vertical text by checking for single spaced letters
         # e.g., "B J P" -> "BJP"

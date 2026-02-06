@@ -230,6 +230,8 @@ class TranslationService:
         """
         Determine if text should be translated.
 
+        Enhanced to catch corrupted/reversed text that should be translated.
+
         Args:
             text: Text to check
             target_lang: Target language (tamil, hindi, english)
@@ -255,16 +257,37 @@ class TranslationService:
         if text in self.KNOWN_PARTY_ABBREVIATIONS:
             return False
 
-        # Check if already in target language
-        if target_lang == "tamil" and self._is_mostly_language(text, self.TAMIL_RANGE):
-            return False
-        elif target_lang == "hindi" and self._is_mostly_language(text, self.HINDI_RANGE):
-            return False
+        # IMPORTANT: Check for corrupted/reversed text BEFORE language detection
+        # Corrupted text should always be translated (after fixing)
+        from .utils import _is_likely_reversed
+        if _is_likely_reversed(text):
+            # This is corrupted/reversed text - it should be translated
+            # The sanitization will fix it first, then it will be translated
+            return True
+
+        # Check if already in target language (but be less strict for corrupted text)
+        if target_lang == "tamil":
+            # Only skip if text is clearly and correctly in Tamil (not corrupted)
+            if self._is_mostly_language(text, self.TAMIL_RANGE) and not _is_likely_reversed(text):
+                return False
+        elif target_lang == "hindi":
+            # Only skip if text is clearly and correctly in Hindi (not corrupted)
+            if self._is_mostly_language(text, self.HINDI_RANGE) and not _is_likely_reversed(text):
+                return False
 
         # Check if it's only special characters and numbers
         alphanumeric_only = re.sub(r"[^a-zA-Z\u0B80-\u0BFF\u0900-\u097F]", "", text)
         if not alphanumeric_only:
             return False
+
+        # If text contains English letters and is not clearly in target language, translate it
+        # This catches cases where text might be partially translated or corrupted
+        has_english = bool(re.search(r'[a-zA-Z]', text))
+        if has_english and target_lang in ["tamil", "hindi"]:
+            # Check if it's mostly English (should be translated)
+            english_ratio = len(re.findall(r'[a-zA-Z]', text)) / max(len(text), 1)
+            if english_ratio > 0.3:  # If more than 30% English, translate it
+                return True
 
         return True
 
@@ -328,13 +351,59 @@ class TranslationService:
             # Create translator for this specific language pair
             # deep_translator uses class methods, not instances
             translator = self._translator(source=source_code, target=target_code)
-            result = translator.translate(text).strip()
-
+            
+            # For very long text, split into sentences/chunks to avoid corruption
+            # Google Translate has limits and can corrupt very long strings
+            MAX_CHUNK_LENGTH = 5000  # Characters per chunk
+            if len(text) > MAX_CHUNK_LENGTH:
+                # Split by common delimiters (periods, newlines, etc.)
+                chunks = []
+                current_chunk = ""
+                
+                # Try to split intelligently at sentence boundaries
+                sentences = re.split(r'([.!?]\s+|\.\s+|\n)', text)
+                for sentence in sentences:
+                    if len(current_chunk) + len(sentence) <= MAX_CHUNK_LENGTH:
+                        current_chunk += sentence
+                    else:
+                        if current_chunk:
+                            chunks.append(current_chunk.strip())
+                        current_chunk = sentence
+                
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                
+                # Translate each chunk
+                translated_chunks = []
+                for chunk in chunks:
+                    if chunk.strip():
+                        try:
+                            translated_chunk = translator.translate(chunk).strip()
+                            translated_chunks.append(translated_chunk)
+                        except Exception as chunk_error:
+                            logger.warning(f"Error translating chunk '{chunk[:50]}...': {chunk_error}")
+                            translated_chunks.append(chunk)  # Keep original on error
+                
+                result = " ".join(translated_chunks).strip()
+            else:
+                result = translator.translate(text).strip()
+            
+            # Verify translation didn't corrupt the text
+            # Check if result is suspiciously similar to reversed input
+            if len(result) == len(text) and result[::-1] == text:
+                logger.warning(f"Translation appears to have reversed text: '{text[:50]}...' -> '{result[:50]}...'")
+                # Try translating again with explicit source language
+                try:
+                    translator = self._translator(source="en", target=target_code)
+                    result = translator.translate(text).strip()
+                except:
+                    pass  # If retry fails, use original result
+            
             self._cache[cache_key] = result
             return result
 
         except Exception as e:
-            logger.error(f"Translation error for '{text}': {e}")
+            logger.error(f"Translation error for '{text[:100]}...': {e}")
             return text  # Return original on error
 
     async def translate_batch(

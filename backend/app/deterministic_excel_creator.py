@@ -94,14 +94,23 @@ class DeterministicExcelCreator:
         self._format_header_row(worksheet, header_row, len(headers))
         current_row += 1
 
-        # Add data rows
+        # Add data rows with final validation pass
         data_start_row = current_row
+        from .utils import _is_likely_reversed
         for row_idx, row_data in enumerate(data_rows):
             for col_idx, value in enumerate(row_data, 1):
                 cell = worksheet.cell(row=data_start_row + row_idx, column=col_idx)
-                # Sanitize and convert to appropriate type
+                # Sanitize and convert to appropriate type with final validation
                 if isinstance(value, str):
                     sanitized = sanitize_text(value)
+                    # Re-check for reversed text after sanitization
+                    if _is_likely_reversed(sanitized):
+                        # Try reversing and re-sanitizing
+                        reversed_text = sanitized[::-1]
+                        re_sanitized = sanitize_text(reversed_text)
+                        if not _is_likely_reversed(re_sanitized):
+                            sanitized = re_sanitized
+                    
                     if sanitized.isdigit():
                         cell.value = int(sanitized)
                     else:

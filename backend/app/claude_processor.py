@@ -419,18 +419,15 @@ Important:
             return [], 0, 0.0
     
     def _clean_cell(self, value) -> str:
-        """Clean a cell value."""
+        """Clean a cell value, including fixing reversed text."""
         if value is None:
             return ""
-        text = str(value).strip()
-        # Remove null bytes and control characters
-        text = text.replace("\x00", "")
-        text = "".join(char for char in text if ord(char) >= 32 or char in "\n\t")
-        # Replace newlines with spaces
-        text = text.replace("\n", " ").replace("\r", " ")
-        # Normalize whitespace
-        text = " ".join(text.split())
-        return text.strip()
+        
+        # Use sanitize_text which handles RTL characters and reversed text detection
+        # This is critical for fixing corrupted polling area data
+        from .utils import sanitize_text
+        text = sanitize_text(value, single_line=False)
+        return text
 
     def analyze_table_structure(
         self,

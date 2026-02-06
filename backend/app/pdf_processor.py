@@ -841,13 +841,13 @@ class PDFProcessor:
 
     def _clean_cell(self, value) -> str:
         """
-        Clean and sanitize a cell value.
+        Clean and sanitize a cell value, including fixing reversed text.
 
         Args:
             value: Raw cell value
 
         Returns:
-            Cleaned string value
+            Cleaned string value with reversed text fixed
         """
         if value is None:
             return ""
@@ -859,12 +859,28 @@ class PDFProcessor:
         if text.lower() in ("nan", "none", "null", "undefined"):
             return ""
 
-        # Remove null bytes and control characters
-        text = text.replace("\x00", "")
-        text = "".join(char for char in text if ord(char) >= 32 or char in "\n\t")
-
-        # Replace newlines with spaces
-        text = text.replace("\n", " ").replace("\r", " ")
+        # Use sanitize_text which handles RTL characters and reversed text detection
+        # This is critical for fixing corrupted polling area data
+        from .utils import sanitize_text, _is_likely_reversed
+        text = sanitize_text(text, single_line=False)
+        
+        # Second-pass validation: Re-check for reversed text after initial sanitization
+        # This catches any cases that might have been missed in the first pass
+        if text and _is_likely_reversed(text):
+            # Try reversing again and re-sanitize
+            reversed_text = text[::-1]
+            re_sanitized = sanitize_text(reversed_text, single_line=False)
+            # Only use reversed version if it's better (not still reversed)
+            if not _is_likely_reversed(re_sanitized):
+                logger.warning(
+                    f"Fixed reversed text in second pass: '{text[:100]}...' -> '{re_sanitized[:100]}...'"
+                )
+                text = re_sanitized
+            else:
+                # If reversed version is still reversed, log warning but keep original
+                logger.warning(
+                    f"Text still appears reversed after second pass: '{text[:100]}...'"
+                )
         
         # Normalize whitespace
         text = " ".join(text.split())
@@ -913,6 +929,40 @@ class PDFProcessor:
                     all_rows.append(normalized_row)
 
         logger.info(f"Merged {len(tables)} tables into single table: {len(all_rows)} rows, {len(headers)} columns")
+
+        # Post-processing validation: Scan all cells for any remaining reversed text
+        # This ensures no corrupted text reaches Excel output
+        from .utils import sanitize_text, _is_likely_reversed
+        corrected_count = 0
+        for row_idx, row in enumerate(all_rows):
+            for col_idx, cell_value in enumerate(row):
+                if isinstance(cell_value, str) and cell_value.strip():
+                    # Re-apply sanitization to catch any missed cases
+                    sanitized = sanitize_text(cell_value, single_line=False)
+                    # Double-check for reversed text
+                    if sanitized != cell_value or _is_likely_reversed(sanitized):
+                        if _is_likely_reversed(sanitized):
+                            # Try reversing and re-sanitizing
+                            reversed_text = sanitized[::-1]
+                            re_sanitized = sanitize_text(reversed_text, single_line=False)
+                            if not _is_likely_reversed(re_sanitized):
+                                all_rows[row_idx][col_idx] = re_sanitized
+                                corrected_count += 1
+                                logger.debug(
+                                    f"Post-processing fix: Row {row_idx+1}, Col {col_idx+1}: "
+                                    f"'{cell_value[:50]}...' -> '{re_sanitized[:50]}...'"
+                                )
+                            else:
+                                # Keep original sanitized version if reversed is still reversed
+                                all_rows[row_idx][col_idx] = sanitized
+                        else:
+                            # Just update with sanitized version
+                            all_rows[row_idx][col_idx] = sanitized
+                            if sanitized != cell_value:
+                                corrected_count += 1
+        
+        if corrected_count > 0:
+            logger.info(f"Post-processing validation: Corrected {corrected_count} cells with reversed/corrupted text")
 
         # Remove duplicate sequential number columns (e.g., PS No. and Sl.No with same values)
         headers, all_rows = self._remove_duplicate_serial_columns(headers, all_rows)

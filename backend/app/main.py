@@ -45,7 +45,7 @@ from .models import (
 from .geocoding_service import GeocodingService, extract_addresses_from_column
 from .pdf_processor import PDFProcessor
 from .translation_service import TranslationAPIError
-from .utils import cleanup_file, validate_pdf_file
+from .utils import cleanup_file, validate_pdf_file, sanitize_text
 
 # Load environment variables from .env file
 load_dotenv()
@@ -508,6 +508,9 @@ async def get_preview(task_id: str):
             num_cols_to_read = max(len(headers), actual_max_col)
             for col in range(1, num_cols_to_read + 1):
                 value = ws.cell(row_idx, col).value
+                # Fix reversed/corrupted text in cell values
+                if isinstance(value, str):
+                    value = sanitize_text(value, single_line=False)
                 row_data.append(value)
             # Ensure row_data matches header count
             while len(row_data) < len(headers):
@@ -1177,50 +1180,67 @@ async def download_modified_excel(request: DownloadModifiedRequest):
 async def process_geocoding(geocode_task_id: str, addresses: list, region_hint: str):
     """Background task for geocoding addresses."""
     try:
+        if geocode_task_id not in geocode_tasks:
+            logger.error(f"Geocode task {geocode_task_id} not found in tasks dictionary")
+            return
+        
         geocode_tasks[geocode_task_id]["status"] = "geocoding"
+        geocode_tasks[geocode_task_id]["message"] = "Starting geocoding..."
+        logger.info(f"Starting geocoding task {geocode_task_id} with {len(addresses)} addresses")
 
         service = GeocodingService()
 
         def progress_callback(current, total, message, success_count, failed_count):
-            geocode_tasks[geocode_task_id].update({
-                "current": current,
-                "total": total,
-                "message": message,
-                "success_count": success_count,
-                "failed_count": failed_count,
-            })
+            if geocode_task_id in geocode_tasks:
+                geocode_tasks[geocode_task_id].update({
+                    "current": current,
+                    "total": total,
+                    "message": message,
+                    "success_count": success_count,
+                    "failed_count": failed_count,
+                })
 
         def cancel_check():
             return geocode_tasks.get(geocode_task_id, {}).get("cancelled", False)
 
         results = await service.geocode_batch(
             addresses,
-            region_hint=region_hint,
+            region_hint=region_hint if region_hint else "India",
             progress_callback=progress_callback,
             cancel_check=cancel_check,
         )
 
         # Store results
-        geocode_tasks[geocode_task_id]["results"] = [
-            {
-                "row_index": r.row_index,
-                "latitude": r.latitude,
-                "longitude": r.longitude,
-                "status": r.status,
-                "error": r.error,
-            }
-            for r in results
-        ]
-        geocode_tasks[geocode_task_id]["status"] = "completed"
-        geocode_tasks[geocode_task_id]["message"] = "Geocoding completed"
+        if geocode_task_id in geocode_tasks:
+            geocode_tasks[geocode_task_id]["results"] = [
+                {
+                    "row_index": r.row_index,
+                    "latitude": r.latitude,
+                    "longitude": r.longitude,
+                    "status": r.status,
+                    "error": r.error,
+                }
+                for r in results
+            ]
+            geocode_tasks[geocode_task_id]["status"] = "completed"
+            geocode_tasks[geocode_task_id]["message"] = "Geocoding completed"
+            geocode_tasks[geocode_task_id]["current"] = len(results)
 
-        logger.info(f"Geocoding completed for task {geocode_task_id}")
+            success_count = sum(1 for r in results if r.status == "success")
+            failed_count = len(results) - success_count
+            logger.info(
+                f"Geocoding completed for task {geocode_task_id}: "
+                f"{success_count} successful, {failed_count} failed out of {len(results)} total"
+            )
+        else:
+            logger.error(f"Geocode task {geocode_task_id} was removed during processing")
 
     except Exception as e:
         logger.error(f"Geocoding failed for task {geocode_task_id}: {e}", exc_info=True)
-        geocode_tasks[geocode_task_id]["status"] = "failed"
-        geocode_tasks[geocode_task_id]["error"] = str(e)
-        geocode_tasks[geocode_task_id]["message"] = f"Geocoding failed: {str(e)}"
+        if geocode_task_id in geocode_tasks:
+            geocode_tasks[geocode_task_id]["status"] = "failed"
+            geocode_tasks[geocode_task_id]["error"] = str(e)
+            geocode_tasks[geocode_task_id]["message"] = f"Geocoding failed: {str(e)}"
 
 
 @app.post("/api/geocode/start", response_model=GeocodeStartResponse)
@@ -1321,12 +1341,18 @@ async def start_geocoding(
         wb.close()
 
         # Extract addresses from specified column
-        addresses = extract_addresses_from_column(headers, rows, request.address_column)
-
+        try:
+            addresses = extract_addresses_from_column(headers, rows, request.address_column)
+            logger.info(f"Extracted {len(addresses)} addresses from column '{request.address_column}'")
+        except ValueError as e:
+            logger.error(f"Failed to extract addresses: {e}")
+            raise HTTPException(status_code=400, detail=str(e))
+        
         if not addresses:
             raise HTTPException(
                 status_code=400,
-                detail=f"No addresses found in column '{request.address_column}'",
+                detail=f"No addresses found in column '{request.address_column}'. "
+                       f"Please verify the column name and ensure it contains address data.",
             )
 
         # Generate geocode task ID
@@ -1362,12 +1388,20 @@ async def start_geocoding(
         )
 
     except ValueError as e:
+        logger.error(f"Value error in geocoding start: {e}")
         raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is
+        raise
     except Exception as e:
         logger.error(f"Failed to start geocoding: {e}", exc_info=True)
+        error_detail = str(e)
+        # Don't expose internal error details in production
+        if "geocoding" not in error_detail.lower():
+            error_detail = "Failed to start geocoding. Please try again or contact support if the issue persists."
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to start geocoding: {str(e)}",
+            detail=error_detail,
         )
 
 
@@ -1446,38 +1480,83 @@ async def apply_geocoding(request: GeocodeApplyRequest):
 
     try:
         results = geocode_task.get("results", [])
+        
+        if not results:
+            logger.warning(f"No geocoding results found for task {request.geocode_task_id}")
+            raise HTTPException(
+                status_code=400,
+                detail="No geocoding results available. The geocoding task may have been cancelled or failed.",
+            )
 
         # Create a mapping of row_index to coordinates
-        coords_map = {
-            r["row_index"]: (r["latitude"], r["longitude"], r["status"])
-            for r in results
-        }
+        coords_map = {}
+        for r in results:
+            row_idx = r.get("row_index")
+            if row_idx is not None:
+                coords_map[row_idx] = (
+                    r.get("latitude"),
+                    r.get("longitude"),
+                    r.get("status", "error")
+                )
 
-        # Add new headers
-        new_headers = request.headers + ["Latitude", "Longitude"]
+        # Check if we have Latitude/Longitude columns already
+        has_lat = "Latitude" in request.headers
+        has_lng = "Longitude" in request.headers
+        
+        # Add new headers if they don't exist
+        new_headers = list(request.headers)
+        if not has_lat:
+            new_headers.append("Latitude")
+        if not has_lng:
+            new_headers.append("Longitude")
 
         # Add coordinates to each row
         new_rows = []
         successful = 0
         failed = 0
+        lat_col_idx = len(request.headers) if not has_lat else request.headers.index("Latitude")
+        lng_col_idx = len(request.headers) + (0 if has_lat else 1) if not has_lng else request.headers.index("Longitude")
 
         for row_idx, row in enumerate(request.rows):
             coords = coords_map.get(row_idx)
+            new_row = list(row)
+            
             if coords:
                 lat, lng, status = coords
-                new_row = list(row) + [lat, lng]
+                # Update or add coordinates
+                if has_lat:
+                    new_row[lat_col_idx] = lat
+                else:
+                    new_row.append(lat)
+                
+                if has_lng:
+                    new_row[lng_col_idx] = lng
+                else:
+                    new_row.append(lng)
+                
                 if status == "success":
                     successful += 1
                 else:
                     failed += 1
             else:
                 # No geocoding result for this row
-                new_row = list(row) + [None, None]
+                if not has_lat:
+                    new_row.append(None)
+                else:
+                    new_row[lat_col_idx] = None
+                
+                if not has_lng:
+                    new_row.append(None)
+                else:
+                    new_row[lng_col_idx] = None
+                
                 failed += 1
+            
             new_rows.append(new_row)
 
         logger.info(
-            f"Applied geocoding results: {successful} successful, {failed} failed"
+            f"Applied geocoding results to {len(new_rows)} rows: "
+            f"{successful} successful, {failed} failed"
         )
 
         return GeocodeApplyResponse(

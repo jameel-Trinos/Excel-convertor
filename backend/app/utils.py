@@ -230,20 +230,37 @@ def sanitize_text(value: Optional[str], single_line: bool = True) -> str:
     # If RTL override was present, the text is likely reversed - fix it
     if has_rlo and text:
         text = text[::-1]
+        # After reversing, check if it's still reversed (shouldn't be)
+        # If it is, it might be double-reversed or incorrectly detected
+        if _is_likely_reversed(text):
+            # Double-check: if reversing again makes it better, keep original
+            double_reversed = text[::-1]
+            if _score_text_naturalness(double_reversed) > _score_text_naturalness(text):
+                text = double_reversed
     # Also check for common reversed patterns even without RTL marker
     elif text and _is_likely_reversed(text):
+        original_text = text
         text = text[::-1]
+        # Verify the fix improved the text (not double-reversed)
+        if _is_likely_reversed(text):
+            # If still reversed, might be incorrectly detected - check scores
+            original_score = _score_text_naturalness(original_text)
+            fixed_score = _score_text_naturalness(text)
+            if original_score >= fixed_score:
+                # Original was better, don't reverse
+                text = original_text
 
     return text
 
 
 def _score_text_naturalness(text: str) -> float:
     """
-    Score text based on English bigram frequency.
+    Score text based on English bigram frequency and Indian election terminology.
     Returns: Higher score = more likely correct (not reversed).
 
     Uses common English bigrams (TH, HE, IN, ER) and impossible
     word-start patterns (JK, MJ, NK, etc.) to score naturalness.
+    Also handles mixed English-Tamil text and Indian election terminology.
     """
     COMMON_BIGRAMS = [
         'TH', 'HE', 'IN', 'ER', 'AN', 'RE', 'ON', 'AT', 'EN', 'ND',
@@ -255,20 +272,58 @@ def _score_text_naturalness(text: str) -> float:
         'JK', 'MJ', 'DJ', 'NK', 'NL', 'TN', 'HL', 'HR', 'KM',
         'LT', 'MN', 'RK', 'TL', 'VL'
     ]
+    
+    # Common Indian election terminology patterns (when correct)
+    ELECTION_TERMS = [
+        'WARD', 'STREET', 'COLONY', 'NAGAR', 'CROSS', 'ROAD',
+        'POLLING', 'STATION', 'ELECTOR', 'OVERSEAS', 'VALID',
+        'VOTES', 'CANDIDATE', 'PARTY', 'ABBREVIATION', 'TOTAL',
+        'REJECTED', 'TENDERED', 'NOTA', 'BUILDING', 'LOCATION',
+        'AREA', 'AREAS', 'SIVAPURAM', 'PITCHIVAKKAM', 'EDAIYARPAKKAM'
+    ]
+    
+    # Tamil place name endings (when correct)
+    TAMIL_ENDINGS = ['AM', 'UR', 'AR', 'AI', 'AY', 'IN', 'AN', 'AL', 'IL', 'UL']
 
     # Normalize: remove punctuation, uppercase
-    clean_text = ''.join(c for c in text if c.isalpha()).upper()
+    clean_text = ''.join(c for c in text if c.isalpha() or c.isspace()).upper()
     if len(clean_text) < 3:
         return 0
+    
+    # Extract words for term matching
+    words = clean_text.split()
+    text_alpha_only = ''.join(c for c in clean_text if c.isalpha())
 
     # Extract bigrams
-    bigrams = [clean_text[i:i+2] for i in range(len(clean_text)-1)]
+    bigrams = [text_alpha_only[i:i+2] for i in range(len(text_alpha_only)-1)] if len(text_alpha_only) >= 2 else []
 
-    # Score
+    # Score based on common English bigrams
     common_count = sum(1 for bg in bigrams if bg in COMMON_BIGRAMS)
-    impossible_count = sum(1 for imp in IMPOSSIBLE_STARTS if clean_text.startswith(imp))
+    impossible_count = sum(1 for imp in IMPOSSIBLE_STARTS if text_alpha_only.startswith(imp))
+    
+    # Bonus for election terminology
+    election_term_bonus = 0
+    for term in ELECTION_TERMS:
+        if term in clean_text:
+            election_term_bonus += 2
+    
+    # Bonus for Tamil place name patterns (when correct, they end with common Tamil endings)
+    tamil_bonus = 0
+    for word in words:
+        if len(word) >= 3:
+            # Check if word ends with common Tamil place name endings
+            if any(word.endswith(ending) for ending in TAMIL_ENDINGS):
+                tamil_bonus += 1
+    
+    # Penalty for reversed patterns
+    reversed_penalty = 0
+    reversed_indicators = ['TEERTS', 'DRAW', 'RAGAN', 'SROTCEL', 'SAESREVO', 'MARUPAVIS']
+    for indicator in reversed_indicators:
+        if indicator in clean_text:
+            reversed_penalty += 5
 
-    return common_count - (impossible_count * 5)
+    base_score = common_count - (impossible_count * 5)
+    return base_score + election_term_bonus + tamil_bonus - reversed_penalty
 
 
 def _has_impossible_consonant_clusters(text: str) -> bool:
@@ -290,6 +345,11 @@ def _has_impossible_consonant_clusters(text: str) -> bool:
 def _is_likely_reversed(text: str) -> bool:
     """
     Check if text appears to be reversed based on common patterns.
+    
+    Enhanced to detect corrupted/reversed text patterns like:
+    - "teertS dr3 ragaN rayireP" (reversed street names)
+    - Text with impossible consonant clusters
+    - Text that scores poorly on naturalness
     
     Args:
         text: Text to check
@@ -350,17 +410,103 @@ def _is_likely_reversed(text: str) -> bool:
         "NAR",               # RAN (common ending)
         "MAR",               # RAM
         "NAS",               # SAN
+        # Polling station data patterns (reversed)
+        ")p(",               # (p) - common in reversed polling area text
+        ")pt(",              # (tp) - common in reversed polling area text
+        "maragayileV",       # Veliyagaram (reversed)
+        "tepillaP",          # Pallipet (reversed)
+        "ruhtalok",          # Kolathur (reversed)
+        "- ]",               # ] - (reversed bracket pattern)
+        "] -",               # - [ (reversed bracket pattern)
+        # Corrupted/reversed street patterns (like "teertS dr3 ragaN rayireP")
+        "teertS",            # Street (reversed)
+        "draw",              # ward (reversed)
+        "yrehcaleV",         # Velachery (reversed)
+        "ragaN",             # Nagar (reversed)
+        "rayireP",           # Periyar (reversed)
+        "ssorC",             # Cross (reversed)
+        "ht",                # th (reversed, common in street numbers)
+        "dr",                # rd (reversed, common in street numbers)
+        "ts",                # st (reversed, common in street numbers)
+        # Enhanced polling area specific patterns
+        "srotcelE saesrevO", # Overseas Electors (reversed)
+        "marupaviS",         # Sivapuram (reversed)
+        ")P(",               # Reversed (P)
+        ")V.R(",             # Reversed (R.V)
+        ")999)-",            # Reversed (999)-
+        "draW)V.R(",         # Reversed (R.V) Ward
+        "teertS dr",         # Reversed Street rd
+        "ynoloc",            # Reversed colony
+        "srotcelE",          # Electors (reversed)
+        "saesrevO",          # Overseas (reversed)
+        "marupaviS 1",       # Sivapuram 1 (reversed)
+        "marupaviS.7",       # 7.Sivapuram (reversed)
+        "marupaviS.6",       # 6.Sivapuram (reversed)
+        "marupaviS.5",       # 5.Sivapuram (reversed)
+        "marupaviS.4",       # 4.Sivapuram (reversed)
+        "marupaviS.3",       # 3.Sivapuram (reversed)
+        "marupaviS.2",       # 2.Sivapuram (reversed)
+        "marupaviS.1",       # 1.Sivapuram (reversed)
+        "kuruk teertS",      # Street kuruk (reversed)
+        "iaragartra teertS", # Street arrangement (reversed)
+        "daor teertS",       # Street road (reversed)
+        "udan teertS",       # Street nadu (reversed)
+        "liokanajaB teertS", # Street Bajakanoli (reversed)
     ]
+    
+    # Check for corrupted text patterns (reversed street names, addresses)
+    # Pattern: words ending with common reversed suffixes
+    words = text_stripped.split()
+    if len(words) > 1:
+        reversed_suffixes = ["teertS", "draw", "ragaN", "rayireP", "ssorC", "srotcelE", "saesrevO", "marupaviS", "ynoloc"]
+        for word in words:
+            for suffix in reversed_suffixes:
+                if word.endswith(suffix) or word.startswith(suffix):
+                    return True
+        
+        # Check for reversed bracket patterns in polling area text
+        # Pattern like ")P(" or ")V.R(" indicates reversed text
+        for word in words:
+            if word.startswith(")") and word.endswith("(") and len(word) >= 3:
+                return True
+            # Pattern like ")999)-" indicates reversed number pattern
+            if word.startswith(")") and word.endswith(")-") and any(c.isdigit() for c in word):
+                return True
     
     for pattern in reversed_patterns:
         if pattern in text_stripped:
             return True
     
     # Check if starts with punctuation (often indicates reversed text)
-    if text_stripped and text_stripped[0] in ".,;:" and len(text_stripped) > 1:
-        # Check if reversing makes it start with a letter
+    # This includes closing parentheses/brackets which are common in reversed text
+    if text_stripped and text_stripped[0] in ".,;:)]}" and len(text_stripped) > 1:
+        # Check if reversing makes it start with a letter or opening bracket
         reversed_text = text_stripped[::-1]
-        if reversed_text[0].isalpha():
+        if reversed_text[0].isalpha() or reversed_text[0] in "[({":
+            return True
+    
+    # Context-aware detection: If text contains polling area keywords, be more aggressive
+    # Check for known polling area context words that suggest this is polling area text
+    polling_area_keywords = ["Ward", "Street", "Colony", "Nagar", "Cross", "Road", "Area", "Areas", 
+                            "Electors", "Overseas", "Polling", "Station", "Building", "Location"]
+    text_upper = text_stripped.upper()
+    has_polling_context = any(keyword.upper() in text_upper for keyword in polling_area_keywords)
+    
+    # If we have polling area context and text shows reversed patterns, be more aggressive
+    if has_polling_context:
+        # Check for reversed Tamil place name patterns (like "marupaviS")
+        tamil_place_patterns = ["marupaviS", "tepillaP", "ruhtalok", "maragayileV", "yrehcaleV"]
+        for pattern in tamil_place_patterns:
+            if pattern in text_stripped:
+                return True
+        
+        # Check for reversed bracket-number patterns like ")999)-" or ")P("
+        if ")P(" in text_stripped or ")V.R(" in text_stripped or ")999)-" in text_stripped:
+            return True
+        
+        # Check for pattern where text starts with closing bracket/parenthesis
+        # and contains reversed place names or street names
+        if text_stripped[0] in ")]}" and any(pattern in text_stripped for pattern in ["marupaviS", "teertS", "draw"]):
             return True
 
     # Statistical bigram analysis - only for longer text

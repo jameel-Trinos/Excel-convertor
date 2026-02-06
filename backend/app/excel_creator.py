@@ -82,13 +82,41 @@ class ExcelCreator:
         self._format_header_row(worksheet, header_row, len(headers))
         current_row += 1
 
-        # Write data rows
+        # Write data rows with final validation pass
         data_start_row = current_row
+        from .utils import _is_likely_reversed
+        corrected_cells = 0
+        
         for row_idx, row_data in enumerate(rows):
             for col_idx, value in enumerate(row_data, 1):
                 if col_idx <= len(headers):  # Ensure we don't exceed header count
                     cell = worksheet.cell(row=data_start_row + row_idx, column=col_idx)
-                    cell.value = sanitize_text(value) if isinstance(value, str) else value
+                    
+                    # Final validation: Double-check for reversed text before writing
+                    if isinstance(value, str):
+                        sanitized = sanitize_text(value)
+                        # Re-check for reversed text after sanitization
+                        if _is_likely_reversed(sanitized):
+                            # Try reversing and re-sanitizing
+                            reversed_text = sanitized[::-1]
+                            re_sanitized = sanitize_text(reversed_text)
+                            if not _is_likely_reversed(re_sanitized):
+                                cell.value = re_sanitized
+                                corrected_cells += 1
+                                logger.debug(
+                                    f"Final validation fix: Row {data_start_row + row_idx}, Col {col_idx}: "
+                                    f"'{value[:50]}...' -> '{re_sanitized[:50]}...'"
+                                )
+                            else:
+                                # Keep original sanitized if reversed is still reversed
+                                cell.value = sanitized
+                        else:
+                            cell.value = sanitized
+                    else:
+                        cell.value = value
+        
+        if corrected_cells > 0:
+            logger.info(f"Final validation: Corrected {corrected_cells} cells with reversed/corrupted text before writing to Excel")
 
         data_end_row = data_start_row + len(rows) - 1
 

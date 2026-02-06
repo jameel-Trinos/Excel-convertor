@@ -15,6 +15,7 @@ while maintaining:
 import os
 import logging
 import asyncio
+import re
 from pathlib import Path
 from typing import Dict, List, Optional, Callable, Any
 from copy import copy
@@ -24,6 +25,7 @@ from openpyxl.styles import Font, Fill, Alignment, Border, PatternFill
 from openpyxl.cell.cell import Cell
 
 from .translation_service import TranslationService, TranslationAPIError
+from .utils import sanitize_text
 
 logger = logging.getLogger(__name__)
 
@@ -107,14 +109,41 @@ class ExcelTranslator:
                     if value.startswith("="):
                         continue
 
-                    # Check if this text should be translated
-                    if self.translator.should_translate(value.strip(), target_lang):
-                        cells_to_translate.append({
-                            "sheet": sheet_name,
-                            "row": row_idx,
-                            "col": col_idx,
-                            "value": value,
-                        })
+                    # Fix reversed/corrupted text before processing
+                    # This handles RTL characters and text that appears reversed
+                    sanitized_value = sanitize_text(value, single_line=False)
+                    
+                    # If the value was fixed (reversed), update the cell immediately
+                    if sanitized_value != value:
+                        cell.value = sanitized_value
+                        value = sanitized_value
+                        logger.info(f"Fixed reversed text in cell {sheet_name}!{cell.coordinate}: '{value[:100]}...'")
+                        
+                        # After fixing, verify it's no longer reversed
+                        from .utils import _is_likely_reversed
+                        if _is_likely_reversed(value):
+                            logger.warning(
+                                f"Text still appears reversed after fix in cell {sheet_name}!{cell.coordinate}: '{value[:100]}...'"
+                            )
+
+                    # Always check if text should be translated (even if it was just fixed)
+                    # This ensures corrupted text gets translated after being fixed
+                    text_to_check = value.strip()
+                    if text_to_check:
+                        should_translate = self.translator.should_translate(text_to_check, target_lang)
+                        if should_translate:
+                            cells_to_translate.append({
+                                "sheet": sheet_name,
+                                "row": row_idx,
+                                "col": col_idx,
+                                "value": text_to_check,  # Use stripped value for consistency
+                            })
+                        else:
+                            # Log why text was skipped (for debugging)
+                            logger.debug(
+                                f"Skipped translation for cell {sheet_name}!{cell.coordinate}: '{text_to_check[:50]}...' "
+                                f"(length: {len(text_to_check)}, has_english: {bool(re.search(r'[a-zA-Z]', text_to_check))})"
+                            )
 
         total_cells = len(cells_to_translate)
         logger.info(f"Found {total_cells} cells to translate")
@@ -185,6 +214,7 @@ class ExcelTranslator:
 
         # Apply translations to cells
         translated_count = 0
+        skipped_count = 0
         for i, cell_info in enumerate(cells_to_translate):
             sheet = wb[cell_info["sheet"]]
             cell = sheet.cell(row=cell_info["row"], column=cell_info["col"])
@@ -194,22 +224,36 @@ class ExcelTranslator:
                 # Get the translated text
                 translated_text = translation_map[original_text]
 
-                # Preserve leading/trailing whitespace from original
-                leading_space = len(cell_info["value"]) - len(cell_info["value"].lstrip())
-                trailing_space = len(cell_info["value"]) - len(cell_info["value"].rstrip())
-
-                if leading_space > 0 or trailing_space > 0:
-                    translated_text = (
-                        cell_info["value"][:leading_space]
-                        + translated_text
-                        + cell_info["value"][-trailing_space:]
-                        if trailing_space > 0
-                        else cell_info["value"][:leading_space] + translated_text
+                # Verify translation actually changed (safety check)
+                if translated_text.strip() == original_text.strip():
+                    logger.warning(
+                        f"Translation returned same text for cell {cell_info['sheet']}!{cell.coordinate}: '{original_text[:50]}...'"
                     )
+                    # Still count it as translated if it was attempted
+                    translated_count += 1
+                else:
+                    # Preserve leading/trailing whitespace from original
+                    leading_space = len(cell_info["value"]) - len(cell_info["value"].lstrip())
+                    trailing_space = len(cell_info["value"]) - len(cell_info["value"].rstrip())
 
-                # Update cell value (formatting is preserved automatically)
-                cell.value = translated_text
-                translated_count += 1
+                    if leading_space > 0 or trailing_space > 0:
+                        translated_text = (
+                            cell_info["value"][:leading_space]
+                            + translated_text
+                            + cell_info["value"][-trailing_space:]
+                            if trailing_space > 0
+                            else cell_info["value"][:leading_space] + translated_text
+                        )
+
+                    # Update cell value (formatting is preserved automatically)
+                    cell.value = translated_text
+                    translated_count += 1
+            else:
+                # This shouldn't happen, but log it for debugging
+                logger.warning(
+                    f"Translation map missing for cell {cell_info['sheet']}!{cell.coordinate}: '{original_text[:50]}...'"
+                )
+                skipped_count += 1
 
             # Reduced callback frequency from every 10 to every 50 cells to reduce overhead
             if progress_callback and i % 50 == 0:
@@ -226,11 +270,15 @@ class ExcelTranslator:
         wb.save(output_path)
         wb.close()
 
-        logger.info(f"Translation complete: {translated_count} cells translated")
+        logger.info(
+            f"Translation complete: {translated_count} cells translated, "
+            f"{skipped_count} skipped, {total_cells} total cells processed"
+        )
 
         return {
             "translated_cells": translated_count,
             "total_cells": total_cells,
+            "skipped_cells": skipped_count,
             "unique_texts": len(unique_text_list),
             "input_file": input_path,
             "output_file": output_path,
@@ -298,13 +346,41 @@ class ExcelTranslator:
                     if value.startswith("="):
                         continue
 
-                    if self.translator.should_translate(value.strip(), target_lang):
-                        cells_to_translate.append({
-                            "sheet": sheet_name,
-                            "row": row_idx,
-                            "col": col_idx,
-                            "value": value,
-                        })
+                    # Fix reversed/corrupted text before processing
+                    # This handles RTL characters and text that appears reversed
+                    sanitized_value = sanitize_text(value, single_line=False)
+                    
+                    # If the value was fixed (reversed), update the cell immediately
+                    if sanitized_value != value:
+                        cell.value = sanitized_value
+                        value = sanitized_value
+                        logger.info(f"Fixed reversed text in cell {sheet_name}!{cell.coordinate}: '{value[:100]}...'")
+                        
+                        # After fixing, verify it's no longer reversed
+                        from .utils import _is_likely_reversed
+                        if _is_likely_reversed(value):
+                            logger.warning(
+                                f"Text still appears reversed after fix in cell {sheet_name}!{cell.coordinate}: '{value[:100]}...'"
+                            )
+
+                    # Always check if text should be translated (even if it was just fixed)
+                    # This ensures corrupted text gets translated after being fixed
+                    text_to_check = value.strip()
+                    if text_to_check:
+                        should_translate = self.translator.should_translate(text_to_check, target_lang)
+                        if should_translate:
+                            cells_to_translate.append({
+                                "sheet": sheet_name,
+                                "row": row_idx,
+                                "col": col_idx,
+                                "value": text_to_check,  # Use stripped value for consistency
+                            })
+                        else:
+                            # Log why text was skipped (for debugging)
+                            logger.debug(
+                                f"Skipped translation for cell {sheet_name}!{cell.coordinate}: '{text_to_check[:50]}...' "
+                                f"(length: {len(text_to_check)}, has_english: {bool(re.search(r'[a-zA-Z]', text_to_check))})"
+                            )
 
         total_cells = len(cells_to_translate)
         logger.info(f"Found {total_cells} cells to translate")
@@ -374,6 +450,7 @@ class ExcelTranslator:
 
         # Apply translations
         translated_count = 0
+        skipped_count = 0
         for i, cell_info in enumerate(cells_to_translate):
             sheet = wb[cell_info["sheet"]]
             cell = sheet.cell(row=cell_info["row"], column=cell_info["col"])
@@ -382,19 +459,31 @@ class ExcelTranslator:
             if original_text in translation_map:
                 translated_text = translation_map[original_text]
 
-                # Preserve whitespace
-                leading_space = len(cell_info["value"]) - len(cell_info["value"].lstrip())
-                trailing_space = len(cell_info["value"]) - len(cell_info["value"].rstrip())
-
-                if leading_space > 0 or trailing_space > 0:
-                    translated_text = (
-                        cell_info["value"][:leading_space]
-                        + translated_text
-                        + (cell_info["value"][-trailing_space:] if trailing_space > 0 else "")
+                # Verify translation actually changed (safety check)
+                if translated_text.strip() == original_text.strip():
+                    logger.warning(
+                        f"Translation returned same text for cell {cell_info['sheet']}!{cell.coordinate}: '{original_text[:50]}...'"
                     )
+                    translated_count += 1
+                else:
+                    # Preserve whitespace
+                    leading_space = len(cell_info["value"]) - len(cell_info["value"].lstrip())
+                    trailing_space = len(cell_info["value"]) - len(cell_info["value"].rstrip())
 
-                cell.value = translated_text
-                translated_count += 1
+                    if leading_space > 0 or trailing_space > 0:
+                        translated_text = (
+                            cell_info["value"][:leading_space]
+                            + translated_text
+                            + (cell_info["value"][-trailing_space:] if trailing_space > 0 else "")
+                        )
+
+                    cell.value = translated_text
+                    translated_count += 1
+            else:
+                logger.warning(
+                    f"Translation map missing for cell {cell_info['sheet']}!{cell.coordinate}: '{original_text[:50]}...'"
+                )
+                skipped_count += 1
 
             # Reduced callback frequency from every 10 to every 50 cells to reduce overhead
             if progress_callback and i % 50 == 0:
@@ -409,11 +498,15 @@ class ExcelTranslator:
         wb.save(output_path)
         wb.close()
 
-        logger.info(f"Translation complete: {translated_count} cells translated")
+        logger.info(
+            f"Translation complete: {translated_count} cells translated, "
+            f"{skipped_count} skipped, {total_cells} total cells processed"
+        )
 
         return {
             "translated_cells": translated_count,
             "total_cells": total_cells,
+            "skipped_cells": skipped_count,
             "unique_texts": len(unique_text_list),
             "input_file": input_path,
             "output_file": output_path,

@@ -176,7 +176,7 @@ class DeterministicParser:
         return all_rows
 
     def _clean_cell(self, value: Optional[str]) -> str:
-        """Clean cell value."""
+        """Clean cell value, including fixing reversed text."""
         if value is None:
             return ""
 
@@ -186,23 +186,10 @@ class DeterministicParser:
         if text.lower() in ("nan", "none", "null"):
             return ""
 
-        # Remove Unicode bidirectional control characters that cause mirror/reverse text
-        # These characters can appear in PDFs and cause text to render backwards
-        bidi_chars = [
-            "\u202A",  # Left-to-Right Embedding (LRE)
-            "\u202B",  # Right-to-Left Embedding (RLE)
-            "\u202C",  # Pop Directional Formatting (PDF)
-            "\u202D",  # Left-to-Right Override (LRO)
-            "\u202E",  # Right-to-Left Override (RLO) - main culprit for mirrored text
-            "\u200E",  # Left-to-Right Mark (LRM)
-            "\u200F",  # Right-to-Left Mark (RLM)
-            "\u2066",  # Left-to-Right Isolate (LRI)
-            "\u2067",  # Right-to-Left Isolate (RLI)
-            "\u2068",  # First Strong Isolate (FSI)
-            "\u2069",  # Pop Directional Isolate (PDI)
-        ]
-        for char in bidi_chars:
-            text = text.replace(char, "")
+        # Use sanitize_text which handles RTL characters and reversed text detection
+        # This is critical for fixing corrupted polling area data
+        from .utils import sanitize_text
+        text = sanitize_text(text, single_line=False)
 
         # Remove control characters
         text = "".join(char for char in text if ord(char) >= 32 or char in "\n\t")

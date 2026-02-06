@@ -105,11 +105,29 @@ class ConstituencyExcelCreator:
                 )
                 continue
             
-            # Write validated row
+            # Write validated row with final validation pass
+            from .utils import _is_likely_reversed
             for col_idx, value in enumerate(validated_row, 1):
                 if col_idx <= len(headers):  # Safety check
                     cell = worksheet.cell(row=data_start_row + validated_rows, column=col_idx)
-                    cell.value = sanitize_text(value) if isinstance(value, str) else value
+                    
+                    # Final validation: Double-check for reversed text before writing
+                    if isinstance(value, str):
+                        sanitized = sanitize_text(value)
+                        # Re-check for reversed text after sanitization
+                        if _is_likely_reversed(sanitized):
+                            # Try reversing and re-sanitizing
+                            reversed_text = sanitized[::-1]
+                            re_sanitized = sanitize_text(reversed_text)
+                            if not _is_likely_reversed(re_sanitized):
+                                cell.value = re_sanitized
+                            else:
+                                # Keep original sanitized if reversed is still reversed
+                                cell.value = sanitized
+                        else:
+                            cell.value = sanitized
+                    else:
+                        cell.value = value
             
             validated_rows += 1
 

@@ -239,14 +239,17 @@ class GeocodingService:
 
             # Call progress callback
             if progress_callback:
-                truncated_address = address[:50] + "..." if len(address) > 50 else address
-                progress_callback(
-                    i + 1,
-                    total,
-                    f"Geocoding: {truncated_address}",
-                    success_count,
-                    failed_count
-                )
+                try:
+                    truncated_address = address[:50] + "..." if len(address) > 50 else address
+                    progress_callback(
+                        i + 1,
+                        total,
+                        f"Geocoding: {truncated_address}",
+                        success_count,
+                        failed_count
+                    )
+                except Exception as callback_error:
+                    logger.warning(f"Progress callback error: {callback_error}")
 
             logger.debug(
                 f"Geocoded {i + 1}/{total}: {address[:30]}... -> "
@@ -275,30 +278,76 @@ def extract_addresses_from_column(
     Raises:
         ValueError: If address column not found
     """
-    # Find column index
+    if not headers:
+        raise ValueError("No headers found in the data")
+    
+    if not rows:
+        raise ValueError("No rows found in the data")
+    
+    # Normalize the address column name for matching
+    address_column_lower = address_column.lower().strip()
+    
+    # Find column index - try exact match first, then partial match
     col_index = None
+    exact_match_index = None
+    partial_match_index = None
+    
     for i, header in enumerate(headers):
-        if header.lower() == address_column.lower():
-            col_index = i
+        header_lower = str(header).lower().strip()
+        
+        # Exact match (case-insensitive)
+        if header_lower == address_column_lower:
+            exact_match_index = i
             break
-        # Also check for partial match
-        if address_column.lower() in header.lower():
-            col_index = i
-            break
-
+        
+        # Partial match - check if address_column is in header or vice versa
+        if address_column_lower in header_lower or header_lower in address_column_lower:
+            # Prefer columns with common address keywords
+            address_keywords = ["address", "location", "building", "place", "area", "street", "road"]
+            if any(keyword in header_lower for keyword in address_keywords):
+                if partial_match_index is None:
+                    partial_match_index = i
+    
+    # Use exact match if found, otherwise use partial match
+    col_index = exact_match_index if exact_match_index is not None else partial_match_index
+    
     if col_index is None:
-        raise ValueError(f"Column '{address_column}' not found. Available columns: {headers}")
-
+        available_columns = ", ".join([f"'{h}'" for h in headers[:10]])  # Show first 10 columns
+        if len(headers) > 10:
+            available_columns += f", ... ({len(headers)} total columns)"
+        raise ValueError(
+            f"Column '{address_column}' not found. "
+            f"Available columns: {available_columns}. "
+            f"Please check the column name and try again."
+        )
+    
+    logger.info(f"Found address column '{address_column}' at index {col_index} (header: '{headers[col_index]}')")
+    
     # Extract addresses
     addresses = []
+    non_empty_count = 0
     for row_idx, row in enumerate(rows):
         if col_index < len(row):
             address = row[col_index]
-            if address and str(address).strip():
-                addresses.append((row_idx, str(address).strip()))
+            # Convert to string and clean
+            if address is not None:
+                address_str = str(address).strip()
+                if address_str:
+                    addresses.append((row_idx, address_str))
+                    non_empty_count += 1
+                else:
+                    addresses.append((row_idx, ""))
             else:
                 addresses.append((row_idx, ""))
         else:
             addresses.append((row_idx, ""))
-
+    
+    logger.info(f"Extracted {non_empty_count} non-empty addresses from {len(rows)} rows")
+    
+    if non_empty_count == 0:
+        raise ValueError(
+            f"No addresses found in column '{address_column}'. "
+            f"The column exists but all values are empty."
+        )
+    
     return addresses

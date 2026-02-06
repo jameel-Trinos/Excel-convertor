@@ -626,7 +626,7 @@ class StructuredPDFProcessor:
         return tables or []
 
     def _clean_cell(self, value) -> str:
-        """Clean and sanitize a cell value."""
+        """Clean and sanitize a cell value, including fixing reversed text."""
         if value is None:
             return ""
 
@@ -636,21 +636,11 @@ class StructuredPDFProcessor:
         if text.lower() in ("nan", "none", "null", "undefined"):
             return ""
 
-        # Remove Unicode bidirectional control characters
-        bidi_chars = [
-            "\u202A", "\u202B", "\u202C", "\u202D", "\u202E",
-            "\u200E", "\u200F", "\u2066", "\u2067", "\u2068", "\u2069"
-        ]
-        for char in bidi_chars:
-            text = text.replace(char, "")
+        # Use sanitize_text which handles RTL characters and reversed text detection
+        # This is critical for fixing corrupted polling area data
+        text = sanitize_text(text, single_line=False)
 
-        # Remove control characters
-        text = "".join(char for char in text if ord(char) >= 32 or char in "\n\t")
-
-        # Normalize whitespace
-        text = " ".join(text.split())
-
-        return text.strip()
+        return text
 
     # ═══════════════════════════════════════════════════════════════
     # PHASE 4: CREATE EXCEL FILE WITH PERFECT STRUCTURE
@@ -788,9 +778,18 @@ class StructuredPDFProcessor:
             for col_idx, value in enumerate(row_data, start=1):
                 cell = sheet.cell(row=current_row, column=col_idx)
 
-                # Convert to appropriate type
+                # Convert to appropriate type with final validation
                 if value and value.strip():
                     sanitized = sanitize_text(value)
+                    # Final validation: Re-check for reversed text after sanitization
+                    from .utils import _is_likely_reversed
+                    if _is_likely_reversed(sanitized):
+                        # Try reversing and re-sanitizing
+                        reversed_text = sanitized[::-1]
+                        re_sanitized = sanitize_text(reversed_text)
+                        if not _is_likely_reversed(re_sanitized):
+                            sanitized = re_sanitized
+                    
                     try:
                         cell.value = int(sanitized.replace(',', ''))
                         cell.number_format = '#,##0'
