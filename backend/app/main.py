@@ -21,6 +21,7 @@ from .constituency_excel_creator import ConstituencyExcelCreator
 from .constituency_processor import ConstituencyProcessor
 from .excel_creator import ExcelCreator
 from .models import (
+    AddBoothNameColumnRequest,
     ConversionTask,
     DownloadModifiedRequest,
     ErrorResponse,
@@ -129,6 +130,16 @@ async def process_conversion(task_id: str, file_path: Path, use_constituency_pro
 
         update_task_progress(task_id, 85, "Creating Excel file...")
 
+        # Extract AC number from page texts (only for election results, not constituency)
+        ac_number = None
+        if not use_constituency_processor and extraction_result.page_texts:
+            from .ac_extractor import extract_ac_number
+            ac_number = extract_ac_number(extraction_result.page_texts)
+            if ac_number:
+                logger.info(f"Extracted AC number: {ac_number}")
+            else:
+                logger.warning("Could not extract AC number from PDF")
+
         # Create Excel file - use constituency creator if using constituency processor
         if use_constituency_processor:
             creator = ConstituencyExcelCreator()
@@ -138,12 +149,22 @@ async def process_conversion(task_id: str, file_path: Path, use_constituency_pro
         output_filename = f"{task_id}.xlsx"
         output_path = OUTPUT_DIR / output_filename
 
-        await asyncio.to_thread(
-            creator.create_from_tables,
-            extraction_result.tables,
-            str(output_path),
-            source_filename=tasks[task_id].filename,
-        )
+        # Pass AC number to ExcelCreator (only for election results)
+        if use_constituency_processor:
+            await asyncio.to_thread(
+                creator.create_from_tables,
+                extraction_result.tables,
+                str(output_path),
+                source_filename=tasks[task_id].filename,
+            )
+        else:
+            await asyncio.to_thread(
+                creator.create_from_tables,
+                extraction_result.tables,
+                str(output_path),
+                source_filename=tasks[task_id].filename,
+                ac_number=ac_number,
+            )
 
         update_task_progress(task_id, 95, "Finalizing...")
 
@@ -298,6 +319,206 @@ async def upload_booth_pdf(
         size=len(content),
         message="File uploaded successfully. Booth conversion started.",
     )
+
+
+@app.post("/api/booth/add-booth-name-column", response_model=FullPreviewData)
+async def add_booth_name_column(request: AddBoothNameColumnRequest):
+    """
+    Add a "Booth name" column by extracting text before comma from source column.
+    
+    Extracts the text before the first comma (",") from each cell in the source column
+    and adds it as a new "Booth name" column immediately after the source column.
+    """
+    if request.task_id not in tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    task = tasks[request.task_id]
+
+    if task.status != "completed":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Task not completed. Current status: {task.status}",
+        )
+
+    if not task.output_file or not Path(task.output_file).exists():
+        raise HTTPException(status_code=404, detail="Output file not found")
+
+    try:
+        import openpyxl
+
+        wb = openpyxl.load_workbook(task.output_file, data_only=True)
+        ws = wb.active
+
+        # Find actual data range
+        actual_max_row = ws.max_row if ws.max_row else 0
+        actual_max_col = ws.max_column if ws.max_column else 0
+
+        # Scan to find actual data boundaries
+        last_data_row = actual_max_row
+        scan_limit = max(actual_max_row + 100, 1000)
+        for row in range(1, min(scan_limit + 1, 2000)):
+            for col in range(1, min(actual_max_col + 100, 200)):
+                cell = ws.cell(row, col)
+                if cell.value is not None and str(cell.value).strip():
+                    actual_max_row = max(actual_max_row, row)
+                    actual_max_col = max(actual_max_col, col)
+                    last_data_row = row
+            if row > last_data_row + 50:
+                break
+
+        if actual_max_row == 0:
+            actual_max_row = ws.max_row if ws.max_row else 100
+        if actual_max_col == 0:
+            actual_max_col = ws.max_column if ws.max_column else 50
+
+        # Find data start row (skip title rows)
+        data_start_row = 1
+        document_title = None
+        for row in range(1, min(20, actual_max_row + 1)):
+            cell_value = ws.cell(row, 1).value
+            if cell_value and str(cell_value).strip():
+                # Check if this looks like a title row
+                if row == 1 and "FORM" in str(cell_value).upper():
+                    document_title = str(cell_value).strip()
+                    continue
+                # Check if this row looks like headers
+                non_empty_count = sum(
+                    1 for col in range(1, min(actual_max_col + 1, 20))
+                    if ws.cell(row, col).value and str(ws.cell(row, col).value).strip()
+                )
+                if non_empty_count >= 2:
+                    data_start_row = row
+                    break
+
+        # Find where actual data starts
+        first_data_row = data_start_row + 1
+        for row in range(data_start_row + 1, min(data_start_row + 10, actual_max_row + 1)):
+            cell_val = ws.cell(row, 1).value
+            if cell_val is not None:
+                if isinstance(cell_val, (int, float)) or (isinstance(cell_val, str) and cell_val.strip().isdigit()):
+                    first_data_row = row
+                    break
+
+        # Calculate how many header rows we have
+        num_header_rows = first_data_row - data_start_row
+
+        # Get headers by merging multi-row headers
+        from .header_fixer import HeaderFixer
+        from .party_name_fixer import PartyNameFixer
+
+        headers = []
+        for col in range(1, actual_max_col + 1):
+            header_parts = []
+            for header_row in range(data_start_row, data_start_row + num_header_rows):
+                value = ws.cell(header_row, col).value
+                if value is not None and str(value).strip():
+                    clean_value = str(value).strip()
+                    if clean_value.upper() not in ['PARTY ABBREVIATION', 'NO. OF VALID VOTES CAST IN FAVOUR OF']:
+                        header_parts.append(clean_value)
+
+            if header_parts:
+                if len(header_parts) == 1:
+                    headers.append(header_parts[0])
+                else:
+                    combined = " - ".join(header_parts[-2:]) if len(header_parts) >= 2 else header_parts[-1]
+                    headers.append(combined)
+            else:
+                headers.append(f"Column {col}")
+
+        # Fix reversed headers if needed
+        needs_fixing = False
+        for header in headers:
+            if any(pattern.lower() in header.lower() for pattern in HeaderFixer.KNOWN_REVERSED_PATTERNS):
+                needs_fixing = True
+                break
+            if PartyNameFixer.is_likely_party_name(header):
+                fixed = PartyNameFixer.fix_reversed_party_name(header)
+                if fixed != header:
+                    needs_fixing = True
+                    break
+
+        if needs_fixing:
+            headers = HeaderFixer.fix_header_list(headers)
+
+        if not headers:
+            for col in range(1, min(actual_max_col + 1, 50)):
+                headers.append(f"Column {col}")
+
+        # Find source column index
+        source_col_idx = None
+        for idx, header in enumerate(headers):
+            if header == request.source_column:
+                source_col_idx = idx
+                break
+
+        if source_col_idx is None:
+            wb.close()
+            raise HTTPException(
+                status_code=400,
+                detail=f"Source column '{request.source_column}' not found in headers",
+            )
+
+        # Get ALL data rows
+        rows = []
+        for row_idx in range(first_data_row, actual_max_row + 1):
+            row_data = []
+            num_cols_to_read = max(len(headers), actual_max_col)
+            for col in range(1, num_cols_to_read + 1):
+                value = ws.cell(row_idx, col).value
+                if isinstance(value, str):
+                    value = sanitize_text(value, single_line=False)
+                row_data.append(value)
+            while len(row_data) < len(headers):
+                row_data.append(None)
+            if len(row_data) > len(headers):
+                row_data = row_data[:len(headers)]
+            rows.append(row_data)
+
+        # Extract booth names from source column
+        booth_names = []
+        for row in rows:
+            source_value = row[source_col_idx] if source_col_idx < len(row) else None
+            if source_value is not None:
+                source_str = str(source_value).strip()
+                # Extract text before first comma
+                if "," in source_str:
+                    booth_name = source_str.split(",")[0].strip()
+                else:
+                    booth_name = source_str
+                booth_names.append(booth_name)
+            else:
+                booth_names.append("")
+
+        # Insert "Booth name" column after source column
+        new_headers = headers[:]
+        new_headers.insert(source_col_idx + 1, "Booth name")
+
+        # Update rows with new column
+        new_rows = []
+        for row_idx, row in enumerate(rows):
+            new_row = row[:]
+            new_row.insert(source_col_idx + 1, booth_names[row_idx])
+            new_rows.append(new_row)
+
+        wb.close()
+
+        return FullPreviewData(
+            headers=new_headers,
+            rows=new_rows,
+            total_rows=len(new_rows),
+            total_columns=len(new_headers),
+            pages_processed=1,
+            document_title=document_title,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to add booth name column: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to add booth name column: {str(e)}",
+        )
 
 
 @app.get("/api/status/{task_id}", response_model=StatusResponse)

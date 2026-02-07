@@ -138,9 +138,13 @@ class PDFProcessor:
                     # Merge all tables into a single table
                     update_progress(80, "Merging tables from all pages...")
                     merged_table = self._merge_tables(tables)
+                    
+                    # Extract page texts for AC number extraction
+                    page_texts = await asyncio.to_thread(self._extract_page_texts)
+                    
                     result = ExtractionResult(
                         tables=[merged_table],
-                        page_texts=[],
+                        page_texts=page_texts,
                     )
                     extraction_method = "pdfplumber"
 
@@ -1115,6 +1119,27 @@ class PDFProcessor:
             return False
 
         return matches / comparisons >= 0.8
+
+    def _extract_page_texts(self) -> List[str]:
+        """Extract raw text from all pages of the PDF."""
+        import pdfplumber
+        
+        page_texts = []
+        
+        try:
+            with pdfplumber.open(str(self.file_path)) as pdf:
+                for page in pdf.pages:
+                    try:
+                        text = page.extract_text() or ""
+                        page_texts.append(text)
+                    except Exception as e:
+                        logger.warning(f"Error extracting text from page: {e}")
+                        page_texts.append("")
+        except Exception as e:
+            logger.error(f"Error extracting page texts: {e}", exc_info=True)
+            return []
+        
+        return page_texts
 
     def get_page_count(self) -> int:
         """Get the number of pages in the PDF."""

@@ -98,6 +98,7 @@ class ExtractionResult(BaseModel):
 
     tables: list[TableData] = Field(default_factory=list)
     page_texts: list[str] = Field(default_factory=list)
+    ac_number: Optional[str] = Field(default=None, description="Assembly Constituency number extracted from PDF")
 
 
 
@@ -294,3 +295,10 @@ class TranslateStatusResponse(BaseModel):
     tamil_file_path: Optional[str] = Field(default=None, description="Path to Tamil Excel file")
     hindi_file_path: Optional[str] = Field(default=None, description="Path to Hindi Excel file")
     english_file_path: Optional[str] = Field(default=None, description="Path to English Excel file")
+
+
+class AddBoothNameColumnRequest(BaseModel):
+    """Request model for adding booth name column."""
+
+    task_id: str = Field(..., description="Task ID of the Excel file")
+    source_column: str = Field(..., description="Column name to extract booth names from")

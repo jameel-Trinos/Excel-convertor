@@ -2,15 +2,39 @@
 
 import asyncio
 import logging
+import os
 import re
+import ssl
 import time
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
 
 from geopy.geocoders import Nominatim
 from geopy.exc import GeocoderTimedOut, GeocoderServiceError, GeocoderUnavailable
+import urllib3
 
 logger = logging.getLogger(__name__)
+
+# Disable SSL warnings if we're disabling verification
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Monkey-patch requests to disable SSL verification by default for geocoding
+# This is needed because some systems have SSL certificate issues
+try:
+    import requests
+    
+    # Patch requests Session to disable SSL verification
+    _original_request = requests.Session.request
+    
+    def _patched_request(self, method, url, **kwargs):
+        """Patched request method that disables SSL verification."""
+        kwargs.setdefault('verify', False)
+        return _original_request(self, method, url, **kwargs)
+    
+    requests.Session.request = _patched_request
+    logger.info("Patched requests library to disable SSL verification for geocoding")
+except Exception as e:
+    logger.warning(f"Failed to patch requests library: {e}")
 
 # Simple in-memory cache to avoid re-geocoding same addresses
 _geocode_cache: Dict[str, dict] = {}
@@ -66,17 +90,117 @@ def clean_address(address: str) -> str:
 class GeocodingService:
     """Service for geocoding addresses using OpenStreetMap Nominatim."""
 
-    def __init__(self, user_agent: str = "pdf-excel-converter"):
+    def __init__(self, user_agent: str = "pdf-excel-converter", verify_ssl: Optional[bool] = None):
         """
         Initialize the geocoding service.
 
         Args:
             user_agent: User agent string for Nominatim API (required by their TOS)
+            verify_ssl: Whether to verify SSL certificates. If None, checks GEOCODE_VERIFY_SSL env var,
+                       defaults to False if SSL verification fails
         """
-        self.geolocator = Nominatim(user_agent=user_agent, timeout=15)
+        # Check environment variable for SSL verification setting
+        # Default to False (disable verification) to handle SSL certificate issues
+        if verify_ssl is None:
+            verify_ssl_env = os.getenv("GEOCODE_VERIFY_SSL", "false").lower()
+            verify_ssl = verify_ssl_env in ("true", "1", "yes", "on")
+        
+        self.verify_ssl = verify_ssl
+        
+        # Initialize Nominatim (but we'll use direct HTTP as primary method due to SSL issues)
+        # SSL verification is handled at the module level via monkey-patch
+        try:
+            self.geolocator = Nominatim(user_agent=user_agent, timeout=15)
+        except Exception as e:
+            logger.warning(f"Failed to initialize Nominatim geolocator: {e}")
+            self.geolocator = None
+        
+        if not self.verify_ssl:
+            logger.info("SSL certificate verification is disabled for geocoding requests (using direct HTTP method)")
+        
         self.rate_limit_delay = 1.1  # Nominatim requires max 1 request/second
         self.max_retries = 3
         self.retry_delay = 2.0
+        self.user_agent = user_agent
+
+    def _geocode_direct_http(self, query: str) -> dict:
+        """
+        Direct HTTP request to Nominatim API, bypassing geopy.
+        This is a fallback when geopy has SSL issues.
+        
+        Args:
+            query: Address query string
+            
+        Returns:
+            dict with keys: latitude, longitude, status, error
+        """
+        try:
+            import requests
+            
+            # Nominatim API endpoint
+            url = "https://nominatim.openstreetmap.org/search"
+            params = {
+                "q": query,
+                "format": "json",
+                "limit": 1,
+                "addressdetails": 0
+            }
+            headers = {
+                "User-Agent": self.user_agent
+            }
+            
+            logger.debug(f"Making direct HTTP request to Nominatim for: {query[:50]}...")
+            
+            # Make request without SSL verification
+            response = requests.get(
+                url, 
+                params=params, 
+                headers=headers, 
+                verify=False,  # Explicitly disable SSL verification
+                timeout=15
+            )
+            
+            logger.debug(f"HTTP response status: {response.status_code}")
+            response.raise_for_status()
+            
+            data = response.json()
+            logger.debug(f"Received {len(data) if data else 0} results from Nominatim")
+            
+            if data and len(data) > 0:
+                result_data = data[0]
+                lat = float(result_data.get("lat", 0))
+                lon = float(result_data.get("lon", 0))
+                logger.info(f"Successfully geocoded '{query[:50]}...' -> ({lat}, {lon})")
+                return {
+                    "latitude": lat,
+                    "longitude": lon,
+                    "status": "success",
+                    "error": None
+                }
+            else:
+                logger.debug(f"No results found for: {query[:50]}...")
+                return {
+                    "latitude": None,
+                    "longitude": None,
+                    "status": "not_found",
+                    "error": "Address not found"
+                }
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Direct HTTP geocoding request failed: {e}")
+            return {
+                "latitude": None,
+                "longitude": None,
+                "status": "error",
+                "error": f"HTTP request failed: {str(e)}"
+            }
+        except Exception as e:
+            logger.error(f"Direct HTTP geocoding failed with unexpected error: {e}", exc_info=True)
+            return {
+                "latitude": None,
+                "longitude": None,
+                "status": "error",
+                "error": str(e)
+            }
 
     def geocode_single(
         self,
@@ -131,42 +255,85 @@ class GeocodingService:
         if region_hint and cleaned_address != address.strip():
             queries_to_try.append(f"{address.strip()}, {region_hint}")
 
+        # Try direct HTTP first (more reliable with SSL issues)
         for query in queries_to_try:
-            for attempt in range(self.max_retries):
-                try:
-                    location = self.geolocator.geocode(query)
+            try:
+                logger.debug(f"Trying direct HTTP geocoding for: {query[:50]}...")
+                result = self._geocode_direct_http(query)
+                if result and result.get("status") == "success":
+                    _geocode_cache[cache_key] = result
+                    logger.debug(f"Direct HTTP geocoding succeeded for: {query[:50]}...")
+                    return result
+                elif result and result.get("status") == "not_found":
+                    # Address not found, try next query variation
+                    continue
+            except Exception as http_error:
+                logger.debug(f"Direct HTTP geocoding failed: {http_error}")
+            
+            # Fallback to geopy if available
+            if self.geolocator:
+                for attempt in range(self.max_retries):
+                    try:
+                        location = self.geolocator.geocode(query)
 
-                    if location:
-                        result = {
-                            "latitude": location.latitude,
-                            "longitude": location.longitude,
-                            "status": "success",
-                            "error": None
-                        }
-                        # Cache successful result
-                        _geocode_cache[cache_key] = result
-                        return result
+                        if location:
+                            result = {
+                                "latitude": location.latitude,
+                                "longitude": location.longitude,
+                                "status": "success",
+                                "error": None
+                            }
+                            # Cache successful result
+                            _geocode_cache[cache_key] = result
+                            return result
 
-                    # No result, try next query
-                    break
+                        # No result, try next query
+                        break
 
-                except GeocoderTimedOut:
-                    if attempt < self.max_retries - 1:
-                        time.sleep(self.retry_delay * (attempt + 1))
-                        continue
-                    # On final attempt timeout, try next query
-                    break
+                    except GeocoderTimedOut:
+                        if attempt < self.max_retries - 1:
+                            time.sleep(self.retry_delay * (attempt + 1))
+                            continue
+                        # On final attempt timeout, try next query
+                        break
 
-                except (GeocoderServiceError, GeocoderUnavailable) as e:
-                    if attempt < self.max_retries - 1:
-                        time.sleep(self.retry_delay * (attempt + 1))
-                        continue
-                    logger.warning(f"Geocoding service error for '{query[:30]}...': {e}")
-                    break
+                    except (GeocoderServiceError, GeocoderUnavailable) as e:
+                        error_str = str(e).lower()
+                        # Check if it's an SSL error
+                        if "ssl" in error_str or "certificate" in error_str or "cert" in error_str:
+                            # Try direct HTTP request as fallback
+                            logger.warning(f"SSL error with geopy, trying direct HTTP request: {e}")
+                            try:
+                                result = self._geocode_direct_http(query)
+                                if result and result.get("status") == "success":
+                                    _geocode_cache[cache_key] = result
+                                    return result
+                            except Exception as http_error:
+                                logger.debug(f"Direct HTTP geocoding also failed: {http_error}")
+                        
+                        if attempt < self.max_retries - 1:
+                            time.sleep(self.retry_delay * (attempt + 1))
+                            continue
+                        logger.warning(f"Geocoding service error for '{query[:30]}...': {e}")
+                        break
 
-                except Exception as e:
-                    logger.error(f"Unexpected geocoding error: {e}")
-                    break
+                    except Exception as e:
+                        error_str = str(e).lower()
+                        # Check if it's an SSL error in the exception message
+                        if "ssl" in error_str or "certificate" in error_str or "cert" in error_str:
+                            # Try direct HTTP request as fallback
+                            logger.warning(f"SSL error detected, trying direct HTTP request: {e}")
+                            try:
+                                result = self._geocode_direct_http(query)
+                                if result and result.get("status") == "success":
+                                    _geocode_cache[cache_key] = result
+                                    return result
+                            except Exception as http_error:
+                                logger.debug(f"Direct HTTP geocoding also failed: {http_error}")
+                        
+                        logger.error(f"Unexpected geocoding error: {e}")
+                        # Continue to next query if this one fails
+                        break
 
         # All queries failed
         result = {

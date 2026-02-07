@@ -36,6 +36,7 @@ class ExcelCreator:
         output_path: str,
         source_filename: str = "Untitled",
         page_texts: Optional[List[str]] = None,
+        ac_number: Optional[str] = None,
     ) -> str:
         """
         Create an Excel file from extracted table data.
@@ -45,6 +46,7 @@ class ExcelCreator:
             output_path: Path where Excel file will be saved
             source_filename: Original PDF filename
             page_texts: Not used in simplified version
+            ac_number: Optional Assembly Constituency number to add as first column
 
         Returns:
             Path to the created Excel file
@@ -70,6 +72,13 @@ class ExcelCreator:
             workbook.save(output_path)
             return output_path
 
+        # Add AC NO as first column (always add, even if ac_number is None)
+        headers = ["AC NO."] + headers
+        if ac_number:
+            logger.info(f"Added AC NO column with value: {ac_number}")
+        else:
+            logger.info("Added AC NO column (AC number not found in PDF)")
+
         current_row = 1
 
         # Write headers
@@ -88,9 +97,16 @@ class ExcelCreator:
         corrected_cells = 0
         
         for row_idx, row_data in enumerate(rows):
-            for col_idx, value in enumerate(row_data, 1):
-                if col_idx <= len(headers):  # Ensure we don't exceed header count
-                    cell = worksheet.cell(row=data_start_row + row_idx, column=col_idx)
+            # Write AC NO in first column (always present, may be empty if not found)
+            cell = worksheet.cell(row=data_start_row + row_idx, column=1)
+            cell.value = ac_number if ac_number else ""
+            
+            # Write remaining data columns (shifted by 1 since AC NO column is always first)
+            start_col = 2
+            for col_idx, value in enumerate(row_data, 0):
+                excel_col = start_col + col_idx
+                if excel_col <= len(headers):  # Ensure we don't exceed header count
+                    cell = worksheet.cell(row=data_start_row + row_idx, column=excel_col)
                     
                     # Final validation: Double-check for reversed text before writing
                     if isinstance(value, str):
@@ -104,7 +120,7 @@ class ExcelCreator:
                                 cell.value = re_sanitized
                                 corrected_cells += 1
                                 logger.debug(
-                                    f"Final validation fix: Row {data_start_row + row_idx}, Col {col_idx}: "
+                                    f"Final validation fix: Row {data_start_row + row_idx}, Col {excel_col}: "
                                     f"'{value[:50]}...' -> '{re_sanitized[:50]}...'"
                                 )
                             else:
@@ -139,6 +155,7 @@ class ExcelCreator:
                 data_start_row=data_start_row,
                 data_end_row=data_end_row,
                 num_columns=len(headers),
+                has_ac_column=True,  # AC NO column is always present as first column
             )
 
         # Auto-fit column widths
@@ -198,13 +215,29 @@ class ExcelCreator:
         data_start_row: int,
         data_end_row: int,
         num_columns: int,
+        has_ac_column: bool = False,
     ):
-        """Add a TOTAL row with SUM formulas for numeric columns."""
+        """
+        Add a TOTAL row with SUM formulas for numeric columns.
+        
+        Args:
+            worksheet: The worksheet to modify
+            total_row: Row number for the total row
+            header_row: Row number of the header row
+            data_start_row: First row of data
+            data_end_row: Last row of data
+            num_columns: Total number of columns
+            has_ac_column: Whether AC NO column exists (should be skipped in totals)
+        """
         # First column gets "TOTAL" label
         worksheet.cell(row=total_row, column=1).value = "TOTAL"
 
+        # Start from column 2 (skip AC NO column if it exists, or skip TOTAL label column)
+        start_col = 2 if has_ac_column else 2
+        
         # Check each column for numeric content and add SUM formulas
-        for col in range(2, num_columns + 1):
+        # Skip the first column (AC NO or TOTAL label)
+        for col in range(start_col, num_columns + 1):
             if self._is_numeric_column(worksheet, col, data_start_row, data_end_row):
                 col_letter = get_column_letter(col)
                 formula = f"=SUM({col_letter}{data_start_row}:{col_letter}{data_end_row})"
