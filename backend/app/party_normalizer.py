@@ -4,6 +4,13 @@ import logging
 import re
 from typing import Dict, List, Optional
 
+from .party_aliases import (
+    TN_PARTY_ALIASES,
+    get_party_abbreviation,
+    get_standardized_party_name,
+    get_all_aliases,
+    is_party_alias,
+)
 from .party_name_fixer import PartyNameFixer
 
 logger = logging.getLogger(__name__)
@@ -18,210 +25,15 @@ class PartyNormalizer:
     """
 
     # Party name mappings: key = standardized name, value = list of variations
+    # Built from comprehensive TN_PARTY_ALIASES mapping
     # Order defines standard output column order
-    PARTY_MAPPINGS = {
-        "BJP Votes": [
-            "Bharatiya Janata Party",
-            "BHARATIYA JANATA PARTY",
-            "BJP",
-            "B.J.P.",
-            "B J P",
-            "Bharatiya Janata Party Votes",
-            "BJP Votes",
-            # Word-order reversals
-            "JANATA BHARATIYA PARTY",
-            "PARTY JANATA BHARATIYA",
-            "BHARATIYA PARTY JANATA",
-        ],
-        "AIADMK Votes": [
-            "All India Dravida Munnetra Kazhagam",
-            "ALL INDIA DRAVIDA MUNNETRA KAZHAGAM",  # Without ANNA (canonical)
-            "All India Anna Dravida Munnetra Kazhagam",  # With ANNA (variant)
-            "ALL INDIA ANNA DRAVIDA MUNNETRA KAZHAGAM",  # With ANNA (variant)
-            "AIADMK",
-            "A.I.A.D.M.K.",
-            "A I A D M K",
-            "All India Dravida Munnetra Kazhagam Votes",
-            "AIADMK Votes",
-            "Anna DMK",
-            # Character-level reversals
-            "ARTENNUM ANNA MAGAHZAK AIDNI ADIVARD LLA",
-            "LLA ADIVARD AIDNI MAGAHZAK ANNA ARTENNUM",
-            "MAGAHZAK ARTENNUM ANNA ADIVARD AIDNI LLA",
-            # Word-order reversals (map to without ANNA)
-            "MUNNETRA ANNA KAZHAGAM INDIA DRAVIDA ALL",
-            "MUNNETRA KAZHAGAM INDIA DRAVIDA ALL",
-            "ANNA DRAVIDA MUNNETRA KAZHAGAM INDIA ALL",
-            "DRAVIDA MUNNETRA KAZHAGAM ANNA INDIA ALL",
-            "DRAVIDA MUNNETRA KAZHAGAM INDIA ALL",
-        ],
-        "DMK Votes": [
-            "Dravida Munnetra Kazhagam",
-            "DRAVIDA MUNNETRA KAZHAGAM",
-            "DMK",
-            "D.M.K.",
-            "D M K",
-            "Dravida Munnetra Kazhagam Votes",
-            "DMK Votes",
-            # Character-level reversals
-            "ARTENNUM MAGAHZAK ADIVARD",
-            "MAGAHZAK ARTENNUM ADIVARD",
-            "ADIVARD ARTENNUM MAGAHZAK",
-            # Word-order reversals
-            "MUNNETRA KAZHAGAM DRAVIDA",
-            "KAZHAGAM MUNNETRA DRAVIDA",
-            "DRAVIDA KAZHAGAM MUNNETRA",
-        ],
-        "Congress Votes": [
-            "Indian National Congress",
-            "INDIAN NATIONAL CONGRESS",
-            "Congress",
-            "INC",
-            "I.N.C.",
-            "Indian National Congress Votes",
-            "Congress Votes",
-            "Congress (I)",
-            # Word-order reversals
-            "NATIONAL INDIAN CONGRESS",
-            "CONGRESS NATIONAL INDIAN",
-            "INDIAN CONGRESS NATIONAL",
-        ],
-        "VCK Votes": [
-            "Viduthalai Chiruthaigal Katchi",
-            "VIDUTHALAI CHIRUTHAIGAL KATCHI",
-            "VCK",
-            "V.C.K.",
-            "V C K",
-            "Viduthalai Chiruthaigal Katchi Votes",
-            "VCK Votes",
-            # Word-order reversals
-            "KATCHI VIDUTHALAI CHIRUTHAIGAL",
-            "CHIRUTHAIGAL VIDUTHALAI KATCHI",
-            "KATCHI CHIRUTHAIGAL VIDUTHALAI",
-        ],
-        "PMK Votes": [
-            "Pattali Makkal Katchi",
-            "PATTALI MAKKAL KATCHI",
-            "PMK",
-            "P.M.K.",
-            "P M K",
-            "Pattali Makkal Katchi Votes",
-            "PMK Votes",
-            # Character-level reversals
-            "IHCTAK LAKKAM ILATTAP",
-            "ILATTAP LAKKAM IHCTAK",
-            # Word-order reversals
-            "MAKKAL PATTALI KATCHI",
-            "PATTALI KATCHI MAKKAL",
-            "KATCHI PATTALI MAKKAL",
-        ],
-        "NTK Votes": [
-            "Naam Tamizhar Katchi",
-            "NAAM TAMIZHAR KATCHI",
-            "NAAM TAMILAR KATCHI",  # Common variant
-            "NTK",
-            "N.T.K.",
-            "N T K",
-            "Naam Tamizhar Katchi Votes",
-            "NTK Votes",
-            # Character-level reversals
-            "IHCTAK RALIMAT MAAN",
-            "MAAN RALIMAT IHCTAK",
-            "HCTAK RALIMAT MAAN",
-            # Word-order reversals
-            "TAMIZHAR KATCHI NAAM",
-            "TAMILAR KATCHI NAAM",
-            "KATCHI TAMIZHAR NAAM",
-            "KATCHI TAMILAR NAAM",
-            "NAAM KATCHI TAMIZHAR",
-            "NAAM KATCHI TAMILAR",
-        ],
-        "BSP Votes": [
-            "Bahujan Samaj Party",
-            "BAHUJAN SAMAJ PARTY",
-            "BSP",
-            "B.S.P.",
-            "B S P",
-            "Bahujan Samaj Party Votes",
-            "BSP Votes",
-            # Character-level reversals
-            "YTRAP NAJAS UJAHAB",
-            # Word-order reversals
-            "PARTY BAHUJAN SAMAJ",
-            "SAMAJ PARTY BAHUJAN",
-            "SAMAJ BAHUJAN PARTY",
-            "PARTY SAMAJ BAHUJAN",
-        ],
-        "NMK Votes": [
-            "Namma Makkal Katchi",
-            "NMK",
-            "N.M.K.",
-            "N M K",
-            "Namma Makkal Katchi Votes",
-            "NMK Votes",
-        ],
-        "MDMK Votes": [
-            "Marumalarchi Dravida Munnetra Kazhagam",
-            "MDMK",
-            "M.D.M.K.",
-            "M D M K",
-            "MDMK Votes",
-        ],
-        "CPI Votes": [
-            "Communist Party of India",
-            "CPI",
-            "C.P.I.",
-            "C P I",
-            "CPI Votes",
-        ],
-        "CPM Votes": [
-            "Communist Party of India (Marxist)",
-            "CPM",
-            "CPI(M)",
-            "CPIM",
-            "C.P.M.",
-            "C P M",
-            "CPM Votes",
-        ],
-        "Independent": [
-            "Independent",
-            "IND",
-            "I.N.D.",
-            "Independent Votes",
-            "Ind",
-            # Reversed variations
-            "TNEDNEPEDNI",
-        ],
-        "NOTA": [
-            "NOTA",
-            "None of the Above",
-            "NOTA Votes",
-            # Reversed variations
-            "ATON",
-        ],
-        "Other Votes": [
-            "Others",
-            "Other",
-            "Other Votes",
-        ],
-        "MNK Votes": [
-            "Makkal Naadaalum Katchi",
-            "MAKKAL NAADAALUM KATCHI",
-            "MNK",
-            "M.N.K.",
-            "M N K",
-            "Makkal Naadaalum Katchi Votes",
-            "MNK Votes",
-            # Word-order reversals
-            "KATCHI NAADAALUM MAKKAL",
-            "NAADAALUM MAKKAL KATCHI",
-            "KATCHI MAKKAL NAADAALUM",
-            "NAADAALUM KATCHI MAKKAL",
-        ],
-    }
+    PARTY_MAPPINGS: Dict[str, List[str]] = {}
 
     def __init__(self):
         """Initialize the party normalizer with reverse lookup mapping."""
+        # Build PARTY_MAPPINGS from comprehensive TN_PARTY_ALIASES
+        self._build_party_mappings_from_aliases()
+        
         # Create reverse mapping: variation -> standardized name
         self._reverse_mapping: Dict[str, str] = {}
 
@@ -242,9 +54,23 @@ class PartyNormalizer:
             "NTK": "NTK Votes",
             "BSP": "BSP Votes",
             "CONGRESS": "Congress Votes",
+            "INC": "Congress Votes",
             "IND": "Independent",
             "INDEPENDENT": "Independent",
+            "NOTA": "NOTA",
         }
+        
+        # Add all parties from TN_PARTY_ALIASES to abbreviation mappings
+        for abbrev in TN_PARTY_ALIASES.keys():
+            if abbrev not in self.ABBREVIATION_MAPPINGS:
+                if abbrev == "IND":
+                    self.ABBREVIATION_MAPPINGS[abbrev] = "Independent"
+                elif abbrev == "NOTA":
+                    self.ABBREVIATION_MAPPINGS[abbrev] = "NOTA"
+                elif abbrev == "INC":
+                    self.ABBREVIATION_MAPPINGS[abbrev] = "Congress Votes"
+                else:
+                    self.ABBREVIATION_MAPPINGS[abbrev] = f"{abbrev} Votes"
         
         # Add abbreviations to reverse mapping
         for abbrev, standard_name in self.ABBREVIATION_MAPPINGS.items():
@@ -253,6 +79,51 @@ class PartyNormalizer:
             self._reverse_mapping[abbrev.lower()] = standard_name
 
         logger.info(f"Party normalizer initialized with {len(self.PARTY_MAPPINGS)} party mappings")
+
+    def _build_party_mappings_from_aliases(self):
+        """Build PARTY_MAPPINGS from comprehensive TN_PARTY_ALIASES."""
+        # Standard order for output (major parties first)
+        standard_order = [
+            "BJP", "AIADMK", "DMK", "INC", "PMK", "VCK", "NTK", "DMDK",
+            "MDMK", "AMMK", "TMC(M)", "CPI", "CPI(M)", "IUML", "AIFB",
+            "RPI(A)", "BSP", "MNM", "IJK", "KMDK", "MMK", "SDPI", "PT",
+            "AIMIM", "TMK", "IND", "NOTA"
+        ]
+        
+        # Build mappings in standard order
+        for abbrev in standard_order:
+            if abbrev not in TN_PARTY_ALIASES:
+                continue
+            
+            # Get standardized name
+            if abbrev == "IND":
+                standard_name = "Independent"
+            elif abbrev == "NOTA":
+                standard_name = "NOTA"
+            elif abbrev == "INC":
+                standard_name = "Congress Votes"
+            else:
+                standard_name = f"{abbrev} Votes"
+            
+            # Get all aliases for this party
+            aliases = get_all_aliases(abbrev)
+            
+            # Convert set to list and add to PARTY_MAPPINGS
+            self.PARTY_MAPPINGS[standard_name] = list(aliases)
+            
+            # Also add common variations with dots/spaces (only for simple abbreviations)
+            if len(abbrev) <= 5 and not any(c in abbrev for c in "()"):
+                abbrev_variations = [
+                    abbrev,
+                    ".".join(abbrev),  # D.M.K.
+                    " ".join(abbrev),  # D M K
+                ]
+                for var in abbrev_variations:
+                    if var not in self.PARTY_MAPPINGS[standard_name]:
+                        self.PARTY_MAPPINGS[standard_name].append(var)
+        
+        # Add "Other Votes" for non-party columns
+        self.PARTY_MAPPINGS["Other Votes"] = ["Others", "Other", "Other Votes"]
 
     def _normalize_for_comparison(self, text: str) -> str:
         """
@@ -272,6 +143,7 @@ class PartyNormalizer:
         Normalize a single column name to standardized party name.
 
         Now handles reversed text by fixing it first using PartyNameFixer.
+        Uses comprehensive alias mapping from party_aliases.py.
 
         Args:
             column_name: Original column name from PDF
@@ -291,7 +163,13 @@ class PartyNormalizer:
                 logger.debug(f"Fixed reversed party name before normalization: '{column_name}' -> '{fixed_column}'")
                 column_name = fixed_column
 
-        # Exact match first
+        # Try comprehensive alias matching first (from party_aliases.py)
+        standardized_name = get_standardized_party_name(column_name)
+        if standardized_name:
+            logger.debug(f"Matched via comprehensive aliases: '{column_name}' -> '{standardized_name}'")
+            return standardized_name
+
+        # Exact match in reverse mapping
         if column_name in self._reverse_mapping:
             return self._reverse_mapping[column_name]
 

@@ -1,6 +1,7 @@
 """PDF table extraction with automatic text/image detection and OCR support."""
 
 import asyncio
+import hashlib
 import logging
 import os
 from pathlib import Path
@@ -293,6 +294,9 @@ class PDFProcessor:
                             headers, data_rows = self._split_table(table)
                         
                         if headers:
+                            # Fix reversed headers immediately after extraction
+                            from .header_fixer import HeaderFixer
+                            headers = HeaderFixer.fix_header_list(headers)
                             first_page_headers = headers  # Store headers from first page
                             logger.info(f"Page 1: Extracted headers: {len(headers)} columns")
                         
@@ -494,14 +498,15 @@ class PDFProcessor:
         if not table or len(table) < 2:
             return [], []
 
-        # Header keywords that indicate a header row
+        # Header keywords that indicate a header row (expanded for different PDF structures)
         HEADER_KEYWORDS = [
-            "sl.", "sl ", "serial", "no.", "number",
-            "polling", "station", "location", "building",
-            "area", "areas", "type", "voter", "voters",
-            "candidate", "party", "abbreviation",
-            "valid", "votes", "total", "rejected", "tendered",
-            "nota"
+            "sl.", "sl ", "s.l.", "s.l ", "serial", "no.", "number", "s.no", "s.no.",
+            "polling", "station", "location", "building", "booth",
+            "area", "areas", "type", "voter", "voters", "elector", "electors",
+            "candidate", "party", "abbreviation", "abbr", "name",
+            "valid", "votes", "total", "rejected", "tendered", "cast",
+            "nota", "dmk", "aiadmk", "bjp", "congress", "independent", "ind",
+            "assembly", "constituency", "ac", "ac no", "ac no."
         ]
         
         # Detect header rows (typically 1-3 rows at the top)
@@ -540,15 +545,21 @@ class PDFProcessor:
             
             # Row is a header if:
             # 1. It has header keywords, OR
-            # 2. It has high text ratio (80%+) AND no numeric values in first column
+            # 2. It has high text ratio (80%+) AND no numeric values in first column, OR
+            # 3. First row with high text ratio (70%+), OR
+            # 4. Row has mostly text and matches common header patterns (colored headers often have this)
             is_header = False
             if has_header_keywords:
                 is_header = True
             elif text_ratio >= 0.8 and numeric_count == 0:
-                # Very high text ratio with no numbers - likely header
+                # Very high text ratio with no numbers - likely header (common for colored headers)
                 is_header = True
             elif idx == 0 and text_ratio >= 0.7:
                 # First row with high text ratio - likely header
+                is_header = True
+            elif idx < 3 and text_ratio >= 0.75 and len(non_empty) >= 3:
+                # Early rows with high text ratio and multiple columns - likely headers
+                # This catches colored headers that may not have obvious keywords
                 is_header = True
             
             if is_header:
@@ -566,9 +577,12 @@ class PDFProcessor:
         # Combine multi-row headers intelligently
         headers = self._combine_header_rows(header_rows)
         
+        # Extract party names only from headers (for candidate columns)
+        headers = self._extract_party_names_only(headers)
+        
         # Log detected headers for debugging
         logger.info(f"Detected {len(header_rows)} header row(s), data starts at row {data_start_idx + 1}")
-        logger.debug(f"Headers: {headers[:5]}...")  # Log first 5 headers
+        logger.debug(f"Headers (party names only): {headers[:5]}...")  # Log first 5 headers
         
         # Extract data rows
         data_rows = []
@@ -582,14 +596,18 @@ class PDFProcessor:
                 # Skip duplicate header rows (headers that appear again mid-table)
                 if self._is_duplicate_header(cleaned_row, header_rows):
                     continue
-                # Normalize row length to match headers
+                # Normalize row length to match headers PERFECTLY
                 if len(cleaned_row) < len(headers):
                     cleaned_row.extend([""] * (len(headers) - len(cleaned_row)))
                 elif len(cleaned_row) > len(headers):
                     cleaned_row = cleaned_row[:len(headers)]
                 data_rows.append(cleaned_row)
 
-        logger.info(f"Extracted {len(data_rows)} data rows with {len(headers)} columns")
+        # Validate and fix header-to-data alignment
+        sample_data = table[data_start_idx:data_start_idx+5] if len(table) > data_start_idx else []
+        headers, data_rows = self._ensure_perfect_alignment(headers, data_rows, sample_data)
+
+        logger.info(f"Extracted {len(data_rows)} data rows with {len(headers)} columns (aligned perfectly)")
         return headers, data_rows
     
     def _split_table_with_ai(self, page, table: List[List]) -> tuple[List[str], List[List[str]]]:
@@ -640,14 +658,20 @@ class PDFProcessor:
                         # Skip column number indicator rows (e.g., 1, 2, 3, 4, 5)
                         if self._is_column_number_row(cleaned_row):
                             continue
-                        # Normalize row length to match headers
+                        # Skip duplicate header rows
+                        if self._is_duplicate_header(cleaned_row, [headers]):
+                            continue
+                        # Normalize row length to match headers PERFECTLY
                         if len(cleaned_row) < len(headers):
                             cleaned_row.extend([""] * (len(headers) - len(cleaned_row)))
                         elif len(cleaned_row) > len(headers):
                             cleaned_row = cleaned_row[:len(headers)]
                         data_rows.append(cleaned_row)
                 
-                logger.info(f"AI extraction: {len(headers)} headers, {len(data_rows)} data rows")
+                # Validate and fix header-to-data alignment
+                headers, data_rows = self._ensure_perfect_alignment(headers, data_rows, table[data_start_idx:data_start_idx+5] if len(table) > data_start_idx else [])
+                
+                logger.info(f"AI extraction: {len(headers)} headers, {len(data_rows)} data rows (aligned perfectly)")
                 return headers, data_rows
             else:
                 logger.warning(f"AI header extraction low confidence ({confidence:.2f}), falling back to regular extraction")
@@ -733,14 +757,21 @@ class PDFProcessor:
                     elif row_idx == party_row_idx:
                         party_name = value
                 
-                if candidate_name and party_name:
-                    # Combine: "CANDIDATE_NAME (PARTY)"
-                    combined = f"{candidate_name} ({party_name})"
-                    combined_headers.append(combined)
-                elif candidate_name:
-                    combined_headers.append(candidate_name)
-                elif party_name:
+                # Extract party name only (not candidate name)
+                if party_name:
+                    # Use party name only, ignore candidate name
                     combined_headers.append(party_name)
+                elif candidate_name:
+                    # No party found, but might be in candidate name format "NAME (PARTY)"
+                    # Try to extract party from candidate name
+                    import re
+                    paren_match = re.search(r'\(([^)]+)\)', candidate_name)
+                    if paren_match:
+                        party_in_parens = paren_match.group(1).strip()
+                        combined_headers.append(party_in_parens)
+                    else:
+                        # No party found, keep candidate name (will be fixed later)
+                        combined_headers.append(candidate_name)
                 else:
                     # Use the last (most specific) value
                     combined_headers.append(header_parts[-1][1])
@@ -919,8 +950,10 @@ class PDFProcessor:
             logger.warning("No headers found in any table")
             return TableData(headers=[], rows=[], page_number=1)
 
-        # Merge all rows from all tables
+        # Merge all rows from all tables with deduplication
         all_rows = []
+        seen_rows = set()  # Track rows we've already added to prevent duplicates
+        
         for table in tables:
             if table.rows:
                 # Ensure row length matches headers
@@ -930,9 +963,38 @@ class PDFProcessor:
                         normalized_row.extend([""] * (len(headers) - len(normalized_row)))
                     elif len(normalized_row) > len(headers):
                         normalized_row = normalized_row[:len(headers)]
-                    all_rows.append(normalized_row)
+                    
+                    # Create a unique key for this row
+                    # Use first 3 columns (typically S.L.No, Polling Station No., etc.) for identification
+                    # If those are empty, use more columns or the full row
+                    row_key_parts = []
+                    for i in range(min(3, len(normalized_row))):
+                        cell = str(normalized_row[i]).strip().lower()
+                        if cell:  # Only include non-empty cells
+                            row_key_parts.append(cell)
+                    
+                    # If first 3 columns are empty, use more columns (up to 5)
+                    if not row_key_parts and len(normalized_row) > 3:
+                        for i in range(3, min(5, len(normalized_row))):
+                            cell = str(normalized_row[i]).strip().lower()
+                            if cell:
+                                row_key_parts.append(cell)
+                    
+                    # If still no key parts, use a hash of the full row (for completely empty rows)
+                    if not row_key_parts:
+                        row_str = "|".join(str(cell).strip() for cell in normalized_row)
+                        row_key = hashlib.md5(row_str.encode()).hexdigest()
+                    else:
+                        row_key = tuple(row_key_parts)
+                    
+                    # Skip if we've seen this row before (duplicate)
+                    if row_key not in seen_rows:
+                        all_rows.append(normalized_row)
+                        seen_rows.add(row_key)
+                    else:
+                        logger.debug(f"Skipping duplicate row: {normalized_row[:3]}")
 
-        logger.info(f"Merged {len(tables)} tables into single table: {len(all_rows)} rows, {len(headers)} columns")
+        logger.info(f"Merged {len(tables)} tables into single table: {len(all_rows)} rows, {len(headers)} columns (duplicates removed)")
 
         # Post-processing validation: Scan all cells for any remaining reversed text
         # This ensures no corrupted text reaches Excel output
@@ -1170,6 +1232,299 @@ class PDFProcessor:
             summary["validation"] = self._validation_report.to_dict()
 
         return summary
+    
+    def _ensure_perfect_alignment(
+        self, 
+        headers: List[str], 
+        data_rows: List[List[str]], 
+        sample_raw_data: List[List] = None
+    ) -> Tuple[List[str], List[List[str]]]:
+        """
+        Ensure perfect alignment between headers and data columns.
+        
+        This method validates that:
+        1. Number of headers matches number of data columns
+        2. Headers align correctly with data columns
+        3. Adjusts headers or data if misalignment is detected
+        
+        Args:
+            headers: List of header names
+            data_rows: List of data rows
+            sample_raw_data: Sample of raw table data for validation
+            
+        Returns:
+            Tuple of (adjusted_headers, adjusted_data_rows)
+        """
+        if not headers or not data_rows:
+            return headers, data_rows
+        
+        # Check if we have a consistent column count across data rows
+        if data_rows:
+            # Find the most common column count in data rows
+            column_counts = [len(row) for row in data_rows if row]
+            if column_counts:
+                most_common_count = max(set(column_counts), key=column_counts.count)
+                
+                # If headers don't match the most common column count, adjust
+                if len(headers) != most_common_count:
+                    logger.warning(
+                        f"Header count ({len(headers)}) doesn't match data column count ({most_common_count}). "
+                        f"Adjusting headers to match data."
+                    )
+                    
+                    if len(headers) < most_common_count:
+                        # Add empty headers for missing columns
+                        headers.extend([f"Column {i+1}" for i in range(len(headers), most_common_count)])
+                    elif len(headers) > most_common_count:
+                        # Trim excess headers
+                        headers = headers[:most_common_count]
+                
+                # Ensure all data rows have the same length as headers
+                for i, row in enumerate(data_rows):
+                    if len(row) < len(headers):
+                        data_rows[i] = row + [""] * (len(headers) - len(row))
+                    elif len(row) > len(headers):
+                        data_rows[i] = row[:len(headers)]
+        
+        # Validate alignment using sample data if available
+        if sample_raw_data and len(sample_raw_data) > 0:
+            # Check if first data row aligns with headers
+            first_data_row = [self._clean_cell(cell) for cell in sample_raw_data[0]] if sample_raw_data else []
+            if first_data_row and len(first_data_row) != len(headers):
+                logger.debug(
+                    f"Sample data has {len(first_data_row)} columns, headers have {len(headers)}. "
+                    f"Using data column count as reference."
+                )
+                # Use data column count as the source of truth
+                if len(first_data_row) > len(headers):
+                    # Add missing headers
+                    headers.extend([f"Column {i+1}" for i in range(len(headers), len(first_data_row))])
+                elif len(first_data_row) < len(headers):
+                    # Trim excess headers
+                    headers = headers[:len(first_data_row)]
+        
+        logger.debug(f"Final alignment: {len(headers)} headers, data rows with {len(data_rows[0]) if data_rows else 0} columns")
+        return headers, data_rows
+    
+    def _extract_party_names_only(self, headers: List[str]) -> List[str]:
+        """
+        Extract party names only from headers, removing candidate names.
+        
+        For headers like "CANDIDATE NAME (PARTY)" or "CANDIDATE NAME - PARTY",
+        extract only the party name. For non-candidate columns, keep as-is.
+        
+        Args:
+            headers: List of headers that may contain candidate names and party names
+            
+        Returns:
+            List of headers with party names only for candidate columns
+        """
+        from .party_name_fixer import PartyNameFixer
+        import re
+        
+        party_only_headers = []
+        
+        # Keywords that indicate non-candidate columns
+        non_candidate_keywords = [
+            "sl.", "s.l.", "serial", "no.", "number",
+            "polling", "station", "location", "building",
+            "area", "areas", "type", "voter", "voters",
+            "total", "valid", "votes", "rejected", "tendered",
+            "nota", "cast", "favour"
+        ]
+        
+        for header in headers:
+            if not header or not header.strip():
+                party_only_headers.append(header)
+                continue
+            
+            header_upper = header.upper()
+            
+            # Check if this is a non-candidate column
+            is_non_candidate = any(keyword in header_upper for keyword in non_candidate_keywords)
+            
+            if is_non_candidate:
+                # Keep non-candidate columns as-is
+                party_only_headers.append(header)
+                continue
+            
+            # Try to extract party name from various formats
+            party_name = None
+            
+            # Format 1: "CANDIDATE NAME (PARTY)" or "CANDIDATE NAME (PARTY ABBR)"
+            # Find the LAST parentheses match (in case there are multiple)
+            paren_matches = list(re.finditer(r'\(([^)]+)\)', header))
+            if paren_matches:
+                # Use the last match (most likely to be the party)
+                last_match = paren_matches[-1]
+                party_in_parens = last_match.group(1).strip()
+                
+                # Special check for NTK in parentheses - look for NAAM keyword
+                party_in_parens_upper = party_in_parens.upper()
+                if "NAAM" in party_in_parens_upper and ("TAMILAR" in party_in_parens_upper or "TAMIZHAR" in party_in_parens_upper):
+                    party_name = "NAAM TAMILAR KATCHI"
+                elif "ADHIKARAM" in party_in_parens_upper and "PARTY" in party_in_parens_upper:
+                    party_name = "PARTY ADHIKARAM MAKKAL"
+                else:
+                    # Fix reversed party name if needed
+                    party_name = PartyNameFixer.fix_reversed_party_name(party_in_parens)
+                    # Try to get full party name from abbreviation
+                    party_name = self._get_full_party_name(party_name)
+                    # If party name contains multiple words that look like separate parties, extract only the first valid party
+                    if party_name and ' ' in party_name:
+                        # Check if it might be multiple party names merged
+                        words = party_name.split()
+                        # Check if any word is a known party abbreviation
+                        for word in words:
+                            word_upper = word.upper()
+                            if word_upper in ["DMK", "AIADMK", "BJP", "NTK", "PMK", "VCK", "BSP", "IND", "NOTA"]:
+                                party_name = self._get_full_party_name(word_upper)
+                                break
+            
+            # Format 2: "CANDIDATE NAME - PARTY"
+            elif ' - ' in header:
+                parts = header.split(' - ', 1)
+                if len(parts) == 2:
+                    party_part = parts[1].strip()
+                    party_name = PartyNameFixer.fix_reversed_party_name(party_part)
+                    party_name = self._get_full_party_name(party_name)
+            
+            # Format 3: Check if header itself is a party name/abbreviation
+            elif PartyNameFixer.is_likely_party_name(header):
+                # Special check for NTK - look for specific keywords to distinguish from PARTY ADHIKARAM MAKKAL
+                header_upper_check = header.upper()
+                if ("NAAM" in header_upper_check and ("TAMILAR" in header_upper_check or "TAMIZHAR" in header_upper_check)):
+                    # This is definitely NTK, not PARTY ADHIKARAM MAKKAL
+                    party_name = "NAAM TAMILAR KATCHI"
+                elif "ADHIKARAM" in header_upper_check and "PARTY" in header_upper_check:
+                    # This is PARTY ADHIKARAM MAKKAL, not NTK
+                    party_name = "PARTY ADHIKARAM MAKKAL"
+                else:
+                    party_name = PartyNameFixer.fix_reversed_party_name(header)
+                    party_name = self._get_full_party_name(party_name)
+            
+            # If we found a party name, use it; otherwise keep original (might be already a party name)
+            if party_name:
+                party_only_headers.append(party_name)
+            else:
+                # Try one more time - check if it's already a party name
+                fixed = PartyNameFixer.fix_reversed_party_name(header)
+                if fixed != header:
+                    party_only_headers.append(self._get_full_party_name(fixed))
+                else:
+                    party_only_headers.append(header)
+        
+        return party_only_headers
+    
+    def _get_full_party_name(self, party_abbr_or_name: str) -> str:
+        """
+        Get full party name from abbreviation or partial name using comprehensive alias mapping.
+        
+        Args:
+            party_abbr_or_name: Party abbreviation or name
+            
+        Returns:
+            Full party name if known, otherwise original
+        """
+        if not party_abbr_or_name:
+            return party_abbr_or_name
+        
+        from .party_aliases import get_party_abbreviation, get_all_aliases
+        
+        party_upper = party_abbr_or_name.upper().strip()
+        
+        # First try comprehensive alias matching
+        abbrev = get_party_abbreviation(party_upper)
+        if abbrev:
+            # Get canonical full name for this abbreviation
+            canonical_map = {
+                "DMK": "DRAVIDA MUNNETRA KAZHAGAM",
+                "AIADMK": "ALL INDIA ANNA DRAVIDA MUNNETRA KAZHAGAM",
+                "BJP": "BHARATIYA JANATA PARTY",
+                "INC": "INDIAN NATIONAL CONGRESS",
+                "PMK": "PATTALI MAKKAL KATCHI",
+                "VCK": "VIDUTHALAI CHIRUTHAIGAL KATCHI",
+                "NTK": "NAAM TAMILAR KATCHI",
+                "DMDK": "DESIYA MURPOKKU DRAVIDA KAZHAGAM",
+                "MDMK": "MARUMALARCHI DRAVIDA MUNNETRA KAZHAGAM",
+                "AMMK": "AMMA MAKKAL MUNNETRA KAZHAGAM",
+                "TMC(M)": "TAMIL MAANILA CONGRESS",
+                "CPI": "COMMUNIST PARTY OF INDIA",
+                "CPI(M)": "COMMUNIST PARTY OF INDIA (MARXIST)",
+                "IUML": "INDIAN UNION MUSLIM LEAGUE",
+                "AIFB": "ALL INDIA FORWARD BLOC",
+                "RPI(A)": "REPUBLICAN PARTY OF INDIA",
+                "BSP": "BAHUJAN SAMAJ PARTY",
+                "MNM": "MAKKAL NEEDHI MAIAM",
+                "IJK": "INDIA JANANAYAKA KATCHI",
+                "KMDK": "KONGUNADU MAKKAL DESIA KATCHI",
+                "MMK": "MANITHANEYA MAKKAL KATCHI",
+                "SDPI": "SOCIAL DEMOCRATIC PARTY OF INDIA",
+                "PT": "PUTHIYA TAMILAGAM",
+                "AIMIM": "ALL INDIA MAJLIS E ITTEHADUL MUSLIMEEN",
+                "TMK": "TAMILAGA MAKKAL KATCHI",
+                "IND": "INDEPENDENT",
+                "NOTA": "NOTA",
+            }
+            canonical = canonical_map.get(abbrev)
+            if canonical:
+                return canonical
+        
+        # Fallback to legacy mapping for backward compatibility
+        party_mapping = {
+            "DMK": "DRAVIDA MUNNETRA KAZHAGAM",
+            "AIADMK": "ALL INDIA DRAVIDA MUNNETRA KAZHAGAM",
+            "BJP": "BHARATIYA JANATA PARTY",
+            "CONGRESS": "INDIAN NATIONAL CONGRESS",
+            "INC": "INDIAN NATIONAL CONGRESS",
+            "IND": "INDEPENDENT",
+            "INDEPENDENT": "INDEPENDENT",
+            "NOTA": "NOTA",
+            "VCK": "VIDUTHALAI CHIRUTHAIGAL KATCHI",
+            "PMK": "PATTALI MAKKAL KATCHI",
+            "NTK": "NAAM TAMILAR KATCHI",
+            "PAMK": "PARTY ADHIKARAM MAKKAL",
+            "BSP": "BAHUJAN SAMAJ PARTY",
+        }
+        
+        # Check exact match
+        if party_upper in party_mapping:
+            return party_mapping[party_upper]
+        
+        # Check if it's already a full party name (contains party keywords)
+        party_keywords = ["KAZHAGAM", "PARTY", "KATCHI", "SAMAJ", "CONGRESS"]
+        if any(keyword in party_upper for keyword in party_keywords):
+            # But check if it might be multiple party names merged
+            # If it contains multiple party keywords, it might be merged
+            keyword_count = sum(1 for keyword in party_keywords if keyword in party_upper)
+            if keyword_count > 1:
+                # Might be merged - try to extract individual party names
+                # Check for known party patterns
+                known_parties = [
+                    "DRAVIDA MUNNETRA KAZHAGAM",
+                    "ALL INDIA DRAVIDA MUNNETRA KAZHAGAM",
+                    "BHARATIYA JANATA PARTY",
+                    "NAAM TAMILAR KATCHI",
+                    "PATTALI MAKKAL KATCHI",
+                    "VIDUTHALAI CHIRUTHAIGAL KATCHI",
+                    "BAHUJAN SAMAJ PARTY",
+                ]
+                for known_party in known_parties:
+                    if known_party.upper() in party_upper:
+                        return known_party
+            return party_abbr_or_name
+        
+        # Special check for NTK variations - must have NAAM keyword
+        if "NAAM" in party_upper and ("TAMILAR" in party_upper or "TAMIZHAR" in party_upper):
+            if "KATCHI" in party_upper:
+                return "NAAM TAMILAR KATCHI"
+        
+        # Special check for PARTY ADHIKARAM MAKKAL - must have ADHIKARAM keyword
+        if "ADHIKARAM" in party_upper and "PARTY" in party_upper:
+            return "PARTY ADHIKARAM MAKKAL"
+        
+        # Return original if no mapping found
+        return party_abbr_or_name
 
 
 # Convenience functions for direct use

@@ -110,6 +110,10 @@ class ColumnFilterService:
                 # Fallback for empty columns
                 headers.append(f"Column {col}")
         
+        # Fix headers after reading from Excel (they might still be reversed)
+        from .header_fixer import HeaderFixer
+        headers = HeaderFixer.fix_header_list(headers)
+        
         # Find where actual data starts (first row with numeric data in first column)
         first_data_row = data_start_row + 1
         for row in range(data_start_row + 1, min(data_start_row + 10, actual_max_row + 1)):

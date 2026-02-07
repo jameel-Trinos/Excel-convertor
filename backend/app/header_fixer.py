@@ -310,7 +310,7 @@ class HeaderFixer:
     @staticmethod
     def fix_header_list(headers: List[str]) -> List[str]:
         """
-        Fix all headers in a list.
+        Fix all headers in a list, including reversed candidate names and party names.
 
         Args:
             headers: List of potentially broken headers
@@ -321,46 +321,142 @@ class HeaderFixer:
         fixed = []
 
         for header in headers:
-            # First, fix party names in headers (handles "NAME - PARTY" format)
-            # This should be done BEFORE general reversal fixes to avoid mangling party names
-            header = PartyNameFixer.fix_header_with_party(header)
+            if not header or not header.strip():
+                fixed.append(header)
+                continue
             
-            # Then fix other reversed text (but be careful not to reverse already-fixed party names)
-            # Only apply to non-party parts
-            if not PartyNameFixer.is_likely_party_name(header):
-                # Check if it's a "NAME - PARTY" format
-                if ' - ' in header:
-                    parts = header.split(' - ', 1)
-                    if len(parts) == 2:
-                        name_part = parts[0]
-                        party_part = parts[1]
-                        # Don't reverse "INDEPENDENT" or "NOTA" - they're usually correct
-                        if party_part.upper() in ['INDEPENDENT', 'IND', 'NOTA']:
-                            # Keep party part as is, these are usually correct
-                            # But fix the name part if needed (but don't reverse word order)
-                            pass
-                        elif not PartyNameFixer.is_likely_party_name(party_part):
-                            # Party part might need fixing
-                            party_part = HeaderFixer.fix_reversed_text(party_part)
-                        # Keep the format: "NAME - PARTY" (don't swap parts)
-                        header = f"{name_part} - {party_part}"
+            original_header = header
+            
+            # Step 1: Fix party names in parentheses (e.g., "NAME (reversed party)" -> "NAME (correct party)")
+            # Pattern: "CANDIDATE (PARTY)" where PARTY might be reversed
+            paren_match = re.search(r'\(([^)]+)\)', header)
+            if paren_match:
+                party_in_parens = paren_match.group(1).strip()
+                name_part = header[:paren_match.start()].strip()
+                
+                # Fix the party name in parentheses
+                fixed_party = PartyNameFixer.fix_reversed_party_name(party_in_parens)
+                if fixed_party != party_in_parens:
+                    # Replace the party part
+                    header = f"{name_part} ({fixed_party})"
+                    logger.debug(f"Fixed party in parentheses: '{party_in_parens}' -> '{fixed_party}'")
+                
+                # Also check if the name part itself is reversed
+                if name_part:
+                    fixed_name = HeaderFixer._fix_candidate_name(name_part)
+                    if fixed_name != name_part:
+                        header = f"{fixed_name} ({fixed_party if fixed_party != party_in_parens else party_in_parens})"
+                        logger.debug(f"Fixed candidate name: '{name_part}' -> '{fixed_name}'")
+            
+            # Step 2: Fix "NAME - PARTY" format
+            elif ' - ' in header:
+                parts = header.split(' - ', 1)
+                if len(parts) == 2:
+                    name_part = parts[0].strip()
+                    party_part = parts[1].strip()
+                    
+                    # Fix candidate name
+                    fixed_name = HeaderFixer._fix_candidate_name(name_part)
+                    
+                    # Fix party name
+                    if party_part.upper() in ['INDEPENDENT', 'IND', 'NOTA']:
+                        fixed_party = party_part  # Keep as is
+                    else:
+                        fixed_party = PartyNameFixer.fix_reversed_party_name(party_part)
+                    
+                    header = f"{fixed_name} - {fixed_party}"
+            
+            # Step 3: Fix party names in headers (handles standalone party names)
+            else:
+                # Check if it's a party name
+                if PartyNameFixer.is_likely_party_name(header):
+                    header = PartyNameFixer.fix_header_with_party(header)
                 else:
-                    # Don't reverse common correct terms
-                    if header.upper() not in ['INDEPENDENT', 'IND', 'NOTA', 'TOTAL', 'VALID', 'REJECTED']:
+                    # Might be a candidate name without party - fix it
+                    fixed_name = HeaderFixer._fix_candidate_name(header)
+                    if fixed_name != header:
+                        header = fixed_name
+                    # Also try general reversal fix
+                    else:
                         header = HeaderFixer.fix_reversed_text(header)
 
-            # Clean multiline
+            # Step 4: Clean multiline
             header = HeaderFixer.clean_multiline_header(header)
             
-            # Format candidate headers (with party abbreviations)
+            # Step 5: Format candidate headers (with party abbreviations)
             header = HeaderFixer.format_candidate_header(header)
 
-            # Remove extra whitespace
+            # Step 6: Remove extra whitespace
             header = ' '.join(header.split())
+            
+            if header != original_header:
+                logger.debug(f"Fixed header: '{original_header}' -> '{header}'")
 
             fixed.append(header)
 
         return fixed
+    
+    @staticmethod
+    def _fix_candidate_name(name: str) -> str:
+        """
+        Fix reversed candidate names.
+        
+        Candidate names often have patterns like:
+        - "JURAK.J" (might be correct)
+        - "J.RAKU" (reversed)
+        - "O J.R" (might be "J.R O" reversed)
+        
+        Args:
+            name: Candidate name that might be reversed
+            
+        Returns:
+            Fixed candidate name
+        """
+        if not name or len(name) < 2:
+            return name
+        
+        original = name.strip()
+        
+        # Check if it looks like a reversed name
+        # Pattern: names often have periods and capital letters
+        # Reversed names might have periods at the end instead of middle
+        
+        # If name ends with period and starts with lowercase, might be reversed
+        if original.endswith('.') and len(original) > 2:
+            # Check if reversing improves it
+            reversed_name = original[::-1]
+            original_score = HeaderFixer._english_score(original)
+            reversed_score = HeaderFixer._english_score(reversed_name)
+            
+            # Also check for common name patterns
+            # Names often have: "FIRST.MIDDLE LAST" or "FIRST LAST"
+            # Reversed might be: "TSAL .DLEMID .TSRIF"
+            if reversed_score > original_score + 1:
+                return reversed_name
+        
+        # Try word-by-word reversal for multi-word names
+        if ' ' in original:
+            words = original.split()
+            # Check if reversing word order helps
+            reversed_words = words[::-1]
+            reversed_order = ' '.join(reversed_words)
+            
+            original_score = HeaderFixer._english_score(original)
+            reversed_score = HeaderFixer._english_score(reversed_order)
+            
+            if reversed_score > original_score + 1:
+                return reversed_order
+        
+        # Try character-level reversal if it's short and looks reversed
+        if len(original) < 20 and not original[0].isupper():
+            reversed_chars = original[::-1]
+            original_score = HeaderFixer._english_score(original)
+            reversed_score = HeaderFixer._english_score(reversed_chars)
+            
+            if reversed_score > original_score + 2:
+                return reversed_chars
+        
+        return original
 
     @staticmethod
     def standardize_common_headers(headers: List[str]) -> List[str]:

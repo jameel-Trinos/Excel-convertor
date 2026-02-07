@@ -1233,26 +1233,10 @@ async def get_full_preview(task_id: str):
                 # Fallback for empty columns
                 headers.append(f"Column {col}")
         
-        # Fix reversed headers (party names, candidate names, etc.)
+        # Always fix reversed headers (party names, candidate names, etc.)
         # The fix_header_list function is conservative and only fixes things that need fixing
-        from .party_name_fixer import PartyNameFixer
-
-        # Check if any header needs fixing (reversed text patterns or reversed party names)
-        needs_fixing = False
-        for header in headers:
-            # Check for basic reversed patterns
-            if any(pattern.lower() in header.lower() for pattern in HeaderFixer.KNOWN_REVERSED_PATTERNS):
-                needs_fixing = True
-                break
-            # Check for reversed party names (more comprehensive check)
-            if PartyNameFixer.is_likely_party_name(header):
-                fixed = PartyNameFixer.fix_reversed_party_name(header)
-                if fixed != header:
-                    needs_fixing = True
-                    break
-
-        if needs_fixing:
-            headers = HeaderFixer.fix_header_list(headers)
+        # But we should always run it to ensure headers are correct
+        headers = HeaderFixer.fix_header_list(headers)
 
         if not headers:
             for col in range(1, min(actual_max_col + 1, 50)):

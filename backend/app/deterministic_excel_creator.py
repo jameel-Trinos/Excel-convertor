@@ -83,11 +83,15 @@ class DeterministicExcelCreator:
             )
             current_row += 3  # Title takes 3 rows
 
+        # Fix headers before writing to Excel
+        from .header_fixer import HeaderFixer
+        headers = HeaderFixer.fix_header_list(headers)
+        
         # Add headers
         header_row = current_row
         for col_idx, header in enumerate(headers, 1):
             cell = worksheet.cell(row=header_row, column=col_idx)
-            # Sanitize header to remove RTL/bidirectional control characters
+            # Headers are already fixed, just sanitize for RTL characters
             cell.value = sanitize_text(header) if header else f"Column {col_idx}"
 
         # Format header row

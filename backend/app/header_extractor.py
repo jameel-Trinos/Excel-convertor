@@ -11,6 +11,13 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from .party_aliases import (
+    get_party_abbreviation,
+    get_standardized_party_name,
+    is_party_alias,
+    get_party_abbreviation_to_standard_name,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -28,25 +35,9 @@ class HeaderExtractor:
     """
 
     # Standard party abbreviation to full name mapping
-    # Order matters - this defines the output column order
-    PARTY_ABBREVIATIONS = {
-        "BJP": "BJP Votes",
-        "AIADMK": "AIADMK Votes",
-        "DMK": "DMK Votes",
-        "INC": "Congress Votes",
-        "CONGRESS": "Congress Votes",
-        "VCK": "VCK Votes",
-        "PMK": "PMK Votes",
-        "NTK": "NTK Votes",
-        "BSP": "BSP Votes",
-        "NMK": "NMK Votes",
-        "MDMK": "MDMK Votes",
-        "CPI": "CPI Votes",
-        "CPM": "CPM Votes",
-        "CPIM": "CPM Votes",
-        "IND": "Independent",  # Special handling - will be grouped
-        "INDEPENDENT": "Independent",
-    }
+    # Built from comprehensive TN_PARTY_ALIASES
+    # This is initialized from party_aliases module
+    PARTY_ABBREVIATIONS: Dict[str, str] = {}
 
     # Columns to IGNORE completely (not party vote columns)
     IGNORE_COLUMNS = {
@@ -102,6 +93,15 @@ class HeaderExtractor:
         self.file_path = Path(file_path)
         if not self.file_path.exists():
             raise FileNotFoundError(f"PDF file not found: {file_path}")
+
+        # Initialize PARTY_ABBREVIATIONS from comprehensive alias mapping
+        if not HeaderExtractor.PARTY_ABBREVIATIONS:
+            HeaderExtractor.PARTY_ABBREVIATIONS = get_party_abbreviation_to_standard_name()
+            # Add common aliases
+            HeaderExtractor.PARTY_ABBREVIATIONS["CONGRESS"] = "Congress Votes"
+            HeaderExtractor.PARTY_ABBREVIATIONS["INDEPENDENT"] = "Independent"
+            HeaderExtractor.PARTY_ABBREVIATIONS["CPM"] = "CPM Votes"
+            HeaderExtractor.PARTY_ABBREVIATIONS["CPIM"] = "CPM Votes"
 
         self._cached_headers: Optional[List[str]] = None
         self._cached_party_mapping: Optional[Dict[str, str]] = None
@@ -202,9 +202,19 @@ class HeaderExtractor:
                                 seen_parties.add(standard_name)
                             original_to_standard[cell_text] = standard_name
                 else:
-                    # Check if the cell itself is a party abbreviation
-                    normalized = self._normalize_text(cell_upper)
-                    standard_name = self._get_standard_party_name(normalized)
+                    # Check if the cell itself is a party name (using comprehensive aliases)
+                    # First try direct alias matching
+                    standard_name = get_standardized_party_name(cell_text)
+                    
+                    if not standard_name:
+                        # Fall back to abbreviation matching
+                        normalized = self._normalize_text(cell_upper)
+                        standard_name = self._get_standard_party_name(normalized)
+                    
+                    # Also check if cell contains party name (for cases like "DMK Votes" or full party name)
+                    if not standard_name:
+                        # Try matching against full cell text
+                        standard_name = get_standardized_party_name(cell_upper)
 
                     if standard_name:
                         if standard_name == "Independent":
@@ -292,17 +302,27 @@ class HeaderExtractor:
 
     def _get_standard_party_name(self, abbreviation: str) -> Optional[str]:
         """
-        Map party abbreviation to standard name.
+        Map party abbreviation or alias to standard name.
+        
+        Uses comprehensive alias matching from party_aliases.py.
 
         Args:
-            abbreviation: Party abbreviation (e.g., "BJP", "AIADMK")
+            abbreviation: Party abbreviation or alias (e.g., "BJP", "AIADMK", "DRAVIDA MUNNETRA KAZHAGAM")
 
         Returns:
             Standard party name or None if not recognized
         """
+        if not abbreviation:
+            return None
+            
         abbr_upper = abbreviation.upper().strip()
 
-        # Direct lookup
+        # First try comprehensive alias matching
+        standard_name = get_standardized_party_name(abbr_upper)
+        if standard_name:
+            return standard_name
+
+        # Direct lookup in PARTY_ABBREVIATIONS
         if abbr_upper in self.PARTY_ABBREVIATIONS:
             return self.PARTY_ABBREVIATIONS[abbr_upper]
 

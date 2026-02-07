@@ -3,7 +3,9 @@
 import logging
 import re
 from itertools import permutations
-from typing import Dict, Optional
+from typing import Dict, List, Optional
+
+from .party_aliases import TN_PARTY_ALIASES, get_all_aliases
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +37,10 @@ class PartyNameFixer:
         "MAGAHZAK ARTENNUM ADIVARD": "DRAVIDA MUNNETRA KAZHAGAM",
         "ADIVARD ARTENNUM MAGAHZAK": "DRAVIDA MUNNETRA KAZHAGAM",
         "MAGAHZAK ARTENNUM ADIVARD DRAVIDA": "DRAVIDA MUNNETRA KAZHAGAM",
+        # Character-level reversals with spaces (from screenshot patterns)
+        "ARTENM N U IVARDAGAH M": "DRAVIDA MUNNETRA KAZHAGAM",  # "artenm n u ivarDagah M" -> "M Dravida Munnetra" reversed
+        "M H AGADRAVI U N M NERTA": "DRAVIDA MUNNETRA KAZHAGAM",
+        "MAGAHZAK ARTENNUM ADIVARD": "DRAVIDA MUNNETRA KAZHAGAM",
         # Word-order reversals
         "MUNNETRA KAZHAGAM DRAVIDA": "DRAVIDA MUNNETRA KAZHAGAM",
         "KAZHAGAM MUNNETRA DRAVIDA": "DRAVIDA MUNNETRA KAZHAGAM",
@@ -72,6 +78,11 @@ class PartyNameFixer:
         "BHARATIYA PARTY JANATA": "BHARATIYA JANATA PARTY",
         "PARTY BHARATIYA JANATA": "BHARATIYA JANATA PARTY",
         "JANATA PARTY BHARATIYA": "BHARATIYA JANATA PARTY",
+        # Character-level reversals with spaces (from screenshot patterns)
+        "JAM AS AJUY N TRAP H AB": "BHARATIYA JANATA PARTY",  # "jam aS ajuy n traP h aB" -> "B h P art n y u j a S m a J" reversed
+        "B H P ART N Y U J A S M A J": "BHARATIYA JANATA PARTY",
+        "YTRAP ATANAJ AYITRAHAB": "BHARATIYA JANATA PARTY",  # Full character reversal
+        "YTRAP ATANAJ AYITRAHB": "BHARATIYA JANATA PARTY",
         
         # INDIAN NATIONAL CONGRESS - canonical form
         "INDIAN NATIONAL CONGRESS": "INDIAN NATIONAL CONGRESS",  # Already correct
@@ -189,6 +200,19 @@ class PartyNameFixer:
         "KATCHI MAKKAL NAADAALUM": "MAKKAL NAADAALUM KATCHI",
         "NAADAALUM KATCHI MAKKAL": "MAKKAL NAADAALUM KATCHI",
         
+        # PARTY ADHIKARAM MAKKAL (PAMK) - canonical form (different from NTK)
+        "PARTY ADHIKARAM MAKKAL": "PARTY ADHIKARAM MAKKAL",  # Already correct
+        # Character-level reversals
+        "LAKKAM MARAKIHDA YTRAP": "PARTY ADHIKARAM MAKKAL",
+        "YTRAP MARAKIHDA LAKKAM": "PARTY ADHIKARAM MAKKAL",
+        "MARAKIHDA YTRAP LAKKAM": "PARTY ADHIKARAM MAKKAL",
+        # Word-order reversals
+        "MAKKAL ADHIKARAM PARTY": "PARTY ADHIKARAM MAKKAL",
+        "ADHIKARAM PARTY MAKKAL": "PARTY ADHIKARAM MAKKAL",
+        "PARTY MAKKAL ADHIKARAM": "PARTY ADHIKARAM MAKKAL",
+        "MAKKAL PARTY ADHIKARAM": "PARTY ADHIKARAM MAKKAL",
+        "ADHIKARAM MAKKAL PARTY": "PARTY ADHIKARAM MAKKAL",
+        
         # INDEPENDENT variations
         "TNEDNEPEDNI": "INDEPENDENT",
         "TNEDNEPEDNI INDEPENDENT": "INDEPENDENT",  # Sometimes appears twice
@@ -205,30 +229,115 @@ class PartyNameFixer:
         'DRAVIDAR', 'ANNA', 'PATTALI', 'TAMILAR', 'TAMIZHAR', 'NAAM',
         'INDEPENDENT', 'INDIA', 'INDIYA', 'BHARATIYA', 'JANATA',
         'VIDUTHALAI', 'CHIRUTHAIGAL', 'NATIONAL', 'CONGRESS',
-        'NAADAALUM'
+        'NAADAALUM', 'ADHIKARAM'
     ]
     
     # Canonical party names (correct order)
-    CANONICAL_PARTY_NAMES = [
-        "DRAVIDA MUNNETRA KAZHAGAM",
-        "ALL INDIA DRAVIDA MUNNETRA KAZHAGAM",  # Without ANNA
-        "BHARATIYA JANATA PARTY",
-        "INDIAN NATIONAL CONGRESS",
-        "VIDUTHALAI CHIRUTHAIGAL KATCHI",
-        "PATTALI MAKKAL KATCHI",
-        "NAAM TAMILAR KATCHI",
-        "INDIA JANAYAKA KATCHI",
-        "BAHUJAN SAMAJ PARTY",
-        "AMMA MAKKAL MUNNETRA KAZHAGAM",
-        "MAKKAL NAADAALUM KATCHI",
-        "INDEPENDENT",
-        "NOTA",
-    ]
+    # Built from comprehensive TN_PARTY_ALIASES
+    CANONICAL_PARTY_NAMES: List[str] = []
+    
+    @classmethod
+    def _build_canonical_names_from_aliases(cls):
+        """Build canonical party names from comprehensive alias mapping."""
+        if cls.CANONICAL_PARTY_NAMES:
+            return  # Already built
+        
+        # Get canonical full names from aliases (prefer full names over abbreviations)
+        canonical_map = {
+            "DMK": "DRAVIDA MUNNETRA KAZHAGAM",
+            "AIADMK": "ALL INDIA ANNA DRAVIDA MUNNETRA KAZHAGAM",
+            "BJP": "BHARATIYA JANATA PARTY",
+            "INC": "INDIAN NATIONAL CONGRESS",
+            "PMK": "PATTALI MAKKAL KATCHI",
+            "VCK": "VIDUTHALAI CHIRUTHAIGAL KATCHI",
+            "NTK": "NAAM TAMILAR KATCHI",
+            "DMDK": "DESIYA MURPOKKU DRAVIDA KAZHAGAM",
+            "MDMK": "MARUMALARCHI DRAVIDA MUNNETRA KAZHAGAM",
+            "AMMK": "AMMA MAKKAL MUNNETRA KAZHAGAM",
+            "TMC(M)": "TAMIL MAANILA CONGRESS",
+            "CPI": "COMMUNIST PARTY OF INDIA",
+            "CPI(M)": "COMMUNIST PARTY OF INDIA (MARXIST)",
+            "IUML": "INDIAN UNION MUSLIM LEAGUE",
+            "AIFB": "ALL INDIA FORWARD BLOC",
+            "RPI(A)": "REPUBLICAN PARTY OF INDIA",
+            "BSP": "BAHUJAN SAMAJ PARTY",
+            "MNM": "MAKKAL NEEDHI MAIAM",
+            "IJK": "INDIA JANANAYAKA KATCHI",
+            "KMDK": "KONGUNADU MAKKAL DESIA KATCHI",
+            "MMK": "MANITHANEYA MAKKAL KATCHI",
+            "SDPI": "SOCIAL DEMOCRATIC PARTY OF INDIA",
+            "PT": "PUTHIYA TAMILAGAM",
+            "AIMIM": "ALL INDIA MAJLIS E ITTEHADUL MUSLIMEEN",
+            "TMK": "TAMILAGA MAKKAL KATCHI",
+            "IND": "INDEPENDENT",
+            "NOTA": "NOTA",
+        }
+        
+        cls.CANONICAL_PARTY_NAMES = list(canonical_map.values())
+        
+        # Also add all full party names from aliases
+        for abbrev, aliases in TN_PARTY_ALIASES.items():
+            # Find the longest full name (most likely canonical)
+            full_names = [a for a in aliases if len(a) > 5 and a == a.upper()]
+            if full_names:
+                canonical = max(full_names, key=len)
+                if canonical not in cls.CANONICAL_PARTY_NAMES:
+                    cls.CANONICAL_PARTY_NAMES.append(canonical)
+    
+    @classmethod
+    def _build_reversed_patterns_from_aliases(cls):
+        """Build additional reversed patterns from comprehensive alias mapping."""
+        cls._build_canonical_names_from_aliases()
+        
+        # Add patterns from TN_PARTY_ALIASES that aren't already in REVERSED_PARTY_PATTERNS
+        for abbrev, aliases in TN_PARTY_ALIASES.items():
+            # Get canonical name for this party
+            canonical_map = {
+                "DMK": "DRAVIDA MUNNETRA KAZHAGAM",
+                "AIADMK": "ALL INDIA ANNA DRAVIDA MUNNETRA KAZHAGAM",
+                "BJP": "BHARATIYA JANATA PARTY",
+                "INC": "INDIAN NATIONAL CONGRESS",
+                "PMK": "PATTALI MAKKAL KATCHI",
+                "VCK": "VIDUTHALAI CHIRUTHAIGAL KATCHI",
+                "NTK": "NAAM TAMILAR KATCHI",
+                "DMDK": "DESIYA MURPOKKU DRAVIDA KAZHAGAM",
+                "MDMK": "MARUMALARCHI DRAVIDA MUNNETRA KAZHAGAM",
+                "AMMK": "AMMA MAKKAL MUNNETRA KAZHAGAM",
+                "TMC(M)": "TAMIL MAANILA CONGRESS",
+                "CPI": "COMMUNIST PARTY OF INDIA",
+                "CPI(M)": "COMMUNIST PARTY OF INDIA (MARXIST)",
+                "IUML": "INDIAN UNION MUSLIM LEAGUE",
+                "AIFB": "ALL INDIA FORWARD BLOC",
+                "RPI(A)": "REPUBLICAN PARTY OF INDIA",
+                "BSP": "BAHUJAN SAMAJ PARTY",
+                "MNM": "MAKKAL NEEDHI MAIAM",
+                "IJK": "INDIA JANANAYAKA KATCHI",
+                "KMDK": "KONGUNADU MAKKAL DESIA KATCHI",
+                "MMK": "MANITHANEYA MAKKAL KATCHI",
+                "SDPI": "SOCIAL DEMOCRATIC PARTY OF INDIA",
+                "PT": "PUTHIYA TAMILAGAM",
+                "AIMIM": "ALL INDIA MAJLIS E ITTEHADUL MUSLIMEEN",
+                "TMK": "TAMILAGA MAKKAL KATCHI",
+                "IND": "INDEPENDENT",
+                "NOTA": "NOTA",
+            }
+            
+            canonical = canonical_map.get(abbrev)
+            if not canonical:
+                continue
+            
+            # Add all aliases as patterns mapping to canonical
+            for alias in aliases:
+                alias_upper = alias.upper().strip()
+                if alias_upper != canonical and alias_upper not in cls.REVERSED_PARTY_PATTERNS:
+                    cls.REVERSED_PARTY_PATTERNS[alias_upper] = canonical
 
     @classmethod
     def fix_reversed_party_name(cls, text: str) -> str:
         """
         Fix reversed party name using pattern matching and intelligent reversal detection.
+        
+        Uses comprehensive alias mapping from TN_PARTY_ALIASES.
         
         Args:
             text: Potentially reversed party name text
@@ -239,6 +348,11 @@ class PartyNameFixer:
         if not text or len(text.strip()) < 3:
             return text
         
+        # Build patterns from aliases if not already done
+        if not cls.CANONICAL_PARTY_NAMES:
+            cls._build_canonical_names_from_aliases()
+            cls._build_reversed_patterns_from_aliases()
+        
         text_upper = text.strip().upper()
         
         # Direct pattern match (exact match)
@@ -246,6 +360,45 @@ class PartyNameFixer:
             corrected = cls.REVERSED_PARTY_PATTERNS[text_upper]
             logger.debug(f"Fixed reversed party name (exact match): '{text}' -> '{corrected}'")
             return corrected
+        
+        # Also check against comprehensive aliases
+        from .party_aliases import get_party_abbreviation, get_all_aliases
+        abbrev = get_party_abbreviation(text_upper)
+        if abbrev:
+            # Get canonical name for this abbreviation
+            canonical_map = {
+                "DMK": "DRAVIDA MUNNETRA KAZHAGAM",
+                "AIADMK": "ALL INDIA ANNA DRAVIDA MUNNETRA KAZHAGAM",
+                "BJP": "BHARATIYA JANATA PARTY",
+                "INC": "INDIAN NATIONAL CONGRESS",
+                "PMK": "PATTALI MAKKAL KATCHI",
+                "VCK": "VIDUTHALAI CHIRUTHAIGAL KATCHI",
+                "NTK": "NAAM TAMILAR KATCHI",
+                "DMDK": "DESIYA MURPOKKU DRAVIDA KAZHAGAM",
+                "MDMK": "MARUMALARCHI DRAVIDA MUNNETRA KAZHAGAM",
+                "AMMK": "AMMA MAKKAL MUNNETRA KAZHAGAM",
+                "TMC(M)": "TAMIL MAANILA CONGRESS",
+                "CPI": "COMMUNIST PARTY OF INDIA",
+                "CPI(M)": "COMMUNIST PARTY OF INDIA (MARXIST)",
+                "IUML": "INDIAN UNION MUSLIM LEAGUE",
+                "AIFB": "ALL INDIA FORWARD BLOC",
+                "RPI(A)": "REPUBLICAN PARTY OF INDIA",
+                "BSP": "BAHUJAN SAMAJ PARTY",
+                "MNM": "MAKKAL NEEDHI MAIAM",
+                "IJK": "INDIA JANANAYAKA KATCHI",
+                "KMDK": "KONGUNADU MAKKAL DESIA KATCHI",
+                "MMK": "MANITHANEYA MAKKAL KATCHI",
+                "SDPI": "SOCIAL DEMOCRATIC PARTY OF INDIA",
+                "PT": "PUTHIYA TAMILAGAM",
+                "AIMIM": "ALL INDIA MAJLIS E ITTEHADUL MUSLIMEEN",
+                "TMK": "TAMILAGA MAKKAL KATCHI",
+                "IND": "INDEPENDENT",
+                "NOTA": "NOTA",
+            }
+            canonical = canonical_map.get(abbrev)
+            if canonical:
+                logger.debug(f"Fixed reversed party name (alias match): '{text}' -> '{canonical}'")
+                return canonical
         
         # Try character-level reversal detection first (for cases like "RALIMAT IHCTAK MAAN")
         # Check if reversing each word individually and trying different word orders helps
@@ -279,6 +432,8 @@ class PartyNameFixer:
         This handles cases where each word is character-reversed (e.g., "RALIMAT" -> "TAMILAR")
         and the word order might also be different.
         
+        Also handles cases where the entire string is reversed character-by-character.
+        
         Args:
             text: Text that may have character-level reversals
             
@@ -289,9 +444,25 @@ class PartyNameFixer:
             return text
         
         text_upper = text.strip().upper()
+        
+        # First, try full string character reversal (for cases like "YTRAP ATANAJ AYITRAHAB")
+        full_reversed = text_upper.replace(' ', '')[::-1]
+        # Try to match against known patterns by checking if reversed string contains party keywords
+        for correct_name in cls.CANONICAL_PARTY_NAMES:
+            correct_upper = correct_name.upper().replace(' ', '')
+            if full_reversed == correct_upper or cls._is_similar_party_name(full_reversed, correct_upper):
+                logger.debug(f"Character reversal fix (full string): '{text}' -> '{correct_name}'")
+                return correct_name
+        
         words = text_upper.split()
         
         if len(words) < 2:
+            # Single word - try reversing it
+            reversed_word = words[0][::-1] if words else text_upper[::-1]
+            for correct_name in cls.CANONICAL_PARTY_NAMES:
+                if reversed_word in correct_name.upper() or correct_name.upper() in reversed_word:
+                    if cls._is_similar_party_name(reversed_word, correct_name.upper()):
+                        return correct_name
             return text
         
         # Generate all possible combinations:
@@ -301,6 +472,16 @@ class PartyNameFixer:
         
         # 2. Reverse each word, reverse word order
         candidate2 = ' '.join(reversed_words[::-1])
+        
+        # 3. Try removing spaces and reversing (for cases like "JAM AS AJUY N TRAP H AB")
+        no_spaces = text_upper.replace(' ', '')
+        no_spaces_reversed = no_spaces[::-1]
+        # Try to match against canonical names without spaces
+        for correct_name in cls.CANONICAL_PARTY_NAMES:
+            correct_no_spaces = correct_name.upper().replace(' ', '')
+            if no_spaces_reversed == correct_no_spaces:
+                logger.debug(f"Character reversal fix (no spaces): '{text}' -> '{correct_name}'")
+                return correct_name
         
         # Check candidates 1 and 2 against known patterns first (most common cases)
         for candidate in [candidate1, candidate2]:

@@ -217,30 +217,50 @@ class ElectionProcessor:
 
     def _extract_party_from_cell(self, cell_text: str) -> Optional[str]:
         """
-        Extract party abbreviation from cell text.
+        Extract party abbreviation from cell text using comprehensive alias matching.
 
         Handles formats like:
         - "CANDIDATE NAME (BJP)"
         - "CANDIDATE NAME. R (AIADMK)"
         - "BJP" (bare abbreviation)
+        - "DRAVIDA MUNNETRA KAZHAGAM" (full party name)
+        - Reversed/OCR corrupted party names
         """
-        cell_upper = cell_text.upper()
+        from .party_aliases import get_party_abbreviation, is_party_alias
+        
+        if not cell_text:
+            return None
+        
+        cell_upper = cell_text.upper().strip()
 
-        # Try to extract from parentheses
+        # Try to extract from parentheses first
         match = re.search(r'\(([A-Z]+)\)', cell_upper)
         if match:
-            return match.group(1)
+            party_abbr = match.group(1)
+            # Verify it's a valid party abbreviation
+            if is_party_alias(party_abbr):
+                return get_party_abbreviation(party_abbr)
 
-        # Check if cell is just a party abbreviation
+        # Check if the entire cell text is a party name/alias
+        if is_party_alias(cell_text):
+            return get_party_abbreviation(cell_text)
+        
+        # Check if cell contains a party name (for cases like "Total - DMK" or full party names)
+        # Try matching against normalized cell text
         clean = re.sub(r'[\s.\-_]+', '', cell_upper)
-        known_parties = [
-            "BJP", "AIADMK", "DMK", "INC", "CONGRESS", "VCK", "PMK",
-            "NTK", "BSP", "NMK", "MDMK", "CPI", "CPM", "CPIM", "IND",
-        ]
-
+        
+        # Check all known party abbreviations
+        from .party_aliases import get_all_party_abbreviations
+        known_parties = get_all_party_abbreviations()
+        
         for party in known_parties:
-            if clean == party or clean.startswith(party):
+            if clean == party or clean.startswith(party) or party in clean:
                 return party
+        
+        # Try comprehensive alias matching on the full cell text
+        abbrev = get_party_abbreviation(cell_text)
+        if abbrev:
+            return abbrev
 
         return None
 

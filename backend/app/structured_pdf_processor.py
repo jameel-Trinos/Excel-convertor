@@ -355,11 +355,28 @@ class StructuredPDFProcessor:
         return False
 
     def _is_party_row(self, row: List[str]) -> bool:
-        """Check if row contains party abbreviations."""
+        """Check if row contains party abbreviations using comprehensive alias matching."""
+        from .party_aliases import is_party_alias, get_all_party_abbreviations
+        
         row_text = " ".join(str(cell).upper() for cell in row if cell)
-        # Common party indicators
-        party_indicators = ["INC", "BJP", "DMK", "AIADMK", "BSP", "IND", "PARTY"]
-        return any(party in row_text for party in party_indicators)
+        
+        # Check each cell for party aliases
+        for cell in row:
+            if cell and is_party_alias(str(cell)):
+                return True
+        
+        # Also check for common party indicators (for backward compatibility)
+        party_indicators = ["INC", "BJP", "DMK", "AIADMK", "BSP", "IND", "PARTY", "NOTA"]
+        if any(party in row_text for party in party_indicators):
+            return True
+        
+        # Check against all known party abbreviations
+        known_parties = get_all_party_abbreviations()
+        for party in known_parties:
+            if party in row_text:
+                return True
+        
+        return False
 
     def _combine_header_rows(self, header_rows: List[List[str]]) -> List[str]:
         """
