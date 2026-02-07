@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 from typing import Dict, List, Optional, Tuple
 
 from anthropic import Anthropic, AnthropicError
@@ -222,15 +223,8 @@ Important:
             # Extract JSON from response
             content = message.content[0].text.strip()
 
-            # Remove markdown code blocks if present
-            if content.startswith("```"):
-                content = content.split("```")[1]
-                if content.startswith("json"):
-                    content = content[4:]
-                content = content.strip()
-
-            # Parse JSON response
-            column_mapping = json.loads(content)
+            # Parse JSON response using robust extraction
+            column_mapping = self._extract_json_from_response(content)
 
             # Validate mapping
             if not isinstance(column_mapping, dict):
@@ -367,15 +361,8 @@ Important:
             # Extract JSON from response
             content = message.content[0].text.strip()
             
-            # Remove markdown code blocks if present
-            if content.startswith("```"):
-                content = content.split("```")[1]
-                if content.startswith("json"):
-                    content = content[4:]
-                content = content.strip()
-            
-            # Parse JSON response
-            result = json.loads(content)
+            # Extract JSON more robustly
+            result = self._extract_json_from_response(content)
             
             # Extract headers and data start index
             header_row_indices = result.get("header_row_indices", [0])
@@ -405,18 +392,73 @@ Important:
             
         except (AnthropicError, json.JSONDecodeError, ValueError) as e:
             logger.error(f"Error during AI header extraction: {e}")
+            # Log the response content if available for debugging
+            try:
+                if 'message' in locals() and hasattr(message, 'content'):
+                    response_preview = message.content[0].text[:500] if message.content else "No content"
+                    logger.debug(f"Claude response preview: {response_preview}")
+            except Exception:
+                pass
             # Fallback: use first row as headers
             if raw_table:
                 headers = [self._clean_cell(cell) for cell in raw_table[0]]
                 return headers, 1, 0.0
             return [], 0, 0.0
         except Exception as e:
-            logger.error(f"Unexpected error during AI header extraction: {e}")
+            logger.error(f"Unexpected error during AI header extraction: {e}", exc_info=True)
             # Fallback: use first row as headers
             if raw_table:
                 headers = [self._clean_cell(cell) for cell in raw_table[0]]
                 return headers, 1, 0.0
             return [], 0, 0.0
+    
+    def _extract_json_from_response(self, content: str) -> dict:
+        """
+        Robustly extract JSON from Claude's response.
+        Handles markdown code blocks, trailing text, and malformed JSON.
+        """
+        original_content = content
+        
+        # Remove markdown code blocks if present
+        if "```json" in content:
+            start = content.find("```json") + 7
+            end = content.find("```", start)
+            if end > start:
+                content = content[start:end].strip()
+        elif "```" in content:
+            start = content.find("```") + 3
+            end = content.find("```", start)
+            if end > start:
+                content = content[start:end].strip()
+        
+        # Try to find JSON object boundaries
+        # Look for the first { and last }
+        first_brace = content.find("{")
+        last_brace = content.rfind("}")
+        
+        if first_brace >= 0 and last_brace > first_brace:
+            content = content[first_brace:last_brace + 1]
+        
+        # Try to parse JSON
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError as e:
+            # Log the problematic content for debugging
+            logger.warning(f"JSON parsing failed, attempting to fix. Error: {e}")
+            logger.debug(f"Problematic content (first 500 chars): {content[:500]}")
+            
+            # Try to fix common JSON issues
+            # Remove trailing commas before closing braces/brackets
+            content = re.sub(r',\s*}', '}', content)
+            content = re.sub(r',\s*]', ']', content)
+            
+            # Try parsing again
+            try:
+                return json.loads(content)
+            except json.JSONDecodeError:
+                # If still failing, log the full response for debugging
+                logger.error(f"Failed to parse JSON after fixes. Original content: {original_content[:1000]}")
+                raise
     
     def _clean_cell(self, value) -> str:
         """Clean a cell value, including fixing reversed text."""
@@ -498,14 +540,8 @@ Return ONLY valid JSON:
 
             content = message.content[0].text.strip()
 
-            # Parse JSON
-            if content.startswith("```"):
-                content = content.split("```")[1]
-                if content.startswith("json"):
-                    content = content[4:]
-                content = content.strip()
-
-            analysis = json.loads(content)
+            # Parse JSON using robust extraction
+            analysis = self._extract_json_from_response(content)
 
             return analysis, 0.9
 
