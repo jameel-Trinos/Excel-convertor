@@ -11,6 +11,8 @@ ENV PYTHONUNBUFFERED=1
 # - python3-tk: Required by camelot-py
 # - libgl1-mesa-glx, libglib2.0-0: OpenCV dependencies
 # - default-jre: Required by tabula-py (Java runtime)
+# - poppler-utils: Required by pdf2image for PDF to image conversion (provides pdfinfo)
+# - tesseract-ocr: Required by pytesseract for OCR processing
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ghostscript \
     python3-tk \
@@ -18,6 +20,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libglib2.0-0 \
     default-jre \
     libmagic1 \
+    poppler-utils \
+    tesseract-ocr \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory

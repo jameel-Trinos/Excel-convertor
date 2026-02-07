@@ -1,0 +1,25 @@
+# System dependencies for PDF processing
+# Railway's Python buildpack will install these packages automatically
+
+# Required by pdf2image for PDF to image conversion (provides pdfinfo)
+poppler-utils
+
+# Required by pytesseract for OCR processing
+tesseract-ocr
+
+# Required by camelot-py for PDF rendering
+ghostscript
+
+# Required by camelot-py
+python3-tk
+
+# OpenCV dependencies
+libgl1-mesa-glx
+libglib2.0-0
+
+# Required by tabula-py (Java runtime)
+default-jre
+
+# Required by python-magic
+libmagic1
+
