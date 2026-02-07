@@ -19,7 +19,14 @@ import {
 } from "lucide-react";
 import { formatFileSize } from "@/lib/utils";
 import { downloadExcel, getPreview, getStatus, getColumns } from "@/lib/api";
-import type { PreviewData, ValidationIssues } from "@/types";
+import {
+  startTranslation,
+  subscribeToTranslateProgress,
+  downloadTranslatedExcel,
+  getTranslateStatus,
+} from "@/lib/translation-api";
+import type { PreviewData, ValidationIssues, TranslateProgressEvent } from "@/types";
+import { Languages, Loader2 } from "lucide-react";
 
 export function FileUpload() {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
@@ -27,6 +34,20 @@ export function FileUpload() {
   const [columnFilterOpen, setColumnFilterOpen] = useState(false);
   const [columns, setColumns] = useState<string[]>([]);
   const [validationIssues, setValidationIssues] = useState<ValidationIssues | null>(null);
+  
+  // Translation state
+  const [translatingTamil, setTranslatingTamil] = useState(false);
+  const [translatingHindi, setTranslatingHindi] = useState(false);
+  const [tamilProgress, setTamilProgress] = useState(0);
+  const [hindiProgress, setHindiProgress] = useState(0);
+  const [tamilProgressMessage, setTamilProgressMessage] = useState("");
+  const [hindiProgressMessage, setHindiProgressMessage] = useState("");
+  const [tamilTaskId, setTamilTaskId] = useState<string | null>(null);
+  const [hindiTaskId, setHindiTaskId] = useState<string | null>(null);
+  const [availableTranslations, setAvailableTranslations] = useState({
+    tamil: false,
+    hindi: false,
+  });
 
   const {
     status,
@@ -102,6 +123,99 @@ export function FileUpload() {
         });
     }
   }, [needsReview, taskId, validationIssues]);
+
+  // Check available translations when conversion completes
+  useEffect(() => {
+    if (isComplete && taskId) {
+      getTranslateStatus(taskId)
+        .then((status) => {
+          setAvailableTranslations({
+            tamil: status.has_tamil_version,
+            hindi: status.has_hindi_version,
+          });
+        })
+        .catch((err) => {
+          console.error("Failed to get translation status:", err);
+        });
+    }
+  }, [isComplete, taskId]);
+
+  const handleTranslate = useCallback(
+    async (targetLang: "tamil" | "hindi") => {
+      if (!taskId || translatingTamil || translatingHindi) return;
+
+      const setTranslating = targetLang === "tamil" ? setTranslatingTamil : setTranslatingHindi;
+      const setProgress = targetLang === "tamil" ? setTamilProgress : setHindiProgress;
+      const setProgressMessage =
+        targetLang === "tamil" ? setTamilProgressMessage : setHindiProgressMessage;
+      const setTaskId = targetLang === "tamil" ? setTamilTaskId : setHindiTaskId;
+
+      setTranslating(true);
+      setProgress(0);
+      setProgressMessage("Starting translation...");
+
+      try {
+        const response = await startTranslation(taskId, targetLang);
+
+        // Check if it's a cached response
+        if (response.translate_task_id.startsWith("cached_")) {
+          setTranslating(false);
+          setAvailableTranslations((prev) => ({ ...prev, [targetLang]: true }));
+          setTaskId(response.translate_task_id);
+          return;
+        }
+
+        setTaskId(response.translate_task_id);
+
+        // Subscribe to progress
+        const unsubscribe = subscribeToTranslateProgress(
+          response.translate_task_id,
+          (event: TranslateProgressEvent) => {
+            const progressPercent =
+              event.total > 0 ? (event.current / event.total) * 100 : 0;
+            setProgress(progressPercent);
+            setProgressMessage(event.message);
+          },
+          () => {
+            // Complete
+            setTranslating(false);
+            setAvailableTranslations((prev) => ({ ...prev, [targetLang]: true }));
+            setTaskId(null);
+          },
+          (err: Error) => {
+            // Error
+            console.error("Translation failed:", err);
+            setProgressMessage(`Error: ${err.message}`);
+            setTranslating(false);
+            setTaskId(null);
+          }
+        );
+
+        // Store unsubscribe function (cleanup on unmount)
+        return () => unsubscribe();
+      } catch (err) {
+        console.error("Failed to start translation:", err);
+        setProgressMessage(
+          err instanceof Error ? err.message : "Translation failed"
+        );
+        setTranslating(false);
+        setTaskId(null);
+      }
+    },
+    [taskId, translatingTamil, translatingHindi]
+  );
+
+  const handleDownloadTranslated = useCallback(
+    async (language: "tamil" | "hindi") => {
+      if (!taskId || !filename) return;
+      try {
+        await downloadTranslatedExcel(taskId, language, filename);
+      } catch (error) {
+        console.error(`Failed to download ${language} translation:`, error);
+      }
+    },
+    [taskId, filename]
+  );
 
   return (
     <div className="bg-white rounded-xl shadow-lg p-6 md:p-8">
@@ -179,6 +293,90 @@ export function FileUpload() {
             </Button>
 
             <DownloadButton taskId={taskId} filename={filename || "data.pdf"} />
+          </div>
+
+          {/* Translation Buttons */}
+          <div className="border-t border-gray-200 pt-4 mt-4">
+            <div className="text-center mb-3">
+              <p className="text-sm font-medium text-gray-700">Translate to:</p>
+            </div>
+            <div className="flex flex-col sm:flex-row gap-3 justify-center">
+              {/* Tamil Translation Button */}
+              <div className="flex flex-col gap-2">
+                {availableTranslations.tamil && !translatingTamil ? (
+                  <Button
+                    variant="outline"
+                    onClick={() => handleDownloadTranslated("tamil")}
+                    className="gap-2"
+                  >
+                    <Languages className="h-4 w-4" />
+                    Download Tamil (தமிழ்)
+                  </Button>
+                ) : (
+                  <Button
+                    variant="outline"
+                    onClick={() => handleTranslate("tamil")}
+                    disabled={translatingTamil || translatingHindi}
+                    className="gap-2"
+                  >
+                    {translatingTamil ? (
+                      <>
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                        Translating... {Math.round(tamilProgress)}%
+                      </>
+                    ) : (
+                      <>
+                        <Languages className="h-4 w-4" />
+                        Translate to Tamil (தமிழ்)
+                      </>
+                    )}
+                  </Button>
+                )}
+                {translatingTamil && tamilProgressMessage && (
+                  <p className="text-xs text-gray-500 text-center">
+                    {tamilProgressMessage}
+                  </p>
+                )}
+              </div>
+
+              {/* Hindi Translation Button */}
+              <div className="flex flex-col gap-2">
+                {availableTranslations.hindi && !translatingHindi ? (
+                  <Button
+                    variant="outline"
+                    onClick={() => handleDownloadTranslated("hindi")}
+                    className="gap-2"
+                  >
+                    <Languages className="h-4 w-4" />
+                    Download Hindi (हिंदी)
+                  </Button>
+                ) : (
+                  <Button
+                    variant="outline"
+                    onClick={() => handleTranslate("hindi")}
+                    disabled={translatingTamil || translatingHindi}
+                    className="gap-2"
+                  >
+                    {translatingHindi ? (
+                      <>
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                        Translating... {Math.round(hindiProgress)}%
+                      </>
+                    ) : (
+                      <>
+                        <Languages className="h-4 w-4" />
+                        Translate to Hindi (हिंदी)
+                      </>
+                    )}
+                  </Button>
+                )}
+                {translatingHindi && hindiProgressMessage && (
+                  <p className="text-xs text-gray-500 text-center">
+                    {hindiProgressMessage}
+                  </p>
+                )}
+              </div>
+            </div>
           </div>
 
           <div className="text-center">

@@ -21,8 +21,7 @@ TN_PARTY_ALIASES: Dict[str, Set[str]] = {
     "AIADMK": {
         "AIADMK",
         "ALL INDIA ANNA DRAVIDA MUNNETRA KAZHAGAM",
-        "ANNA DRAVIDA MUNNETRA KAZHAGAM",
-        "ALL INDIA ANNA DRAVIDA KAZHAGAM",
+        "ALL INDIA DRAVIDA MUNNETRA KAZHAGAM",  # Common variation without ANNA
         "ARTENNUM ANNA MAGAHZAK AIDNI ADIVARD LLA",  # OCR broken
         "MAGAHZAK ARTENNEM ANNA AIDNI ADIVARD",
     },
@@ -212,17 +211,26 @@ def get_party_abbreviation(alias: str) -> Optional[str]:
             return abbrev
     
     # Check if alias contains any known party alias
+    # Collect ALL matches and return the most specific one (longest matching alias)
+    # This prevents "DRAVIDA MUNNETRA KAZHAGAM" (DMK) from matching before
+    # "ALL INDIA ANNA DRAVIDA MUNNETRA KAZHAGAM" (AIADMK) when processing AIADMK names
+    best_match_abbrev = None
+    best_match_length = 0
+
     for abbrev, aliases in TN_PARTY_ALIASES.items():
         for known_alias in aliases:
             if known_alias in alias_upper or alias_upper in known_alias:
                 # Additional check: ensure significant overlap
                 if len(known_alias) >= 5 and len(alias_upper) >= 5:
-                    return abbrev
-    
-    return None
+                    # Prefer the longest matching alias (most specific match)
+                    if len(known_alias) > best_match_length:
+                        best_match_length = len(known_alias)
+                        best_match_abbrev = abbrev
+
+    return best_match_abbrev
 
 
-def get_standardized_party_name(alias: str) -> Optional[str]:
+def get_standardized_party_name(alias: str, include_votes_suffix: bool = True) -> Optional[str]:
     """
     Get the standardized party column name for a given alias.
     
@@ -231,9 +239,10 @@ def get_standardized_party_name(alias: str) -> Optional[str]:
     
     Args:
         alias: Party name variation/alias to look up
+        include_votes_suffix: If True, add " Votes" suffix. If False, return just abbreviation.
         
     Returns:
-        Standardized party name (e.g., "DMK Votes") or None if not found
+        Standardized party name (e.g., "DMK Votes" or "DMK") or None if not found
     """
     abbrev = get_party_abbreviation(alias)
     
@@ -245,6 +254,10 @@ def get_standardized_party_name(alias: str) -> Optional[str]:
         return "Independent"
     if abbrev == "NOTA":
         return "NOTA"
+    
+    # If include_votes_suffix is False, return just the abbreviation
+    if not include_votes_suffix:
+        return abbrev
     
     # Standard format: "{ABBREVIATION} Votes"
     return f"{abbrev} Votes"

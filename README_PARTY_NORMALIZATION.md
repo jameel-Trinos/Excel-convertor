@@ -68,7 +68,7 @@ pip install -r requirements.txt
 
 ```bash
 # Clone or navigate to project
-cd "/Volumes/Trinos/Learning/Excel Convertor"
+# From project root
 
 # Set API key
 export ANTHROPIC_API_KEY='sk-ant-your-api-key-here'

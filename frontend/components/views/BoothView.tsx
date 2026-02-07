@@ -166,6 +166,7 @@ export function BoothView() {
             setPreviewOpen(false);
             setColumnFilterOpen(true);
           }}
+          isBoothView={true}
         />
       )}
 

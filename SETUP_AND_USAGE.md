@@ -12,7 +12,7 @@ python3 --version
 ### Step 2: Install Dependencies
 
 ```bash
-cd "/Volumes/Trinos/Learning/Excel Convertor/backend"
+cd backend
 pip install -r requirements.txt
 ```
 
@@ -23,8 +23,9 @@ pip install -r requirements.txt
 export ANTHROPIC_API_KEY='sk-ant-your-api-key-here'
 
 # Option 2: .env file (permanent)
-cd "/Volumes/Trinos/Learning/Excel Convertor"
-echo "ANTHROPIC_API_KEY=sk-ant-your-key-here" > .env
+cd backend
+cp .env.example .env
+# Edit .env and add: ANTHROPIC_API_KEY=sk-ant-your-key-here
 ```
 
 **Get your API key**: https://console.anthropic.com/
@@ -32,7 +33,7 @@ echo "ANTHROPIC_API_KEY=sk-ant-your-key-here" > .env
 ### Step 4: Test Installation
 
 ```bash
-cd "/Volumes/Trinos/Learning/Excel Convertor/backend"
+cd backend
 python3 demo_party_normalization.py
 ```
 
@@ -45,8 +46,6 @@ python3 demo_party_normalization.py
 ### Scenario 1: Convert One PDF (Most Common)
 
 ```bash
-cd "/Volumes/Trinos/Learning/Excel Convertor"
-
 # Simple conversion
 python3 convert_with_party_normalization.py election_data.pdf
 
@@ -114,7 +113,7 @@ asyncio.run(convert("input.pdf", "output.xlsx"))
 
 **Start server:**
 ```bash
-cd "/Volumes/Trinos/Learning/Excel Convertor/backend"
+cd backend
 uvicorn app.main:app --reload --port 8000
 ```
 

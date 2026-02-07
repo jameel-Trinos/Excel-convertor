@@ -1473,7 +1473,7 @@ class PDFProcessor:
         # Fallback to legacy mapping for backward compatibility
         party_mapping = {
             "DMK": "DRAVIDA MUNNETRA KAZHAGAM",
-            "AIADMK": "ALL INDIA DRAVIDA MUNNETRA KAZHAGAM",
+            "AIADMK": "ALL INDIA ANNA DRAVIDA MUNNETRA KAZHAGAM",
             "BJP": "BHARATIYA JANATA PARTY",
             "CONGRESS": "INDIAN NATIONAL CONGRESS",
             "INC": "INDIAN NATIONAL CONGRESS",
@@ -1500,9 +1500,12 @@ class PDFProcessor:
             if keyword_count > 1:
                 # Might be merged - try to extract individual party names
                 # Check for known party patterns
+                # Order: longest/most specific names first to avoid
+                # "DRAVIDA MUNNETRA KAZHAGAM" (DMK) matching before AIADMK
                 known_parties = [
-                    "DRAVIDA MUNNETRA KAZHAGAM",
+                    "ALL INDIA ANNA DRAVIDA MUNNETRA KAZHAGAM",
                     "ALL INDIA DRAVIDA MUNNETRA KAZHAGAM",
+                    "DRAVIDA MUNNETRA KAZHAGAM",
                     "BHARATIYA JANATA PARTY",
                     "NAAM TAMILAR KATCHI",
                     "PATTALI MAKKAL KATCHI",

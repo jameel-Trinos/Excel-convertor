@@ -18,7 +18,7 @@ Your PDF to Excel converter is now running with **Enhanced Claude AI Mode** enab
 Open a new terminal and run:
 
 ```bash
-cd /Volumes/Trinos/Learning/Excel\ Convertor/frontend
+cd frontend
 npm run dev
 ```
 
@@ -203,7 +203,7 @@ This checks:
 Monitor what's happening:
 
 ```bash
-tail -f /Volumes/Trinos/Learning/Excel\ Convertor/backend/backend.log
+tail -f backend/backend.log
 ```
 
 You'll see detailed logs about:
@@ -251,8 +251,8 @@ npm run dev
 
 ## 📝 File Locations
 
-- **Backend**: `/Volumes/Trinos/Learning/Excel Convertor/backend/`
-- **Frontend**: `/Volumes/Trinos/Learning/Excel Convertor/frontend/`
+- **Backend**: `backend/`
+- **Frontend**: `frontend/`
 - **Uploads**: `backend/uploads/` (cleaned up after processing)
 - **Outputs**: `backend/outputs/` (your Excel files)
 - **Logs**: `backend/backend.log`

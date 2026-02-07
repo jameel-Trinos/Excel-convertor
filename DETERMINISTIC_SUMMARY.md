@@ -221,7 +221,7 @@ WARNING: Station 42: Vote sum mismatch.
 ## File Locations
 
 ```
-/Volumes/Trinos/Learning/Excel Convertor/
+.
 ├── backend/app/
 │   ├── deterministic_parser.py          ← New parser
 │   ├── deterministic_excel_creator.py   ← New Excel creator

@@ -71,13 +71,15 @@ export function ColumnFilter({
     }
   }, [isOpen, columns]);
 
-  // Group columns by mapped party label (or by their original header when no confident match)
+  // Group columns - show each column separately, do NOT group by party label
+  // This ensures each independent party and each party column is shown individually
   const columnGroups = useMemo(() => {
     const groups: Record<string, { cols: string[]; examples: string[] }> = {};
 
     for (const col of columns) {
-      const match = matchPartyLabel(col);
-      const key = match ? match.label : col; // no forced "OTHERS"; keep original if unsure
+      // Use the original column name as the key to keep all columns separate
+      // This ensures each column appears individually, even if they have the same party name
+      const key = col;
 
       if (!groups[key]) groups[key] = { cols: [], examples: [] };
       groups[key].cols.push(col);
@@ -102,12 +104,38 @@ export function ColumnFilter({
       "NDK Votes",
       "CPI Votes",
       "NOTA Votes",
-      "IND Votes",
     ];
 
-    const partyKeys = knownPartyOrder.filter((k) => keys.includes(k));
-    const rest = keys.filter((k) => !knownPartyOrder.includes(k));
-    return [...partyKeys, ...rest];
+    // Sort columns: first by party label match (if any), then by original order
+    const sorted = keys.sort((a, b) => {
+      const matchA = matchPartyLabel(a);
+      const matchB = matchPartyLabel(b);
+      
+      // Get party labels for comparison
+      const labelA = matchA?.label || "";
+      const labelB = matchB?.label || "";
+      
+      // Find index in known party order
+      const indexA = knownPartyOrder.indexOf(labelA);
+      const indexB = knownPartyOrder.indexOf(labelB);
+      
+      // If both are in known order, sort by that order
+      if (indexA !== -1 && indexB !== -1) {
+        if (indexA !== indexB) return indexA - indexB;
+        // If same party label, maintain original order
+        return keys.indexOf(a) - keys.indexOf(b);
+      }
+      
+      // If only A is in known order, A comes first
+      if (indexA !== -1) return -1;
+      // If only B is in known order, B comes first
+      if (indexB !== -1) return 1;
+      
+      // If neither is in known order, maintain original order
+      return keys.indexOf(a) - keys.indexOf(b);
+    });
+    
+    return sorted;
   }, [columnGroups]);
 
   const filteredGroupKeys = useMemo(() => {
@@ -315,20 +343,21 @@ export function ColumnFilter({
                     (groupKey.toLowerCase().includes(searchQuery.toLowerCase()) ||
                       cols.some((c) => c.toLowerCase().includes(searchQuery.toLowerCase())));
 
-                  // If groupKey is exactly an original column (no match), treat as single-column entry
+                  // Since we're showing each column separately, each group should have exactly 1 column
                   const isSingle = cols.length === 1 && cols[0] === groupKey;
-                  const colors = getPartyColors(groupKey);
+                  
+                  // Get party label for display (if available)
+                  const match = matchPartyLabel(groupKey);
+                  const displayLabel = match?.label || groupKey;
+                  const colors = getPartyColors(displayLabel);
 
-                  // Determine badge type
+                  // Determine badge type - since each column is separate, show "Numeric" or "Text"
                   let badgeText = "Numeric";
                   let badgeColor = colors.badge + " " + colors.badgeText;
 
                   if (groupKey.includes("TOTAL")) {
                     badgeText = "Calculated";
                     badgeColor = "bg-indigo-100 text-indigo-700";
-                  } else if (!isSingle) {
-                    badgeText = `${cols.length} columns`;
-                    badgeColor = "bg-gray-100 text-gray-700";
                   }
 
                   return (
@@ -343,24 +372,19 @@ export function ColumnFilter({
                       <input
                         type="checkbox"
                         checked={selected}
-                        onChange={() => (isSingle ? toggleColumn(groupKey) : toggleGroup(groupKey))}
+                        onChange={() => toggleColumn(groupKey)}
                         className="w-4 h-4 text-blue-600 rounded mt-0.5"
                       />
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-1.5 mb-0.5">
-                          <h3 className="font-semibold text-gray-900 text-sm truncate">{groupKey}</h3>
+                          <h3 className="font-semibold text-gray-900 text-sm truncate">{displayLabel}</h3>
                           <span className={`px-1.5 py-0.5 ${badgeColor} text-xs font-medium rounded flex-shrink-0`}>
                             {badgeText}
                           </span>
                         </div>
-                        {isSingle && cols[0] !== groupKey && (
-                          <p className="text-xs text-gray-600 truncate">{cols[0]}</p>
-                        )}
-                        {!isSingle && cols.length > 1 && (
-                          <p className="text-xs text-gray-600 truncate">
-                            {group.examples.slice(0, 2).join(", ")}
-                            {cols.length > 2 && ` +${cols.length - 2} more`}
-                          </p>
+                        {/* Show original column name if it differs from display label */}
+                        {groupKey !== displayLabel && (
+                          <p className="text-xs text-gray-600 truncate">{groupKey}</p>
                         )}
                       </div>
                     </label>

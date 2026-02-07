@@ -140,3 +140,35 @@ export interface GeocodeApplyResponse {
   successful: number;
   failed: number;
 }
+
+// Translation Types
+
+export type Language = "original" | "tamil" | "hindi" | "english";
+
+export interface TranslateStartResponse {
+  translate_task_id: string;
+  total_cells: number;
+  message: string;
+}
+
+export interface TranslateProgressEvent {
+  current: number;
+  total: number;
+  status: "translating" | "completed" | "failed" | "cancelled";
+  message: string;
+}
+
+export interface TranslateStatusResponse {
+  task_id: string;
+  has_tamil_version: boolean;
+  has_hindi_version: boolean;
+  has_english_version: boolean;
+  tamil_file_path?: string | null;
+  hindi_file_path?: string | null;
+  english_file_path?: string | null;
+}
+
+export interface AddBoothNameColumnRequest {
+  task_id: string;
+  source_column: string;
+}

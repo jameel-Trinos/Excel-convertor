@@ -163,11 +163,32 @@ class PartyNormalizer:
                 logger.debug(f"Fixed reversed party name before normalization: '{column_name}' -> '{fixed_column}'")
                 column_name = fixed_column
 
+        # Check if column name contains "votes" or is clearly a vote column
+        column_lower = column_name.lower()
+        is_vote_column = any(keyword in column_lower for keyword in ["vote", "votes", "total", "count"])
+        
         # Try comprehensive alias matching first (from party_aliases.py)
-        standardized_name = get_standardized_party_name(column_name)
+        # For vote columns (which is the primary use case for normalize_column_name),
+        # always return standardized name with "Votes" suffix
+        standardized_name = get_standardized_party_name(column_name, include_votes_suffix=True)
         if standardized_name:
             logger.debug(f"Matched via comprehensive aliases: '{column_name}' -> '{standardized_name}'")
             return standardized_name
+        
+        # If not found via alias matching and it's not a vote column,
+        # check if it's a full party name that should return just the abbreviation
+        if not is_vote_column:
+            abbrev = get_party_abbreviation(column_name)
+            if abbrev:
+                # Check if the column name is a full party name (not just abbreviation)
+                # Full party names are typically longer and contain multiple words
+                is_full_party_name = len(column_name.split()) > 2 or any(
+                    word in column_lower for word in ["kazhagam", "katchi", "party", "congress"]
+                )
+                if is_full_party_name:
+                    # Return just the abbreviation for non-vote column contexts (e.g., candidate party field)
+                    logger.debug(f"Matched full party name (non-vote context): '{column_name}' -> '{abbrev}'")
+                    return abbrev
 
         # Exact match in reverse mapping
         if column_name in self._reverse_mapping:
