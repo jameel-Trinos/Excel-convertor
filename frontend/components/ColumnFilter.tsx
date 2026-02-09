@@ -12,7 +12,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Loader2, X, Download, Info } from "lucide-react";
 import { filterExcel } from "@/lib/api";
-import { matchPartyLabel } from "@/lib/partyHeaderMapper";
+import { matchColumnLabel } from "@/lib/partyHeaderMapper";
 
 interface ColumnFilterProps {
   isOpen: boolean;
@@ -24,18 +24,50 @@ interface ColumnFilterProps {
 
 // Color schemes for different party types
 const PARTY_COLORS: Record<string, { border: string; bg: string; badge: string; badgeText: string }> = {
-  "BJP Votes": { border: "border-blue-200", bg: "bg-blue-50", badge: "bg-blue-100", badgeText: "text-blue-700" },
+  // Major parties
+  "DMK Votes": { border: "border-indigo-200", bg: "bg-indigo-50", badge: "bg-indigo-100", badgeText: "text-indigo-700" },
   "AIADMK Votes": { border: "border-green-200", bg: "bg-green-50", badge: "bg-green-100", badgeText: "text-green-700" },
-  "BSP Votes": { border: "border-purple-200", bg: "bg-purple-50", badge: "bg-purple-100", badgeText: "text-purple-700" },
-  "NMK Votes": { border: "border-yellow-200", bg: "bg-yellow-50", badge: "bg-yellow-100", badgeText: "text-yellow-700" },
+  "BJP Votes": { border: "border-blue-200", bg: "bg-blue-50", badge: "bg-blue-100", badgeText: "text-blue-700" },
+  "CONGRESS Votes": { border: "border-cyan-200", bg: "bg-cyan-50", badge: "bg-cyan-100", badgeText: "text-cyan-700" },
+  // Alliance / medium parties
+  "PMK Votes": { border: "border-lime-200", bg: "bg-lime-50", badge: "bg-lime-100", badgeText: "text-lime-700" },
   "VCK Votes": { border: "border-red-200", bg: "bg-red-50", badge: "bg-red-100", badgeText: "text-red-700" },
   "NTK Votes": { border: "border-pink-200", bg: "bg-pink-50", badge: "bg-pink-100", badgeText: "text-pink-700" },
+  "DMDK Votes": { border: "border-teal-200", bg: "bg-teal-50", badge: "bg-teal-100", badgeText: "text-teal-700" },
+  "MDMK Votes": { border: "border-emerald-200", bg: "bg-emerald-50", badge: "bg-emerald-100", badgeText: "text-emerald-700" },
+  "AMMK Votes": { border: "border-amber-200", bg: "bg-amber-50", badge: "bg-amber-100", badgeText: "text-amber-700" },
+  "NDK Votes": { border: "border-stone-200", bg: "bg-stone-50", badge: "bg-stone-100", badgeText: "text-stone-700" },
+  // Left parties
+  "CPI Votes": { border: "border-red-200", bg: "bg-red-50", badge: "bg-red-100", badgeText: "text-red-700" },
+  "CPI(M) Votes": { border: "border-rose-200", bg: "bg-rose-50", badge: "bg-rose-100", badgeText: "text-rose-700" },
+  // Congress allies
+  "TMC(M) Votes": { border: "border-sky-200", bg: "bg-sky-50", badge: "bg-sky-100", badgeText: "text-sky-700" },
+  "IUML Votes": { border: "border-emerald-200", bg: "bg-emerald-50", badge: "bg-emerald-100", badgeText: "text-emerald-700" },
+  "AIFB Votes": { border: "border-fuchsia-200", bg: "bg-fuchsia-50", badge: "bg-fuchsia-100", badgeText: "text-fuchsia-700" },
+  "RPI(A) Votes": { border: "border-violet-200", bg: "bg-violet-50", badge: "bg-violet-100", badgeText: "text-violet-700" },
+  // Smaller / regional parties
+  "BSP Votes": { border: "border-purple-200", bg: "bg-purple-50", badge: "bg-purple-100", badgeText: "text-purple-700" },
+  "MNM Votes": { border: "border-yellow-200", bg: "bg-yellow-50", badge: "bg-yellow-100", badgeText: "text-yellow-700" },
+  "IJK Votes": { border: "border-stone-200", bg: "bg-stone-50", badge: "bg-stone-100", badgeText: "text-stone-700" },
+  "KMDK Votes": { border: "border-zinc-200", bg: "bg-zinc-50", badge: "bg-zinc-100", badgeText: "text-zinc-700" },
+  "MMK Votes": { border: "border-slate-200", bg: "bg-slate-50", badge: "bg-slate-100", badgeText: "text-slate-700" },
+  "SDPI Votes": { border: "border-green-200", bg: "bg-green-50", badge: "bg-green-100", badgeText: "text-green-700" },
+  "PT Votes": { border: "border-amber-200", bg: "bg-amber-50", badge: "bg-amber-100", badgeText: "text-amber-700" },
+  "AIMIM Votes": { border: "border-teal-200", bg: "bg-teal-50", badge: "bg-teal-100", badgeText: "text-teal-700" },
+  "TMK Votes": { border: "border-cyan-200", bg: "bg-cyan-50", badge: "bg-cyan-100", badgeText: "text-cyan-700" },
+  // Special
   "IND Votes": { border: "border-gray-200", bg: "bg-gray-50", badge: "bg-gray-100", badgeText: "text-gray-700" },
   "NOTA Votes": { border: "border-orange-200", bg: "bg-orange-50", badge: "bg-orange-100", badgeText: "text-orange-700" },
-  "DMK Votes": { border: "border-indigo-200", bg: "bg-indigo-50", badge: "bg-indigo-100", badgeText: "text-indigo-700" },
-  "CONGRESS Votes": { border: "border-cyan-200", bg: "bg-cyan-50", badge: "bg-cyan-100", badgeText: "text-cyan-700" },
-  "PMK Votes": { border: "border-lime-200", bg: "bg-lime-50", badge: "bg-lime-100", badgeText: "text-lime-700" },
   "TOTAL": { border: "border-indigo-200", bg: "bg-indigo-50", badge: "bg-indigo-100", badgeText: "text-indigo-700" },
+  // Administrative columns
+  "Polling Station No.": { border: "border-slate-200", bg: "bg-slate-50", badge: "bg-slate-100", badgeText: "text-slate-700" },
+  "Polling Station Name": { border: "border-sky-200", bg: "bg-sky-50", badge: "bg-sky-100", badgeText: "text-sky-700" },
+  "SL. NO.": { border: "border-slate-200", bg: "bg-slate-50", badge: "bg-slate-100", badgeText: "text-slate-700" },
+  "AC NO.": { border: "border-slate-200", bg: "bg-slate-50", badge: "bg-slate-100", badgeText: "text-slate-700" },
+  "Total Valid Votes": { border: "border-indigo-200", bg: "bg-indigo-50", badge: "bg-indigo-100", badgeText: "text-indigo-700" },
+  "Rejected Votes": { border: "border-orange-200", bg: "bg-orange-50", badge: "bg-orange-100", badgeText: "text-orange-700" },
+  "Tendered Votes": { border: "border-orange-200", bg: "bg-orange-50", badge: "bg-orange-100", badgeText: "text-orange-700" },
+  "Total Electors": { border: "border-indigo-200", bg: "bg-indigo-50", badge: "bg-indigo-100", badgeText: "text-indigo-700" },
   "default": { border: "border-gray-200", bg: "bg-white", badge: "bg-gray-100", badgeText: "text-gray-700" },
 };
 
@@ -59,57 +91,62 @@ export function ColumnFilter({
   const [showOthersDialog, setShowOthersDialog] = useState(false);
   const [selectedOthersColumns, setSelectedOthersColumns] = useState<Set<string>>(new Set());
 
+  // Build unique keys for each column to handle duplicates (e.g., multiple "DNI" columns)
+  const uniqueColumns = useMemo(() => {
+    const nameCounts: Record<string, number> = {};
+    return columns.map((col, idx) => {
+      nameCounts[col] = (nameCounts[col] || 0) + 1;
+      const count = nameCounts[col];
+      // For first occurrence keep original name, for duplicates append index
+      const uniqueKey = count === 1 ? col : `${col} (${count})`;
+      return { uniqueKey, originalName: col, index: idx };
+    });
+  }, [columns]);
+
+  // All unique keys for convenience
+  const allUniqueKeys = useMemo(() => uniqueColumns.map(c => c.uniqueKey), [uniqueColumns]);
+
   // Initialize all columns as selected by default
   useEffect(() => {
     if (isOpen) {
-      setSelectedColumns(new Set(columns));
+      setSelectedColumns(new Set(allUniqueKeys));
       setSearchQuery("");
       setIncludeOthers(false);
       setError(null);
       setShowOthersDialog(false);
       setSelectedOthersColumns(new Set());
     }
-  }, [isOpen, columns]);
+  }, [isOpen, allUniqueKeys]);
 
-  // Group columns - show each column separately, do NOT group by party label
-  // This ensures each independent party and each party column is shown individually
+  // Group columns - show each column separately
   const columnGroups = useMemo(() => {
     const groups: Record<string, { cols: string[]; examples: string[] }> = {};
 
-    for (const col of columns) {
-      // Use the original column name as the key to keep all columns separate
-      // This ensures each column appears individually, even if they have the same party name
-      const key = col;
-
-      if (!groups[key]) groups[key] = { cols: [], examples: [] };
-      groups[key].cols.push(col);
-      if (groups[key].examples.length < 2) groups[key].examples.push(col);
+    for (const { uniqueKey } of uniqueColumns) {
+      if (!groups[uniqueKey]) groups[uniqueKey] = { cols: [], examples: [] };
+      groups[uniqueKey].cols.push(uniqueKey);
+      if (groups[uniqueKey].examples.length < 2) groups[uniqueKey].examples.push(uniqueKey);
     }
-    
+
     return groups;
-  }, [columns]);
+  }, [uniqueColumns]);
 
   const sortedGroupKeys = useMemo(() => {
     const keys = Object.keys(columnGroups);
     const knownPartyOrder = [
-      "DMK Votes",
-      "AIADMK Votes",
-      "BJP Votes",
-      "CONGRESS Votes",
-      "VCK Votes",
-      "PMK Votes",
-      "NTK Votes",
-      "AMMK Votes",
-      "DMDK Votes",
-      "NDK Votes",
-      "CPI Votes",
-      "NOTA Votes",
+      "DMK Votes", "AIADMK Votes", "BJP Votes", "CONGRESS Votes",
+      "PMK Votes", "VCK Votes", "NTK Votes", "AMMK Votes", "DMDK Votes",
+      "MDMK Votes", "NDK Votes", "CPI Votes", "CPI(M) Votes",
+      "TMC(M) Votes", "IUML Votes", "AIFB Votes", "RPI(A) Votes",
+      "BSP Votes", "MNM Votes", "IJK Votes", "KMDK Votes", "MMK Votes",
+      "SDPI Votes", "PT Votes", "AIMIM Votes", "TMK Votes",
+      "IND Votes", "NOTA Votes",
     ];
 
     // Sort columns: first by party label match (if any), then by original order
     const sorted = keys.sort((a, b) => {
-      const matchA = matchPartyLabel(a);
-      const matchB = matchPartyLabel(b);
+      const matchA = matchColumnLabel(a);
+      const matchB = matchColumnLabel(b);
       
       // Get party labels for comparison
       const labelA = matchA?.label || "";
@@ -184,19 +221,19 @@ export function ColumnFilter({
   };
 
   const toggleAll = () => {
-    if (selectedColumns.size === columns.length) {
+    if (selectedColumns.size === allUniqueKeys.length) {
       // Deselect all
       setSelectedColumns(new Set());
     } else {
       // Select all
-      setSelectedColumns(new Set(columns));
+      setSelectedColumns(new Set(allUniqueKeys));
     }
   };
 
   // Get unselected columns for OTHERS dialog
   const unselectedColumns = useMemo(() => {
-    return columns.filter(col => !selectedColumns.has(col));
-  }, [columns, selectedColumns]);
+    return allUniqueKeys.filter(key => !selectedColumns.has(key));
+  }, [allUniqueKeys, selectedColumns]);
 
   const handleSubmit = async () => {
     if (selectedColumns.size === 0) {
@@ -217,23 +254,34 @@ export function ColumnFilter({
     await performFilter([]);
   };
 
+  // Helper to map unique keys back to original column names
+  const uniqueKeyToOriginal = useMemo(() => {
+    const map: Record<string, string> = {};
+    for (const { uniqueKey, originalName } of uniqueColumns) {
+      map[uniqueKey] = originalName;
+    }
+    return map;
+  }, [uniqueColumns]);
+
   const performFilter = async (othersColumns: string[]) => {
     setLoading(true);
     setError(null);
 
     try {
-      const columnsToInclude = Array.from(selectedColumns);
-      // Build header overrides so downloaded Excel uses the same display labels shown in this UI
+      // Map unique keys back to original column names for the API
+      const columnsToInclude = Array.from(selectedColumns).map(key => uniqueKeyToOriginal[key] || key);
+      const othersOriginal = othersColumns.map(key => uniqueKeyToOriginal[key] || key);
+      // Build header overrides so downloaded Excel uses abbreviated party labels
+      // e.g., "BHARATIYA JANATA PARTY" → "BJP Votes"
       const headerOverrides: Record<string, string> = {};
-      for (const [groupKey, group] of Object.entries(columnGroups)) {
-        for (const col of group.cols) {
-          if (!selectedColumns.has(col)) continue;
-          // Only override when the UI label differs from the original header
-          if (groupKey !== col) headerOverrides[col] = groupKey;
+      for (const col of columnsToInclude) {
+        const match = matchColumnLabel(col);
+        if (match) {
+          headerOverrides[col] = match.label;
         }
       }
 
-      await filterExcel(taskId, columnsToInclude, filename, othersColumns, headerOverrides);
+      await filterExcel(taskId, columnsToInclude, filename, othersOriginal, headerOverrides);
       onClose();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to filter Excel");
@@ -251,8 +299,8 @@ export function ColumnFilter({
     performFilter(Array.from(selectedOthersColumns));
   };
 
-  const allSelected = selectedColumns.size === columns.length;
-  const someSelected = selectedColumns.size > 0 && selectedColumns.size < columns.length;
+  const allSelected = selectedColumns.size === allUniqueKeys.length;
+  const someSelected = selectedColumns.size > 0 && selectedColumns.size < allUniqueKeys.length;
   const totalColumnsToDownload = selectedColumns.size + (includeOthers ? 1 : 0);
 
   return (
@@ -314,14 +362,22 @@ export function ColumnFilter({
 
                 {/* Select All / Deselect All */}
                 <div className="flex items-center justify-between">
-            <button
-              onClick={toggleAll}
-              className="text-xs text-blue-600 hover:text-blue-700 font-medium transition-colors"
-            >
-              {allSelected ? "Deselect All" : "Select All"}
-            </button>
+            <div className="flex items-center gap-3">
+              <button
+                onClick={() => setSelectedColumns(new Set(allUniqueKeys))}
+                className="text-xs text-blue-600 hover:text-blue-700 font-medium transition-colors"
+              >
+                Select All
+              </button>
+              <button
+                onClick={() => setSelectedColumns(new Set())}
+                className="text-xs text-blue-600 hover:text-blue-700 font-medium transition-colors"
+              >
+                Deselect All
+              </button>
+            </div>
             <span className="text-xs text-gray-600">
-              <span className="font-semibold text-gray-900">{selectedColumns.size}</span> of {columns.length} selected
+              <span className="font-semibold text-gray-900">{selectedColumns.size}</span> of {allUniqueKeys.length} selected
             </span>
           </div>
 
@@ -347,16 +403,22 @@ export function ColumnFilter({
                   const isSingle = cols.length === 1 && cols[0] === groupKey;
                   
                   // Get party label for display (if available)
-                  const match = matchPartyLabel(groupKey);
+                  const match = matchColumnLabel(groupKey);
                   const displayLabel = match?.label || groupKey;
                   const colors = getPartyColors(displayLabel);
 
-                  // Determine badge type - since each column is separate, show "Numeric" or "Text"
+                  // Determine badge type based on matched column type
                   let badgeText = "Numeric";
                   let badgeColor = colors.badge + " " + colors.badgeText;
 
-                  if (groupKey.includes("TOTAL")) {
-                    badgeText = "Calculated";
+                  if (match?.type === "identifier") {
+                    badgeText = "ID";
+                    badgeColor = "bg-slate-100 text-slate-700";
+                  } else if (match?.type === "location") {
+                    badgeText = "Location";
+                    badgeColor = "bg-sky-100 text-sky-700";
+                  } else if (match?.type === "count" || groupKey.includes("TOTAL")) {
+                    badgeText = "Count";
                     badgeColor = "bg-indigo-100 text-indigo-700";
                   }
 
@@ -518,18 +580,20 @@ export function ColumnFilter({
                         {unselectedColumns.length} unselected
                       </span>
                     </div>
-                    <button
-                      onClick={() => {
-                        if (selectedOthersColumns.size === unselectedColumns.length) {
-                          setSelectedOthersColumns(new Set());
-                        } else {
-                          setSelectedOthersColumns(new Set(unselectedColumns));
-                        }
-                      }}
-                      className="text-blue-600 hover:text-blue-700 font-medium text-xs"
-                    >
-                      {selectedOthersColumns.size === unselectedColumns.length ? "Deselect All" : "Select All"}
-                    </button>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => setSelectedOthersColumns(new Set(unselectedColumns))}
+                        className="text-blue-600 hover:text-blue-700 font-medium text-xs"
+                      >
+                        Select All
+                      </button>
+                      <button
+                        onClick={() => setSelectedOthersColumns(new Set())}
+                        className="text-blue-600 hover:text-blue-700 font-medium text-xs"
+                      >
+                        Deselect All
+                      </button>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -560,7 +624,7 @@ export function ColumnFilter({
                 <div className="space-y-1.5">
                   {unselectedColumns.map((col) => {
                     const isSelected = selectedOthersColumns.has(col);
-                    const match = matchPartyLabel(col);
+                    const match = matchColumnLabel(col);
                     const displayLabel = match?.label || col;
                     const colors = getPartyColors(displayLabel);
 

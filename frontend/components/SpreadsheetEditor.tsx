@@ -719,7 +719,7 @@ export function SpreadsheetEditor({
                         >
                           <span className="text-lg">{option.emoji}</span>
                           <span className="flex-1">{option.label}</span>
-                          {availableTranslations[option.value] && option.value !== "original" && (
+                          {option.value !== "original" && availableTranslations[option.value] && (
                             <span className="text-xs text-green-600">✓</span>
                           )}
                         </button>
@@ -928,7 +928,7 @@ export function SpreadsheetEditor({
                           }}
                           className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none"
                         >
-                          {editedData?.headers.length > 0 ? (
+                          {editedData && editedData.headers.length > 0 ? (
                             editedData.headers.map((header, idx) => (
                               <option key={idx} value={header}>
                                 {header}
@@ -1145,7 +1145,7 @@ export function SpreadsheetEditor({
                   {!addingBoothName && (
                     <>
                       <p className="text-sm text-gray-600 mb-4">
-                        Select a column to extract booth names from. The system will extract the text before the first comma (",") from each cell in the selected column.
+                        Select a column to extract booth names from. The system will extract the core institution/building name by removing pincodes, location details after commas, and truncating after institution keywords (School, College, Hall, etc.).
                       </p>
 
                       {/* Source Column Selection */}
@@ -1161,7 +1161,7 @@ export function SpreadsheetEditor({
                           }}
                           className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none"
                         >
-                          {editedData?.headers.length > 0 ? (
+                          {editedData && editedData.headers.length > 0 ? (
                             editedData.headers.map((header, idx) => (
                               <option key={idx} value={header}>
                                 {header}
