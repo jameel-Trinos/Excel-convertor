@@ -10,9 +10,7 @@ import re
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from .header_extractor import HeaderExtractor
 from .models import ExtractionResult, TableData
-from .party_normalizer import PartyNormalizer
 
 logger = logging.getLogger(__name__)
 
@@ -61,8 +59,6 @@ class ElectionProcessor:
         if not self.file_path.exists():
             raise FileNotFoundError(f"PDF file not found: {file_path}")
 
-        self.header_extractor = HeaderExtractor(file_path)
-        self.party_normalizer = PartyNormalizer()
 
         # Cached extraction results
         self._headers: Optional[List[str]] = None
@@ -140,8 +136,7 @@ class ElectionProcessor:
                 party_name = self._extract_party_from_cell(cell_text)
 
                 if party_name:
-                    # Normalize the party name
-                    standard_party = self.party_normalizer.normalize_column_name(party_name)
+                    standard_party = party_name
 
                     if standard_party:
                         if standard_party == "Independent":
@@ -226,41 +221,26 @@ class ElectionProcessor:
         - "DRAVIDA MUNNETRA KAZHAGAM" (full party name)
         - Reversed/OCR corrupted party names
         """
-        from .party_aliases import get_party_abbreviation, is_party_alias
-        
         if not cell_text:
             return None
-        
+
         cell_upper = cell_text.upper().strip()
 
-        # Try to extract from parentheses first
-        match = re.search(r'\(([A-Z]+)\)', cell_upper)
+        # Try to extract from parentheses first (e.g., "CANDIDATE NAME (DMK)")
+        match = re.search(r'\(([^)]+)\)', cell_upper)
         if match:
-            party_abbr = match.group(1)
-            # Verify it's a valid party abbreviation
-            if is_party_alias(party_abbr):
-                return get_party_abbreviation(party_abbr)
+            return match.group(1).strip()
 
-        # Check if the entire cell text is a party name/alias
-        if is_party_alias(cell_text):
-            return get_party_abbreviation(cell_text)
-        
-        # Check if cell contains a party name (for cases like "Total - DMK" or full party names)
-        # Try matching against normalized cell text
-        clean = re.sub(r'[\s.\-_]+', '', cell_upper)
-        
-        # Check all known party abbreviations
-        from .party_aliases import get_all_party_abbreviations
-        known_parties = get_all_party_abbreviations()
-        
-        for party in known_parties:
-            if clean == party or clean.startswith(party) or party in clean:
-                return party
-        
-        # Try comprehensive alias matching on the full cell text
-        abbrev = get_party_abbreviation(cell_text)
-        if abbrev:
-            return abbrev
+        # Non-party keywords - skip these
+        non_party = ["sl", "serial", "no.", "polling", "station", "location",
+                      "total", "valid", "rejected", "tendered", "nota", "cast", "favour"]
+        if any(kw in cell_upper.lower() for kw in non_party):
+            return None
+
+        # If it looks like a party name (short text, all caps, no numbers in first char)
+        # return it as-is
+        if cell_upper and not cell_upper[0].isdigit() and len(cell_upper) < 100:
+            return cell_text.strip()
 
         return None
 

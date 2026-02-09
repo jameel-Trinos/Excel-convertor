@@ -8,9 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from anthropic import Anthropic
 
-from .header_fixer import HeaderFixer
 from .models import TableData
-from .party_normalizer import PartyNormalizer
 from .pdf_processor import PDFProcessor
 
 
@@ -289,10 +287,6 @@ Return your analysis in JSON format:
         if not true_headers and tables:
             true_headers = tables[0].headers
 
-        # Fix common header issues (reversed text, etc.)
-        true_headers = HeaderFixer.fix_header_list(true_headers)
-        true_headers = HeaderFixer.standardize_common_headers(true_headers)
-
         standardized_tables = []
 
         for table in tables:
@@ -395,7 +389,6 @@ Return JSON:
         self,
         pdf_path: str,
         progress_callback: Optional[callable] = None,
-        apply_party_normalization: bool = True
     ) -> Tuple[List[TableData], Dict[str, Any]]:
         """
         Perform enhanced extraction with Claude AI analysis.
@@ -403,7 +396,6 @@ Return JSON:
         Args:
             pdf_path: Path to PDF file
             progress_callback: Optional progress callback
-            apply_party_normalization: Whether to apply party name normalization
 
         Returns:
             Tuple of (cleaned_tables, analysis_metadata)
@@ -445,14 +437,7 @@ Return JSON:
             analysis
         )
 
-        # Step 5: Apply party normalization (if enabled)
-        party_normalized = False
-        if apply_party_normalization:
-            update_progress(75, "Normalizing political party columns...")
-            standardized_tables = self._apply_party_normalization(standardized_tables)
-            party_normalized = True
-
-        # Step 6: Validate accuracy
+        # Step 5: Validate accuracy
         update_progress(85, "Validating cell-level accuracy...")
         validation = await self.validate_cell_accuracy(
             pdf_path,
@@ -469,47 +454,7 @@ Return JSON:
             "validation": validation,
             "tables_processed": len(standardized_tables),
             "total_rows": sum(len(t.rows) for t in standardized_tables),
-            "party_normalization_applied": party_normalized
         }
 
         return standardized_tables, metadata
 
-    def _apply_party_normalization(self, tables: List[TableData]) -> List[TableData]:
-        """
-        Apply party name normalization to tables.
-        
-        This normalizes party column names (DMK, AIADMK, BJP, etc.) and
-        aggregates minor parties into OTHERS.
-        
-        Args:
-            tables: Tables to normalize
-            
-        Returns:
-            Tables with normalized party columns
-        """
-        normalizer = PartyNormalizer()
-        normalized_tables = []
-        
-        for table in tables:
-            if not table.headers or not table.rows:
-                normalized_tables.append(table)
-                continue
-            
-            # Normalize headers and aggregate data
-            normalized_headers, normalized_rows = normalizer.normalize_and_aggregate_columns(
-                table.headers,
-                table.rows
-            )
-            
-            # Create new table with normalized data
-            normalized_table = TableData(
-                headers=normalized_headers,
-                rows=normalized_rows,
-                page_number=table.page_number
-            )
-            normalized_table.title_rows = table.title_rows
-            normalized_table.header_rows = table.header_rows
-            
-            normalized_tables.append(normalized_table)
-        
-        return normalized_tables

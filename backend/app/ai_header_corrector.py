@@ -5,8 +5,6 @@ import logging
 import os
 from typing import Dict, List, Optional
 
-from .party_name_fixer import PartyNameFixer
-
 logger = logging.getLogger(__name__)
 
 
@@ -86,8 +84,7 @@ class AIHeaderCorrector:
         if not self.enabled:
             logger.info("AI not available, using pattern matching fallback")
             # Fallback to pattern matching
-            from .header_fixer import HeaderFixer
-            return HeaderFixer.fix_header_list(headers)
+            return headers
         
         logger.info(f"Using AI to fix {len(headers)} headers (primary method)")
         
@@ -110,8 +107,7 @@ class AIHeaderCorrector:
             except Exception as e:
                 logger.warning(f"AI correction failed for batch: {e}")
                 # Fallback to pattern matching for this batch
-                from .header_fixer import HeaderFixer
-                fallback_fixed = HeaderFixer.fix_header_list(batch)
+                fallback_fixed = batch
                 for j, fixed in enumerate(fallback_fixed):
                     corrected_headers[batch_indices[j]] = fixed
         
@@ -157,8 +153,7 @@ class AIHeaderCorrector:
         except Exception as e:
             logger.error(f"Claude API error: {e}")
             # Fallback to pattern matching
-            from .header_fixer import HeaderFixer
-            return HeaderFixer.fix_header_list(headers)
+            return headers
 
     def _fix_with_openai(self, headers: List[str]) -> List[str]:
         """Fix headers using OpenAI GPT."""
@@ -187,8 +182,7 @@ class AIHeaderCorrector:
         except Exception as e:
             logger.error(f"OpenAI API error: {e}")
             # Fallback to pattern matching
-            from .header_fixer import HeaderFixer
-            return HeaderFixer.fix_header_list(headers)
+            return headers
 
     def _create_correction_prompt(self, headers: List[str]) -> str:
         """Create prompt for AI correction with comprehensive examples."""

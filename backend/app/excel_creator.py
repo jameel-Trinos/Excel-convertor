@@ -81,10 +81,6 @@ class ExcelCreator:
 
         current_row = 1
 
-        # Fix headers before writing to Excel
-        from .header_fixer import HeaderFixer
-        headers = HeaderFixer.fix_header_list(headers)
-        
         # Write headers
         header_row = current_row
         for col_idx, header in enumerate(headers, 1):

@@ -83,10 +83,6 @@ class DeterministicExcelCreator:
             )
             current_row += 3  # Title takes 3 rows
 
-        # Fix headers before writing to Excel
-        from .header_fixer import HeaderFixer
-        headers = HeaderFixer.fix_header_list(headers)
-        
         # Add headers
         header_row = current_row
         for col_idx, header in enumerate(headers, 1):

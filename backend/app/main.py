@@ -122,12 +122,6 @@ async def process_conversion(task_id: str, file_path: Path, use_constituency_pro
             error_msg = "No tables found in the constituency PDF" if use_constituency_processor else "No tables found in the PDF"
             raise ValueError(error_msg)
 
-        # Fix reversed headers (party names, candidate names, etc.) before creating Excel
-        from .header_fixer import HeaderFixer
-        for table in extraction_result.tables:
-            if table.headers:
-                table.headers = HeaderFixer.fix_header_list(table.headers)
-
         update_task_progress(task_id, 85, "Creating Excel file...")
 
         # Extract AC number from page texts (only for election results, not constituency)
@@ -403,9 +397,6 @@ async def add_booth_name_column(request: AddBoothNameColumnRequest):
         num_header_rows = first_data_row - data_start_row
 
         # Get headers by merging multi-row headers
-        from .header_fixer import HeaderFixer
-        from .party_name_fixer import PartyNameFixer
-
         headers = []
         for col in range(1, actual_max_col + 1):
             header_parts = []
@@ -424,21 +415,6 @@ async def add_booth_name_column(request: AddBoothNameColumnRequest):
                     headers.append(combined)
             else:
                 headers.append(f"Column {col}")
-
-        # Fix reversed headers if needed
-        needs_fixing = False
-        for header in headers:
-            if any(pattern.lower() in header.lower() for pattern in HeaderFixer.KNOWN_REVERSED_PATTERNS):
-                needs_fixing = True
-                break
-            if PartyNameFixer.is_likely_party_name(header):
-                fixed = PartyNameFixer.fix_reversed_party_name(header)
-                if fixed != header:
-                    needs_fixing = True
-                    break
-
-        if needs_fixing:
-            headers = HeaderFixer.fix_header_list(headers)
 
         if not headers:
             for col in range(1, min(actual_max_col + 1, 50)):
@@ -698,25 +674,6 @@ async def get_preview(task_id: str):
             # Fallback: try to detect columns by scanning first few data rows
             for col in range(1, min(actual_max_col + 1, 50)):
                 headers.append(f"Column {col}")
-
-        # Fix reversed headers (party names, candidate names, etc.)
-        from .header_fixer import HeaderFixer
-        from .party_name_fixer import PartyNameFixer
-
-        # Check if any header needs fixing
-        needs_fixing = False
-        for header in headers:
-            if any(pattern.lower() in header.lower() for pattern in HeaderFixer.KNOWN_REVERSED_PATTERNS):
-                needs_fixing = True
-                break
-            if PartyNameFixer.is_likely_party_name(header):
-                fixed = PartyNameFixer.fix_reversed_party_name(header)
-                if fixed != header:
-                    needs_fixing = True
-                    break
-
-        if needs_fixing:
-            headers = HeaderFixer.fix_header_list(headers)
 
         # Get first 10 data rows (first_data_row was already calculated above)
         rows = []
@@ -1203,9 +1160,7 @@ async def get_full_preview(task_id: str):
         # Calculate how many header rows we have
         num_header_rows = first_data_row - data_start_row
 
-        # Get headers by merging multi-row headers and fix reversed text
-        from .header_fixer import HeaderFixer
-
+        # Get headers by merging multi-row headers
         headers = []
         for col in range(1, actual_max_col + 1):
             # Get values from actual header rows only (not data rows)
@@ -1232,11 +1187,6 @@ async def get_full_preview(task_id: str):
             else:
                 # Fallback for empty columns
                 headers.append(f"Column {col}")
-        
-        # Always fix reversed headers (party names, candidate names, etc.)
-        # The fix_header_list function is conservative and only fixes things that need fixing
-        # But we should always run it to ensure headers are correct
-        headers = HeaderFixer.fix_header_list(headers)
 
         if not headers:
             for col in range(1, min(actual_max_col + 1, 50)):

@@ -9,8 +9,6 @@ from typing import Dict, List, Optional, Tuple
 from openai import OpenAI
 from openai import OpenAIError
 
-from .party_normalizer import PartyNormalizer
-
 logger = logging.getLogger(__name__)
 
 
@@ -37,7 +35,6 @@ class AIProcessor:
         self.client = None
         self.enabled = False
         self._response_cache: Dict[str, any] = {}
-        self.party_normalizer = PartyNormalizer()
 
         if self.api_key:
             try:
@@ -247,10 +244,6 @@ Important:
 
             coverage = len(mapped_headers) / len(all_header_names) if all_header_names else 0
             confidence = min(coverage, 0.95)
-
-            # Apply party name normalization
-            logger.info("Applying Tamil Nadu party name normalization")
-            column_mapping = self.party_normalizer.normalize_column_mapping(column_mapping)
 
             result = (column_mapping, confidence)
             self._response_cache[cache_key] = result

@@ -9,8 +9,6 @@ from typing import Dict, List, Optional, Tuple
 
 from anthropic import Anthropic, AnthropicError
 
-from .party_normalizer import PartyNormalizer
-
 logger = logging.getLogger(__name__)
 
 
@@ -38,7 +36,6 @@ class ClaudeProcessor:
         self.client = None
         self.enabled = False
         self._response_cache: Dict[str, any] = {}
-        self.party_normalizer = PartyNormalizer()
 
         if self.api_key:
             try:
@@ -242,10 +239,6 @@ Important:
             coverage = len(mapped_headers) / len(all_header_names) if all_header_names else 0
             confidence = min(coverage, 0.95)
 
-            # Apply party name normalization
-            logger.info("Applying Tamil Nadu party name normalization")
-            column_mapping = self.party_normalizer.normalize_column_mapping(column_mapping)
-
             result = (column_mapping, confidence)
             self._response_cache[cache_key] = result
 
@@ -306,15 +299,17 @@ Important:
                 })
             
             # Create prompt for Claude
-            prompt = f"""You are analyzing an election results PDF table to identify column headers. The PDF may have DIFFERENT STRUCTURES and some headers may be COLORED or have special formatting.
+            prompt = f"""You are analyzing an election results PDF table to identify column headers.
 
-CRITICAL REQUIREMENT: Extract PARTY NAMES ONLY for candidate columns, NOT candidate names. For example:
-- If header is "CANDIDATE NAME (DMK)" → extract "DMK" or "DRAVIDA MUNNETRA KAZHAGAM"
-- If header is "JOHN DOE (BJP)" → extract "BJP" or "BHARATIYA JANATA PARTY"
-- If header is just "DMK" → extract "DMK" or "DRAVIDA MUNNETRA KAZHAGAM"
+CRITICAL REQUIREMENT: Extract PARTY NAMES ONLY for candidate columns, NOT candidate names.
+- If header is "CANDIDATE NAME (DMK)" → extract "DMK"
+- If header is "JOHN DOE (BJP)" → extract "BJP"
+- If header is just "DMK" → keep "DMK"
 - For non-candidate columns (SL. NO., Polling Station, etc.), keep them as-is
 
-IMPORTANT: This is an election results PDF that can have various structures:
+IMPORTANT: Extract party names EXACTLY as they appear in the PDF. Do NOT expand abbreviations or map them to full names. Use the exact text from the PDF headers.
+
+This is an election results PDF that can have various structures:
 - Headers may have colored backgrounds (blue, gray, etc.) or colored text
 - Headers may be in different positions (top rows, after title rows, etc.)
 - Headers may span multiple rows (candidate names + party abbreviations)
@@ -333,57 +328,38 @@ Your task:
 4. Determine the row index where data rows start (after all header rows)
 5. Ensure PERFECT alignment: each header must correspond to the correct data column
 
-CRITICAL RULES FOR HEADER DETECTION:
+RULES FOR HEADER DETECTION:
 - Headers are typically rows with descriptive text like "Sl.No", "S.L.NO.", "Polling Station No.", "Location", candidate names, party names, etc.
-- Headers may have colored backgrounds or special formatting - look for rows that are visually distinct
 - Data rows usually start with numbers (like "1", "2", "3") in the first column - these are NOT headers
-- If the first row starts with a number, it's likely a data row, NOT a header
 - Headers may span multiple rows:
   * Row 1 might have: "SL. NO.", "Polling Station No.", "No. of valid votes cast in favour of"
-  * Row 2 might have: candidate names (e.g., "CANDIDATE NAME 1", "CANDIDATE NAME 2")
+  * Row 2 might have: candidate names with party info
   * Row 3 might have: party abbreviations (e.g., "DMK", "AIADMK", "BJP")
 - When headers span multiple rows:
   * For candidate columns: Extract ONLY the party name (from parentheses or party row), ignore candidate name
-  * For non-candidate columns: Use the appropriate column label (SL. NO., Polling Station, etc.)
+  * For non-candidate columns: Use the appropriate column label
 - Title rows (like "FORM 20", "ELECTION RESULTS") are NOT headers - skip them
-- Section separator rows are NOT headers - skip them
 
-CRITICAL RULES FOR PARTY NAME EXTRACTION:
-- If header format is "CANDIDATE NAME (PARTY)" → extract only "PARTY" (use full party name if known, e.g., "DMK" → "DRAVIDA MUNNETRA KAZHAGAM")
-- If header format is "CANDIDATE NAME - PARTY" → extract only "PARTY"
-- If header is just a party abbreviation (DMK, AIADMK, BJP, etc.) → use the full party name
-- IMPORTANT: Each column should have ONLY ONE party name. Do NOT merge multiple party names together.
-- If a header appears to contain multiple party names, extract the PRIMARY party name (usually the one in parentheses or the last one)
-- Known party mappings:
-  * "DMK" → "DRAVIDA MUNNETRA KAZHAGAM"
-  * "AIADMK" → "ALL INDIA DRAVIDA MUNNETRA KAZHAGAM"
-  * "BJP" → "BHARATIYA JANATA PARTY"
-  * "CONGRESS" → "INDIAN NATIONAL CONGRESS"
-  * "NTK" → "NAAM TAMILAR KATCHI" (note: TAMILAR not TAMIZHAR)
-  * "PAMK" or "PARTY ADHIKARAM MAKKAL" → "PARTY ADHIKARAM MAKKAL" (different from NTK)
-  * "IND" or "INDEPENDENT" → "INDEPENDENT"
-  * "NOTA" → "NOTA"
-- CRITICAL: Distinguish between "NAAM TAMILAR KATCHI" (NTK) and "PARTY ADHIKARAM MAKKAL" (PAMK):
-  * NTK contains: "NAAM" + "TAMILAR"/"TAMIZHAR" + "KATCHI"
-  * PAMK contains: "PARTY" + "ADHIKARAM" + "MAKKAL"
-  * If you see "NAAM" keyword, it's NTK, not PAMK
-  * If you see "ADHIKARAM" keyword, it's PAMK, not NTK
-- If party name is reversed or corrupted, fix it to the canonical form
-- For "NAAM TAMILAR KATCHI" (NTK): Use "NAAM TAMILAR KATCHI" (with TAMILAR, not TAMIZHAR)
+RULES FOR PARTY NAME EXTRACTION:
+- If header format is "CANDIDATE NAME (PARTY)" → extract only "PARTY" exactly as written
+- If header format is "CANDIDATE NAME - PARTY" → extract only "PARTY" exactly as written
+- If header is just a party abbreviation or name → keep it exactly as written
+- Do NOT expand abbreviations (keep "DMK" as "DMK", not "DRAVIDA MUNNETRA KAZHAGAM")
+- Do NOT normalize or standardize party names in any way
+- Each column should have ONLY ONE party name
 
-CRITICAL RULES FOR DATA ALIGNMENT:
+RULES FOR DATA ALIGNMENT:
 - The number of headers MUST match the number of data columns
 - Each header must align perfectly with its corresponding data column
-- If a header spans multiple columns, create separate headers for each data column
-- Match headers to data columns by position (first header = first column, second header = second column, etc.)
+- Match headers to data columns by position (first header = first column, etc.)
 
 Return ONLY valid JSON in this exact format (no markdown, no explanations):
 {{
-  "header_row_indices": [0, 1, 2],  // List of row indices that are headers (0-based)
-  "headers": ["SL. NO.", "Polling Station No.", "Location", "DRAVIDA MUNNETRA KAZHAGAM", "ALL INDIA DRAVIDA MUNNETRA KAZHAGAM", "BHARATIYA JANATA PARTY", ...],  // Final header names - PARTY NAMES ONLY for candidate columns
-  "data_start_row": 3,  // Row index where data starts (0-based)
-  "confidence": 0.95,  // Confidence score 0.0-1.0
-  "reasoning": "Brief explanation: identified headers in rows 0-2, extracted party names only for candidate columns, data starts at row 3"
+  "header_row_indices": [0, 1, 2],
+  "headers": ["SL. NO.", "Polling Station No.", "Location", "DMK", "AIADMK", "BJP", ...],
+  "data_start_row": 3,
+  "confidence": 0.95,
+  "reasoning": "Brief explanation"
 }}
 
 Important:
@@ -425,9 +401,6 @@ Important:
                     headers = [self._clean_cell(cell) for cell in raw_table[0]]
                     logger.warning("Claude returned empty headers, using first row as fallback")
                     return headers, 1, 0.3
-            
-            # Extract party names only from headers (for candidate columns)
-            headers = self._extract_party_names_only(headers)
             
             # Ensure data_start_row is valid
             if data_start_row < len(header_row_indices):
@@ -510,187 +483,6 @@ Important:
                 # If still failing, log the full response for debugging
                 logger.error(f"Failed to parse JSON after fixes. Original content: {original_content[:1000]}")
                 raise
-    
-    def _extract_party_names_only(self, headers: List[str]) -> List[str]:
-        """
-        Extract party names only from headers, removing candidate names.
-        
-        For headers like "CANDIDATE NAME (PARTY)" or "CANDIDATE NAME - PARTY",
-        extract only the party name. For non-candidate columns, keep as-is.
-        
-        Args:
-            headers: List of headers that may contain candidate names and party names
-            
-        Returns:
-            List of headers with party names only for candidate columns
-        """
-        from .party_name_fixer import PartyNameFixer
-        
-        party_only_headers = []
-        
-        # Keywords that indicate non-candidate columns
-        non_candidate_keywords = [
-            "sl.", "s.l.", "serial", "no.", "number",
-            "polling", "station", "location", "building",
-            "area", "areas", "type", "voter", "voters",
-            "total", "valid", "votes", "rejected", "tendered",
-            "nota", "cast", "favour"
-        ]
-        
-        for header in headers:
-            if not header or not header.strip():
-                party_only_headers.append(header)
-                continue
-            
-            header_upper = header.upper()
-            
-            # Check if this is a non-candidate column
-            is_non_candidate = any(keyword in header_upper for keyword in non_candidate_keywords)
-            
-            if is_non_candidate:
-                # Keep non-candidate columns as-is
-                party_only_headers.append(header)
-                continue
-            
-            # Try to extract party name from various formats
-            party_name = None
-            
-            # Format 1: "CANDIDATE NAME (PARTY)" or "CANDIDATE NAME (PARTY ABBR)"
-            import re
-            # Find the LAST parentheses match (in case there are multiple)
-            paren_matches = list(re.finditer(r'\(([^)]+)\)', header))
-            if paren_matches:
-                # Use the last match (most likely to be the party)
-                last_match = paren_matches[-1]
-                party_in_parens = last_match.group(1).strip()
-                
-                # Special check for NTK in parentheses - look for NAAM keyword
-                party_in_parens_upper = party_in_parens.upper()
-                if "NAAM" in party_in_parens_upper and ("TAMILAR" in party_in_parens_upper or "TAMIZHAR" in party_in_parens_upper):
-                    party_name = "NAAM TAMILAR KATCHI"
-                elif "ADHIKARAM" in party_in_parens_upper and "PARTY" in party_in_parens_upper:
-                    party_name = "PARTY ADHIKARAM MAKKAL"
-                else:
-                    # Fix reversed party name if needed
-                    party_name = PartyNameFixer.fix_reversed_party_name(party_in_parens)
-                    # Try to get full party name from abbreviation
-                    party_name = self._get_full_party_name(party_name)
-                    # If party name contains multiple words that look like separate parties, extract only the first valid party
-                    if party_name and ' ' in party_name:
-                        # Check if it might be multiple party names merged
-                        words = party_name.split()
-                        # Check if any word is a known party abbreviation
-                        for word in words:
-                            word_upper = word.upper()
-                            if word_upper in ["DMK", "AIADMK", "BJP", "NTK", "PMK", "VCK", "BSP", "IND", "NOTA"]:
-                                party_name = self._get_full_party_name(word_upper)
-                                break
-            
-            # Format 2: "CANDIDATE NAME - PARTY"
-            elif ' - ' in header:
-                parts = header.split(' - ', 1)
-                if len(parts) == 2:
-                    party_part = parts[1].strip()
-                    party_name = PartyNameFixer.fix_reversed_party_name(party_part)
-                    party_name = self._get_full_party_name(party_name)
-            
-            # Format 3: Check if header itself is a party name/abbreviation
-            elif PartyNameFixer.is_likely_party_name(header):
-                # Special check for NTK - look for specific keywords
-                header_upper_check = header.upper()
-                if ("NAAM" in header_upper_check and ("TAMILAR" in header_upper_check or "TAMIZHAR" in header_upper_check)):
-                    # This is definitely NTK, not PARTY ADHIKARAM MAKKAL
-                    party_name = "NAAM TAMILAR KATCHI"
-                elif "ADHIKARAM" in header_upper_check and "PARTY" in header_upper_check:
-                    # This is PARTY ADHIKARAM MAKKAL, not NTK
-                    party_name = "PARTY ADHIKARAM MAKKAL"
-                else:
-                    party_name = PartyNameFixer.fix_reversed_party_name(header)
-                    party_name = self._get_full_party_name(party_name)
-            
-            # If we found a party name, use it; otherwise keep original (might be already a party name)
-            if party_name:
-                party_only_headers.append(party_name)
-            else:
-                # Try one more time - check if it's already a party name
-                fixed = PartyNameFixer.fix_reversed_party_name(header)
-                if fixed != header:
-                    party_only_headers.append(self._get_full_party_name(fixed))
-                else:
-                    party_only_headers.append(header)
-        
-        return party_only_headers
-    
-    def _get_full_party_name(self, party_abbr_or_name: str) -> str:
-        """
-        Get full party name from abbreviation or partial name.
-        
-        Args:
-            party_abbr_or_name: Party abbreviation or name
-            
-        Returns:
-            Full party name if known, otherwise original
-        """
-        if not party_abbr_or_name:
-            return party_abbr_or_name
-        
-        party_upper = party_abbr_or_name.upper().strip()
-        
-        # Map common abbreviations to full names (consistent with party_name_fixer.py)
-        party_mapping = {
-            "DMK": "DRAVIDA MUNNETRA KAZHAGAM",
-            "AIADMK": "ALL INDIA DRAVIDA MUNNETRA KAZHAGAM",
-            "BJP": "BHARATIYA JANATA PARTY",
-            "CONGRESS": "INDIAN NATIONAL CONGRESS",
-            "INC": "INDIAN NATIONAL CONGRESS",
-            "IND": "INDEPENDENT",
-            "INDEPENDENT": "INDEPENDENT",
-            "NOTA": "NOTA",
-            "VCK": "VIDUTHALAI CHIRUTHAIGAL KATCHI",
-            "PMK": "PATTALI MAKKAL KATCHI",
-            "NTK": "NAAM TAMILAR KATCHI",  # Use TAMILAR (consistent with party_name_fixer)
-            "PAMK": "PARTY ADHIKARAM MAKKAL",  # Different from NTK
-            "BSP": "BAHUJAN SAMAJ PARTY",
-        }
-        
-        # Check exact match
-        if party_upper in party_mapping:
-            return party_mapping[party_upper]
-        
-        # Check if it's already a full party name (contains party keywords)
-        party_keywords = ["KAZHAGAM", "PARTY", "KATCHI", "SAMAJ", "CONGRESS"]
-        if any(keyword in party_upper for keyword in party_keywords):
-            # But check if it might be multiple party names merged
-            # If it contains multiple party keywords, it might be merged
-            keyword_count = sum(1 for keyword in party_keywords if keyword in party_upper)
-            if keyword_count > 1:
-                # Might be merged - try to extract individual party names
-                # Check for known party patterns
-                known_parties = [
-                    "DRAVIDA MUNNETRA KAZHAGAM",
-                    "ALL INDIA DRAVIDA MUNNETRA KAZHAGAM",
-                    "BHARATIYA JANATA PARTY",
-                    "NAAM TAMILAR KATCHI",
-                    "PATTALI MAKKAL KATCHI",
-                    "VIDUTHALAI CHIRUTHAIGAL KATCHI",
-                    "BAHUJAN SAMAJ PARTY",
-                ]
-                for known_party in known_parties:
-                    if known_party.upper() in party_upper:
-                        return known_party
-            return party_abbr_or_name
-        
-        # Special check for NTK variations - must have NAAM keyword
-        if "NAAM" in party_upper and ("TAMILAR" in party_upper or "TAMIZHAR" in party_upper):
-            if "KATCHI" in party_upper:
-                return "NAAM TAMILAR KATCHI"
-        
-        # Special check for PARTY ADHIKARAM MAKKAL - must have ADHIKARAM keyword
-        if "ADHIKARAM" in party_upper and "PARTY" in party_upper:
-            return "PARTY ADHIKARAM MAKKAL"
-        
-        # Return original if no mapping found
-        return party_abbr_or_name
     
     def _clean_cell(self, value) -> str:
         """Clean a cell value, including fixing reversed text."""

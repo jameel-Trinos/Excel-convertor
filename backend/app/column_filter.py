@@ -9,10 +9,29 @@ import openpyxl
 import pandas as pd
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
-from .party_normalizer import PartyNormalizer
-from .party_aliases import get_standardized_party_name
-
 logger = logging.getLogger(__name__)
+
+# Non-party column keywords - columns matching these are administrative, not party vote columns
+_NON_PARTY_KEYWORDS = [
+    "sl", "serial", "no.", "number", "polling", "station", "location",
+    "building", "area", "type", "voter", "total", "valid", "rejected",
+    "tendered", "nota", "cast", "favour", "column", "ac no",
+]
+
+
+def _is_party_column(col_name: str) -> bool:
+    """Check if a column is likely a party vote column (not an administrative column)."""
+    if not col_name:
+        return False
+    col_lower = col_name.lower().strip()
+    # If any non-party keyword is in the column name, it's not a party column
+    for keyword in _NON_PARTY_KEYWORDS:
+        if keyword in col_lower:
+            return False
+    # If it's just "Column N", it's not a party column
+    if col_lower.startswith("column "):
+        return False
+    return True
 
 
 def _normalize_column_name(name: str) -> str:
@@ -215,25 +234,6 @@ class ColumnFilterService:
             for col in range(1, min(actual_max_col + 1, 50)):
                 headers.append(f"Column {col}")
 
-        # Fix reversed headers (party names, candidate names, etc.) - EXACT same logic as preview
-        from .header_fixer import HeaderFixer
-        from .party_name_fixer import PartyNameFixer
-
-        # Check if any header needs fixing
-        needs_fixing = False
-        for header in headers:
-            if any(pattern.lower() in header.lower() for pattern in HeaderFixer.KNOWN_REVERSED_PATTERNS):
-                needs_fixing = True
-                break
-            if PartyNameFixer.is_likely_party_name(header):
-                fixed = PartyNameFixer.fix_reversed_party_name(header)
-                if fixed != header:
-                    needs_fixing = True
-                    break
-
-        if needs_fixing:
-            headers = HeaderFixer.fix_header_list(headers)
-        
         wb.close()
         
         # Now load with pandas, skipping all header rows
@@ -332,10 +332,6 @@ class ColumnFilterService:
                     fallback_headers.append(f"Column {col}")
             
             wb_fallback.close()
-            
-            # Fix headers
-            if needs_fixing:
-                fallback_headers = HeaderFixer.fix_header_list(fallback_headers)
             
             # Update dataframe column names if we got better headers
             if len(fallback_headers) == len(available_columns):
@@ -439,17 +435,14 @@ class ColumnFilterService:
                     logger.warning("No valid columns found in others_columns list, skipping OTHERS column")
             else:
                 # Auto-detect party columns from unselected columns
-                # Initialize PartyNormalizer to identify party columns
-                party_normalizer = PartyNormalizer()
-
                 # Get all unselected columns
                 unselected_columns = [col for col in available_columns if col not in requested_columns]
 
                 # Filter to only party columns (excluding administrative columns like SL.NO, Total, etc.)
                 party_unselected = []
                 for col in unselected_columns:
-                    # Check if this is a party column (DMK, BJP, AIADMK, etc.)
-                    if party_normalizer.is_party_column(col):
+                    # Check if this is a party column (not an administrative column)
+                    if _is_party_column(col):
                         # Also verify it's numeric (contains vote data)
                         # Handle duplicate column names - df[col] might return DataFrame
                         col_data = df[col]
@@ -493,21 +486,8 @@ class ColumnFilterService:
             if col_name in header_overrides:
                 desired = header_overrides[col_name]
             else:
-                # Try to convert party names to standardized format (e.g., "DMK Votes", "AIADMK Votes")
-                standardized = get_standardized_party_name(col_name)
-                if standardized:
-                    # Special case: Convert "INC Votes" to "CONGRESS Votes" if the original was Congress-related
-                    if standardized == "INC Votes":
-                        # Check if original column name contains "CONGRESS" (case-insensitive)
-                        if "CONGRESS" in col_name.upper():
-                            desired = "CONGRESS Votes"
-                        else:
-                            desired = standardized
-                    else:
-                        desired = standardized
-                else:
-                    # Keep original name for non-party columns (AC NO., Polling Station No., etc.)
-                    desired = col_name
+                # Keep original column name as-is
+                desired = col_name
             
             desired = str(desired).strip() if desired is not None else str(col_name).strip()
             if not desired:
