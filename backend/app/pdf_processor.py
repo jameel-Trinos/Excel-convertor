@@ -206,7 +206,8 @@ class PDFProcessor:
             denoise=True,
             deskew=True,
             contrast_enhance=True,
-            use_easyocr_fallback=True,
+            use_grid_detection=True,
+            use_easyocr_fallback=False,  # Disabled: EasyOCR has NumPy 2.x incompatibility
             min_confidence=50.0,
         )
 

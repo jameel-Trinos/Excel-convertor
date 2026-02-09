@@ -37,6 +37,9 @@ class OCRConfig:
     # Quality thresholds
     min_confidence: float = 60.0  # Minimum confidence for OCR results
 
+    # Grid-line detection
+    use_grid_detection: bool = True  # Try grid-line-based extraction first
+
     # Fallback
     use_easyocr_fallback: bool = True
 
@@ -111,11 +114,61 @@ class OCRProcessor:
         total_confidence = 0.0
         first_page_headers = None  # Headers extracted from first page only
 
+        # Initialize grid OCR extractor if grid detection is enabled
+        grid_extractor = None
+        if self.config.use_grid_detection:
+            try:
+                from .grid_ocr_processor import GridOCRTableExtractor
+                grid_extractor = GridOCRTableExtractor(
+                    language=self.config.language,
+                )
+                logger.info("Grid-line OCR extractor initialized")
+            except Exception as e:
+                logger.warning(f"Failed to initialize grid OCR extractor: {e}")
+
         for page_idx, image in enumerate(images):
             page_num = page_idx + 1
             progress = int(10 + ((page_idx / total_pages) * 70))
             update_progress(progress, f"Processing page {page_num} of {total_pages} with OCR...")
 
+            # Strategy 1: Try grid-line-based extraction first (best for scanned tables with borders)
+            # Run on original image (not preprocessed) because CLAHE can degrade line detection
+            grid_succeeded = False
+            if grid_extractor is not None:
+                try:
+                    if page_num == 1:
+                        table_data = grid_extractor.extract_table_from_image(image, page_num)
+                        if table_data and not table_data.is_empty:
+                            first_page_headers = table_data.headers
+                            all_tables.append(table_data)
+                            all_page_texts.append("")  # No raw text from grid OCR
+                            total_confidence += 85.0  # Grid OCR is high confidence
+                            logger.info(
+                                f"Page 1: Grid OCR extracted {len(first_page_headers)} headers, "
+                                f"{len(table_data.rows)} data rows"
+                            )
+                            grid_succeeded = True
+                    else:
+                        if first_page_headers is not None:
+                            table_data = grid_extractor.extract_data_only(
+                                image, first_page_headers, page_num
+                            )
+                            if table_data and not table_data.is_empty:
+                                all_tables.append(table_data)
+                                all_page_texts.append("")
+                                total_confidence += 85.0
+                                logger.info(
+                                    f"Page {page_num}: Grid OCR extracted "
+                                    f"{len(table_data.rows)} data rows"
+                                )
+                                grid_succeeded = True
+                except Exception as e:
+                    logger.warning(f"Page {page_num}: Grid OCR failed: {e}")
+
+            if grid_succeeded:
+                continue
+
+            # Strategy 2: Fallback to full-page OCR + bounding box parsing
             # Preprocess the image
             processed_image, preprocessing_steps = self._preprocess_image(image)
 
@@ -128,7 +181,7 @@ class OCRProcessor:
             if page_num == 1:
                 # Parse OCR result into table structure (includes headers)
                 table_data = self._parse_ocr_to_table(ocr_result)
-                
+
                 if table_data and not table_data.is_empty:
                     # Store headers from first page
                     first_page_headers = table_data.headers
@@ -144,10 +197,10 @@ class OCRProcessor:
                 if first_page_headers is None:
                     logger.warning(f"Page {page_num}: No headers from first page, skipping")
                     continue
-                
+
                 # Parse OCR result but extract only data rows
                 table_data = self._parse_ocr_data_only(ocr_result, first_page_headers)
-                
+
                 if table_data and not table_data.is_empty:
                     all_tables.append(table_data)
                     logger.info(
