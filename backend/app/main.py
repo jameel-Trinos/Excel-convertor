@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -73,6 +74,92 @@ geocode_tasks: Dict[str, dict] = {}  # {geocode_task_id: {status, results, progr
 
 # Translation task storage
 translation_tasks: Dict[str, dict] = {}  # {translate_task_id: {status, progress, ...}}
+
+# Booth name extraction helpers
+
+# Keywords in parenthetical booth descriptors (e.g., "(ADDL. BUILDING)")
+_PAREN_DESCRIPTOR_KEYWORDS = {
+    "BUILDING", "BLDG", "PORTION", "WING", "BLOCK", "FLOOR",
+    "ROOM", "SHED", "SIDE", "SECTION", "ANNEX", "ANNEXE", "EXTENSION",
+    "EXT", "PART", "UNIT", "ADDL", "ADDITIONAL", "NEW", "OLD", "MAIN",
+    "NORTH", "SOUTH", "EAST", "WEST", "LEFT", "RIGHT", "UPPER", "LOWER",
+    "GROUND", "FIRST", "SECOND", "THIRD", "FRONT", "REAR", "BACK",
+    "CENTRAL", "MIDDLE",
+}
+
+# Institution type keywords — truncate after the LAST occurrence found.
+# Works for all forms: "Higher Secondary School", "P.U.M.School", "Aided.E.School"
+_INSTITUTION_RE = re.compile(
+    r'\b('
+    r'School|College|University|Academy|Institute|'
+    r'Vidyalaya|Vidyalayam|Patasala|'
+    r'Hall|Mandapam|Kalyanamandapam|Mahal|Choultry|'
+    r'Hospital|Dispensary|Library|'
+    r'Madrasa|Madarasa|Seminary'
+    r')\b',
+    re.IGNORECASE,
+)
+
+# Dotted abbreviation pattern at start of string (e.g., P.U.M.S, P.U.E.S, P.U.M.School)
+_ABBREVIATION_RE = re.compile(r'^([A-Z]\.){2,}[A-Za-z]*', re.IGNORECASE)
+
+
+def extract_booth_name(source_str: str) -> str:
+    """Extract only the institution/building name from election booth location string.
+
+    Examples:
+      "P.U.M.S Thalavadi-638461 South Facing Terraced Building East Side"
+        → "P.U.M.S"
+      "Govt. Boys Higher Secondary School Athani Road Sathyamangalam 638401East Facing..."
+        → "Govt. Boys Higher Secondary School"
+      "P.U.M.School Thottagajanur-638461 East Facing terraced Building Right Side"
+        → "P.U.M.School"
+      "PANCHAYAT UNION PRIMARY SCHOOL (ADDL. BUILDING), THENGUMARAHADA - 638451"
+        → "PANCHAYAT UNION PRIMARY SCHOOL"
+
+    Strategy:
+      1. Clean text: comma split, remove pincodes, remove descriptor parentheticals
+      2. Extract institution name using one of two methods:
+         a. Standalone institution keyword found (School, College, Hall, etc.)
+            → truncate after it
+         b. Dotted abbreviation at start (P.U.M.S, P.U.E.S, etc.)
+            → extract just the abbreviation
+    """
+    text = source_str.strip()
+    if not text:
+        return ""
+
+    # Step 1: Take text before first comma
+    if "," in text:
+        text = text.split(",")[0].strip()
+
+    # Step 2: Remove pincode patterns (6-digit numbers)
+    text = re.sub(r'[-\u2013]\s*\d{6}', '', text)
+    text = re.sub(r'\b\d{6}(?=[A-Za-z\s]|$)', '', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+
+    # Step 3: Remove trailing parenthetical if it contains a descriptor keyword
+    paren_match = re.search(r'\s*\(([^)]+)\)\s*$', text)
+    if paren_match:
+        paren_content = paren_match.group(1).upper()
+        tokens = re.split(r'[\s.,]+', paren_content)
+        if any(tok in _PAREN_DESCRIPTOR_KEYWORDS for tok in tokens):
+            text = text[:paren_match.start()].strip()
+
+    # Step 4: Extract institution name
+    # Method A: Standalone institution keyword (e.g., "Higher Secondary School")
+    inst_match = _INSTITUTION_RE.search(text)
+    if inst_match:
+        return text[:inst_match.end()].strip()
+
+    # Method B: Dotted abbreviation at start (e.g., "P.U.M.S", "P.U.E.S", "P.U.M.School")
+    abbr_match = _ABBREVIATION_RE.match(text)
+    if abbr_match:
+        return abbr_match.group(0).strip()
+
+    # Fallback: return cleaned text as-is
+    return text
+
 
 # Create FastAPI app
 app = FastAPI(
@@ -455,12 +542,7 @@ async def add_booth_name_column(request: AddBoothNameColumnRequest):
         for row in rows:
             source_value = row[source_col_idx] if source_col_idx < len(row) else None
             if source_value is not None:
-                source_str = str(source_value).strip()
-                # Extract text before first comma
-                if "," in source_str:
-                    booth_name = source_str.split(",")[0].strip()
-                else:
-                    booth_name = source_str
+                booth_name = extract_booth_name(str(source_value))
                 booth_names.append(booth_name)
             else:
                 booth_names.append("")
