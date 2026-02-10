@@ -17,6 +17,7 @@ import {
   RotateCcw,
 } from "lucide-react";
 import { AllianceModal } from "@/components/AllianceModal";
+import { ALLIANCE_CONFIG, ASSEMBLY_ALLIANCE_CONFIG } from "@/lib/allianceConfig";
 import {
   getFullPreview,
   downloadModifiedExcel,
@@ -118,12 +119,15 @@ export function SpreadsheetEditor({
 
   // Alliance state
   const [allianceModalOpen, setAllianceModalOpen] = useState(false);
+  const [allianceDropdownOpen, setAllianceDropdownOpen] = useState(false);
+  const [selectedAllianceType, setSelectedAllianceType] = useState<"loksabha" | "assembly" | null>(null);
   const [preAllianceData, setPreAllianceData] = useState<{
     headers: string[];
     rows: CellValue[][];
   } | null>(null);
   const [allianceApplied, setAllianceApplied] = useState(false);
   const [allianceWarnings, setAllianceWarnings] = useState<string[]>([]);
+  const allianceDropdownRef = useRef<HTMLDivElement>(null);
 
   // Fetch preview data when modal opens or language changes
   useEffect(() => {
@@ -202,6 +206,22 @@ export function SpreadsheetEditor({
       };
     }
   }, [showLanguageDropdown]);
+
+  // Close alliance dropdown when clicking outside
+  useEffect(() => {
+    function handleClickOutside(event: MouseEvent) {
+      if (allianceDropdownRef.current && !allianceDropdownRef.current.contains(event.target as Node)) {
+        setAllianceDropdownOpen(false);
+      }
+    }
+
+    if (allianceDropdownOpen) {
+      document.addEventListener("mousedown", handleClickOutside);
+      return () => {
+        document.removeEventListener("mousedown", handleClickOutside);
+      };
+    }
+  }, [allianceDropdownOpen]);
 
   // Cleanup translation subscription on unmount
   useEffect(() => {
@@ -815,15 +835,43 @@ export function SpreadsheetEditor({
 
                 {!isBoothView && (
                   <>
-                    <button
-                      type="button"
-                      onClick={() => setAllianceModalOpen(true)}
-                      disabled={loading || !!error || allianceApplied}
-                      className="flex items-center gap-2 px-4 py-2 bg-white border border-blue-300 text-blue-700 rounded-lg hover:bg-blue-50 font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                    >
-                      <Users className="w-4 h-4" />
-                      Add Alliance
-                    </button>
+                    <div className="relative" ref={allianceDropdownRef}>
+                      <button
+                        type="button"
+                        onClick={() => !allianceApplied && setAllianceDropdownOpen(!allianceDropdownOpen)}
+                        disabled={loading || !!error || allianceApplied}
+                        className="flex items-center gap-2 px-4 py-2 bg-white border border-blue-300 text-blue-700 rounded-lg hover:bg-blue-50 font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        <Users className="w-4 h-4" />
+                        Add Alliance
+                        <ChevronDown className="w-4 h-4" />
+                      </button>
+
+                      {allianceDropdownOpen && (
+                        <div className="absolute top-full right-0 mt-1 w-48 bg-white border border-gray-300 rounded-lg shadow-lg z-10 overflow-hidden">
+                          <button
+                            onClick={() => {
+                              setSelectedAllianceType("loksabha");
+                              setAllianceDropdownOpen(false);
+                              setAllianceModalOpen(true);
+                            }}
+                            className="w-full px-4 py-2.5 text-left hover:bg-blue-50 transition-colors text-sm font-medium text-gray-700 flex items-center gap-2"
+                          >
+                            Loksabha
+                          </button>
+                          <button
+                            onClick={() => {
+                              setSelectedAllianceType("assembly");
+                              setAllianceDropdownOpen(false);
+                              setAllianceModalOpen(true);
+                            }}
+                            className="w-full px-4 py-2.5 text-left hover:bg-blue-50 transition-colors text-sm font-medium text-gray-700 flex items-center gap-2 border-t border-gray-100"
+                          >
+                            Assembly
+                          </button>
+                        </div>
+                      )}
+                    </div>
                     {allianceApplied && (
                       <button
                         type="button"
@@ -1397,7 +1445,7 @@ export function SpreadsheetEditor({
         onClose={() => setAllianceModalOpen(false)}
         onApply={handleApplyAlliance}
         availableColumns={editedData?.headers ?? []}
-        allianceConfig={undefined}
+        allianceConfig={selectedAllianceType === "assembly" ? ASSEMBLY_ALLIANCE_CONFIG : ALLIANCE_CONFIG}
       />
     </>
   );
