@@ -135,17 +135,13 @@ class FilterExcelRequest(BaseModel):
 
     task_id: str = Field(..., description="Task ID of the Excel file to filter")
     selected_columns: list[str] = Field(..., description="List of column names to keep (in desired order)")
-    include_others: bool = Field(
-        default=False,
-        description="If True, add an 'OTHERS' column with sum of unselected party columns"
-    )
-    others_columns: Optional[list[str]] = Field(
-        default=None,
-        description="List of unselected column names to sum into OTHERS column. If provided, OTHERS column will be added with sum of these columns."
-    )
     header_overrides: Optional[dict[str, str]] = Field(
         default=None,
         description="Optional mapping of original column name -> desired output header name",
+    )
+    sum_other_columns: Optional[list[str]] = Field(
+        default=None,
+        description="List of unselected numeric/party column names whose values should be summed into an 'Other' column",
     )
 
 

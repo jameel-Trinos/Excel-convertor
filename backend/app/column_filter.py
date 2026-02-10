@@ -11,28 +11,6 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
 logger = logging.getLogger(__name__)
 
-# Non-party column keywords - columns matching these are administrative, not party vote columns
-_NON_PARTY_KEYWORDS = [
-    "sl", "serial", "no.", "number", "polling", "station", "location",
-    "building", "area", "type", "voter", "total", "valid", "rejected",
-    "tendered", "nota", "cast", "favour", "column", "ac no",
-]
-
-
-def _is_party_column(col_name: str) -> bool:
-    """Check if a column is likely a party vote column (not an administrative column)."""
-    if not col_name:
-        return False
-    col_lower = col_name.lower().strip()
-    # If any non-party keyword is in the column name, it's not a party column
-    for keyword in _NON_PARTY_KEYWORDS:
-        if keyword in col_lower:
-            return False
-    # If it's just "Column N", it's not a party column
-    if col_lower.startswith("column "):
-        return False
-    return True
-
 
 def _normalize_column_name(name: str) -> str:
     """
@@ -109,9 +87,9 @@ class ColumnFilterService:
         input_file: str,
         requested_columns: List[str],
         output_dir: str,
-        include_others: bool = False,
         header_overrides: Optional[Dict[str, str]] = None,
-        others_columns: Optional[List[str]] = None,
+        task_id: Optional[str] = None,
+        sum_other_columns: Optional[List[str]] = None,
     ) -> tuple[str, dict]:
         """
         Filter Excel file to include only requested columns.
@@ -120,9 +98,8 @@ class ColumnFilterService:
             input_file: Path to the source Excel file
             requested_columns: List of column names to include (in desired order)
             output_dir: Directory to save the filtered Excel file
-            include_others: If True, add an "OTHER Votes" column with sum of unselected party columns
             header_overrides: Optional mapping of original column name -> desired output header name
-            others_columns: Optional list of specific column names to sum into OTHERS. If provided, these columns will be used instead of auto-detection.
+            task_id: Optional task ID to check for alliance mappings (for handling merged columns)
 
         Returns:
             Tuple of (output_file_path, metadata_dict)
@@ -401,80 +378,30 @@ class ColumnFilterService:
         # Filter dataframe to requested columns (preserving order)
         filtered_df = df[requested_columns].copy()
 
-        # Add OTHERS column if requested
-        others_columns_used = []
-        if include_others:
-            # Use provided others_columns if available, otherwise auto-detect
-            if others_columns and len(others_columns) > 0:
-                # Validate that all provided others_columns exist in the dataframe
-                valid_others_columns = [col for col in others_columns if col in available_columns]
-                invalid_others_columns = [col for col in others_columns if col not in available_columns]
-                
-                if invalid_others_columns:
-                    logger.warning(f"Some others_columns not found in Excel file: {invalid_others_columns}")
-                
-                if valid_others_columns:
-                    logger.info(f"Adding OTHERS column with sum of specified columns: {valid_others_columns}")
-                    # Calculate sum of specified columns (convert to numeric, treating NaN as 0)
-                    others_sum = pd.Series(0, index=df.index)
-                    for col in valid_others_columns:
-                        # Handle duplicate column names - df[col] might return DataFrame
-                        col_data = df[col]
-                        if isinstance(col_data, pd.DataFrame):
-                            # If duplicate columns, convert to numeric first, then sum across all columns with that name
-                            col_data = col_data.apply(lambda x: pd.to_numeric(x, errors='coerce').fillna(0))
-                            col_data = col_data.sum(axis=1)
-                        elif not isinstance(col_data, pd.Series):
-                            # Convert to Series if it's not already
-                            col_data = pd.Series(col_data, index=df.index)
-                        others_sum += pd.to_numeric(col_data, errors='coerce').fillna(0)
-                    
-                    filtered_df['OTHERS'] = others_sum.astype(int)
-                    others_columns_used = valid_others_columns
-                else:
-                    logger.warning("No valid columns found in others_columns list, skipping OTHERS column")
+        # Sum unselected party/numeric columns into an "Other" column if requested
+        if sum_other_columns:
+            # Match the unselected columns against available columns (same fuzzy matching)
+            # Use column indices to handle duplicate column names (e.g. multiple "INDEPENDENT")
+            other_col_indices = []
+            for other_col in sum_other_columns:
+                matched = _find_column_match(other_col, available_columns)
+                if matched and matched not in requested_columns:
+                    # Find ALL indices for this column name (handles duplicates)
+                    for idx, col_name in enumerate(available_columns):
+                        if col_name == matched and idx not in other_col_indices:
+                            other_col_indices.append(idx)
+                            break  # one index per requested entry
+
+            if other_col_indices:
+                logger.info(f"Summing {len(other_col_indices)} unselected columns into 'Other' (indices: {other_col_indices})")
+                # Use iloc to select by position, avoiding duplicate column name issues
+                other_values = df.iloc[:, other_col_indices].copy()
+                # Convert each column to numeric by position
+                for i in range(other_values.shape[1]):
+                    other_values.iloc[:, i] = pd.to_numeric(other_values.iloc[:, i], errors='coerce').fillna(0)
+                filtered_df["Others Votes"] = other_values.sum(axis=1).astype(int)
             else:
-                # Auto-detect party columns from unselected columns
-                # Get all unselected columns
-                unselected_columns = [col for col in available_columns if col not in requested_columns]
-
-                # Filter to only party columns (excluding administrative columns like SL.NO, Total, etc.)
-                party_unselected = []
-                for col in unselected_columns:
-                    # Check if this is a party column (not an administrative column)
-                    if _is_party_column(col):
-                        # Also verify it's numeric (contains vote data)
-                        # Handle duplicate column names - df[col] might return DataFrame
-                        col_data = df[col]
-                        if isinstance(col_data, pd.DataFrame):
-                            # If duplicate columns, use the first one for checking
-                            col_data = col_data.iloc[:, 0]
-                        if not isinstance(col_data, pd.Series):
-                            col_data = pd.Series(col_data, index=df.index)
-                        sample_values = col_data.dropna().head(10)
-                        if len(sample_values) > 0:
-                            numeric_count = pd.to_numeric(sample_values, errors='coerce').notna().sum()
-                            if numeric_count / len(sample_values) >= 0.5:  # At least 50% numeric
-                                party_unselected.append(col)
-
-                if party_unselected:
-                    logger.info(f"Adding OTHERS column with sum of auto-detected unselected PARTY columns: {party_unselected}")
-                    # Calculate sum of unselected party columns (convert to numeric, treating NaN as 0)
-                    others_sum = pd.Series(0, index=df.index)
-                    for col in party_unselected:
-                        # Handle duplicate column names - df[col] might return DataFrame
-                        col_data = df[col]
-                        if isinstance(col_data, pd.DataFrame):
-                            # If duplicate columns, convert to numeric first, then sum across all columns with that name
-                            col_data = col_data.apply(lambda x: pd.to_numeric(x, errors='coerce').fillna(0))
-                            col_data = col_data.sum(axis=1)
-                        elif not isinstance(col_data, pd.Series):
-                            # Convert to Series if it's not already
-                            col_data = pd.Series(col_data, index=df.index)
-                        others_sum += pd.to_numeric(col_data, errors='coerce').fillna(0)
-
-                    filtered_df['OTHERS'] = others_sum.astype(int)
-                    others_columns_used = party_unselected
+                logger.info("No valid unselected columns found for 'Other' summing")
 
         # Apply output header overrides (display names) AFTER selecting data by original headers
         header_overrides = header_overrides or {}
@@ -529,8 +456,6 @@ class ColumnFilterService:
             "total_columns": len(filtered_df.columns),
             "total_rows": len(filtered_df),
             "columns_removed": len(available_columns) - len(requested_columns),
-            "include_others": include_others,
-            "others_columns": others_columns_used if include_others else [],
         }
 
         logger.info(f"Filtering complete: {len(requested_columns)} columns, {len(filtered_df)} rows")

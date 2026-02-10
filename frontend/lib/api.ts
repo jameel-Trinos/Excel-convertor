@@ -172,10 +172,9 @@ export async function filterExcel(
   taskId: string,
   selectedColumns: string[],
   filename: string,
-  othersColumns: string[] = [],
-  headerOverrides?: Record<string, string>
+  headerOverrides?: Record<string, string>,
+  sumOtherColumns?: string[]
 ): Promise<void> {
-  const includeOthers = othersColumns.length > 0;
   const response = await fetch(`${API_BASE_URL}/api/filter-excel`, {
     method: "POST",
     headers: {
@@ -184,9 +183,8 @@ export async function filterExcel(
     body: JSON.stringify({
       task_id: taskId,
       selected_columns: selectedColumns,
-      include_others: includeOthers,
-      others_columns: includeOthers ? othersColumns : null,
       header_overrides: headerOverrides,
+      sum_other_columns: sumOtherColumns,
     }),
   });
 
@@ -420,3 +418,4 @@ export async function addBoothNameColumn(
 
   return response.json();
 }
+

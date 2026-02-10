@@ -5,7 +5,7 @@ import { SpreadsheetEditor } from "@/components/SpreadsheetEditor";
 import { ColumnFilter } from "@/components/ColumnFilter";
 import { useFileUpload } from "@/hooks/useFileUpload";
 import { downloadExcel, getPreview, getStatus, getColumns } from "@/lib/api";
-import type { PreviewData, ValidationIssues } from "@/types";
+import type { PreviewData, ValidationIssues, CellValue } from "@/types";
 import {
   IdleState,
   ProcessingState,
@@ -24,6 +24,7 @@ export function ElectionResultsView() {
   const [columns, setColumns] = useState<string[]>([]);
   const [validationIssues, setValidationIssues] = useState<ValidationIssues | null>(null);
   const [previewData, setPreviewData] = useState<PreviewData | null>(null);
+  const [editedData, setEditedData] = useState<{ headers: string[]; rows: CellValue[][] } | null>(null);
 
   const {
     status,
@@ -51,6 +52,7 @@ export function ElectionResultsView() {
     setColumns([]);
     setValidationIssues(null);
     setPreviewData(null);
+    setEditedData(null);
     reset();
   }, [reset]);
 
@@ -170,6 +172,8 @@ export function ElectionResultsView() {
             setPreviewOpen(false);
             setColumnFilterOpen(true);
           }}
+          onColumnsChange={(updatedCols) => setColumns(updatedCols)}
+          onDataChange={(data) => setEditedData(data)}
         />
       )}
 
@@ -180,6 +184,7 @@ export function ElectionResultsView() {
           taskId={taskId}
           columns={columns}
           filename={filename || "data.pdf"}
+          editedData={editedData}
         />
       )}
     </>

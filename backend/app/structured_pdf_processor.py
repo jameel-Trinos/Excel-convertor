@@ -20,7 +20,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import pdfplumber
 from openpyxl import Workbook
@@ -29,6 +29,7 @@ from openpyxl.utils import get_column_letter
 
 from .models import ExtractionResult, TableData
 from .utils import sanitize_text
+from .alliance_utils import combine_alliance_headers, combine_alliance_data_rows, detect_alliance_columns
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +96,8 @@ class StructuredPDFProcessor:
         self.structure: Optional[PDFStructure] = None
         self.headers: List[str] = []
         self.data_rows: List[List[str]] = []
+        self._alliance_column_mapping: Dict[int, int] = {}
+        self._alliance_info: Dict[str, Dict[str, List[int]]] = {}
         self.title_lines: List[str] = []
         # Store raw header rows for duplicate detection
         self._raw_header_rows: List[List[str]] = []
@@ -270,8 +273,12 @@ class StructuredPDFProcessor:
                     # Store raw header rows for duplicate detection
                     self._raw_header_rows = header_rows
                     self._create_header_fingerprints(header_rows)
-                    # Combine multi-row headers
-                    self.headers = self._combine_header_rows(header_rows)
+                    # Combine multi-row headers (already sanitized in _combine_header_rows)
+                    combined_headers = self._combine_header_rows(header_rows)
+                    # Apply alliance detection and combination
+                    self.headers, self._alliance_column_mapping, self._alliance_info = combine_alliance_headers(combined_headers)
+                    # Final sanitization pass on combined headers to ensure no corruption
+                    self.headers = [self._clean_cell(header) for header in self.headers]
                     break
 
             if not self.headers:
@@ -382,7 +389,9 @@ class StructuredPDFProcessor:
             return []
 
         if len(header_rows) == 1:
-            return [h for h in header_rows[0] if h]
+            # Sanitize each header before returning
+            sanitized = [self._clean_cell(h) for h in header_rows[0] if h]
+            return sanitized
 
         # Find maximum columns
         max_cols = max(len(row) for row in header_rows)
@@ -420,18 +429,34 @@ class StructuredPDFProcessor:
                         party = value
 
                 if name and party:
-                    combined.append(f"{name}\n({party})")
+                    # Sanitize both name and party before combining
+                    sanitized_name = self._clean_cell(name)
+                    sanitized_party = self._clean_cell(party)
+                    combined.append(f"{sanitized_name}\n({sanitized_party})")
                 elif name:
-                    combined.append(name)
+                    combined.append(self._clean_cell(name))
                 elif party:
-                    combined.append(party)
+                    combined.append(self._clean_cell(party))
                 else:
-                    combined.append(parts[-1][1])
+                    combined.append(self._clean_cell(parts[-1][1]))
             else:
-                # Use the most specific (last) value
-                combined.append(parts[-1][1])
+                # Use the most specific (last) value and sanitize it
+                combined.append(self._clean_cell(parts[-1][1]))
 
-        return combined
+        # Final pass: ensure all headers are properly sanitized and in correct order
+        final_headers = []
+        for header in combined:
+            # Additional sanitization pass to catch any remaining issues
+            sanitized = self._clean_cell(header)
+            # Handle multi-line headers (name\n(party))
+            if "\n" in sanitized:
+                lines = sanitized.split("\n")
+                sanitized_lines = [self._clean_cell(line) for line in lines]
+                final_headers.append("\n".join(sanitized_lines))
+            else:
+                final_headers.append(sanitized)
+
+        return final_headers
 
     # ═══════════════════════════════════════════════════════════════
     # PHASE 3: EXTRACT DATA (FROM ALL PAGES)
@@ -511,9 +536,20 @@ class StructuredPDFProcessor:
                         # Check if this is a data row (has numeric value in first columns)
                         # ONLY add rows that are confirmed data rows
                         if self._is_data_row(cleaned_row):
-                            # Normalize row length
-                            normalized_row = self._normalize_row(cleaned_row, expected_columns)
+                            # Normalize row length (use original header count before alliance combination)
+                            original_expected = len(self._alliance_column_mapping) if self._alliance_column_mapping else expected_columns
+                            normalized_row = self._normalize_row(cleaned_row, original_expected)
                             all_data.append(normalized_row)
+
+        # Apply alliance data combination if alliance mapping exists
+        if self._alliance_column_mapping and self._alliance_info and all_data:
+            logger.info("  Combining alliance votes into main party columns...")
+            all_data = combine_alliance_data_rows(
+                all_data,
+                self._alliance_column_mapping,
+                self._alliance_info
+            )
+            logger.info(f"  Combined alliance data: {len(all_data)} rows")
 
         self.data_rows = all_data
 

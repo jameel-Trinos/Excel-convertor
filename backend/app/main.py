@@ -1056,14 +1056,13 @@ async def filter_columns(request: FilterColumnsRequest):
 @app.post("/api/filter-excel")
 async def filter_excel(request: FilterExcelRequest):
     """
-    Filter Excel file to include only selected columns and optionally add OTHERS column.
+    Filter Excel file to include only selected columns.
 
-    Takes a task_id, list of column names, and include_others flag.
-    Creates a new Excel file with selected columns and optionally adds an
-    "OTHER Votes" column that sums all unselected party columns.
+    Takes a task_id and list of column names.
+    Creates a new Excel file with selected columns.
 
     Args:
-        request: FilterExcelRequest with task_id, selected_columns, and include_others
+        request: FilterExcelRequest with task_id and selected_columns
 
     Returns:
         FileResponse with the filtered Excel file for direct download
@@ -1091,29 +1090,29 @@ async def filter_excel(request: FilterExcelRequest):
         )
 
     try:
-        # Auto-set include_others if others_columns is provided
-        include_others = request.include_others or (request.others_columns is not None and len(request.others_columns) > 0)
-        
         logger.info(
-            f"Filtering columns for task {request.task_id}: {request.selected_columns}, "
-            f"include_others: {include_others}, others_columns: {request.others_columns}"
+            f"Filtering columns for task {request.task_id}: {request.selected_columns}"
         )
 
         # Create filter service
         filter_service = ColumnFilterService()
 
-        # Filter columns with OTHERS support
+        # Filter columns
         filtered_file, metadata = await asyncio.to_thread(
             filter_service.filter_columns,
             task.output_file,
             request.selected_columns,
             str(OUTPUT_DIR),
-            include_others,
             request.header_overrides,
-            request.others_columns,
+            request.task_id,  # Pass task_id to handle alliance mappings
+            request.sum_other_columns,
         )
 
         logger.info(f"Column filtering completed: {filtered_file}")
+
+        # Update task's output file to point to filtered file so editor shows filtered columns
+        task.output_file = filtered_file
+        logger.info(f"Updated task {request.task_id} output_file to: {filtered_file}")
 
         # Return the filtered file for download
         return FileResponse(
@@ -2327,5 +2326,3 @@ async def startup_event():
                     pass
 
     asyncio.create_task(periodic_cleanup())
-
-

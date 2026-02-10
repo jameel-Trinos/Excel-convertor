@@ -13,7 +13,10 @@ import {
   Languages,
   ChevronDown,
   Edit,
+  Users,
+  RotateCcw,
 } from "lucide-react";
+import { AllianceModal } from "@/components/AllianceModal";
 import {
   getFullPreview,
   downloadModifiedExcel,
@@ -38,6 +41,12 @@ import type {
   Language,
 } from "@/types";
 
+function safeNumber(val: CellValue): number {
+  if (val === null || val === undefined || val === "") return 0;
+  const n = Number(val);
+  return isNaN(n) ? 0 : n;
+}
+
 interface SpreadsheetEditorProps {
   isOpen: boolean;
   onClose: () => void;
@@ -45,6 +54,8 @@ interface SpreadsheetEditorProps {
   filename: string;
   onFilterColumns?: () => void;
   isBoothView?: boolean;
+  onColumnsChange?: (columns: string[]) => void;
+  onDataChange?: (data: { headers: string[]; rows: CellValue[][] }) => void;
 }
 
 interface ContextMenuPosition {
@@ -61,6 +72,8 @@ export function SpreadsheetEditor({
   filename,
   onFilterColumns,
   isBoothView = false,
+  onColumnsChange,
+  onDataChange,
 }: SpreadsheetEditorProps) {
   const [previewData, setPreviewData] = useState<FullPreviewData | null>(null);
   const [loading, setLoading] = useState(true);
@@ -103,9 +116,26 @@ export function SpreadsheetEditor({
   const [selectedSourceColumn, setSelectedSourceColumn] = useState<string>("");
   const [addingBoothName, setAddingBoothName] = useState(false);
 
+  // Alliance state
+  const [allianceModalOpen, setAllianceModalOpen] = useState(false);
+  const [preAllianceData, setPreAllianceData] = useState<{
+    headers: string[];
+    rows: CellValue[][];
+  } | null>(null);
+  const [allianceApplied, setAllianceApplied] = useState(false);
+  const [allianceWarnings, setAllianceWarnings] = useState<string[]>([]);
+
   // Fetch preview data when modal opens or language changes
   useEffect(() => {
     if (isOpen && taskId) {
+      // Don't refetch if we have alliance data or local edits (preserve user changes)
+      if (allianceApplied || preAllianceData) {
+        console.log("SpreadsheetEditor - Skipping refetch (alliance data exists)");
+        setLoading(false); // Ensure loading is false so table renders
+        setError(null);
+        return;
+      }
+
       setLoading(true);
       setError(null);
 
@@ -131,7 +161,7 @@ export function SpreadsheetEditor({
 
       loadPreview();
     }
-  }, [isOpen, taskId, currentLanguage]);
+  }, [isOpen, taskId, currentLanguage, allianceApplied, preAllianceData]);
 
   // Check available translations when modal opens
   useEffect(() => {
@@ -149,6 +179,13 @@ export function SpreadsheetEditor({
         });
     }
   }, [isOpen, taskId]);
+
+  // Notify parent of data changes (for alliance → filter flow)
+  useEffect(() => {
+    if (editedData && onDataChange) {
+      onDataChange(editedData);
+    }
+  }, [editedData, onDataChange]);
 
   // Close language dropdown when clicking outside
   useEffect(() => {
@@ -256,6 +293,104 @@ export function SpreadsheetEditor({
     setEditedData({ ...editedData, rows: newRows });
     setContextMenu(null);
   }, [contextMenu, editedData]);
+
+  // Alliance: apply alliance vote sums
+  // allianceMap: { mainPartyColumnHeader: [allyColumnHeader, ...] }
+  // 1. Sum alliance columns into main party column (create column if missing)
+  // 2. Remove the alliance columns from the table
+  const handleApplyAlliance = useCallback(
+    async (allianceMap: Record<string, string[]>) => {
+      console.log("SpreadsheetEditor - Received Alliance Map:", allianceMap);
+      console.log("SpreadsheetEditor - Current Headers:", editedData?.headers);
+
+      if (!editedData) {
+        console.error("SpreadsheetEditor - Cannot apply alliance: editedData is null");
+        return;
+      }
+
+      // Snapshot current data for reset
+      setPreAllianceData({
+        headers: editedData.headers.map((h) => h),
+        rows: editedData.rows.map((row) => [...row]),
+      });
+      setAllianceWarnings([]);
+
+      // Client-side alliance logic
+      // Sums alliance party votes into main party column, then removes alliance columns.
+      let newHeaders = [...editedData.headers];
+      let newRows = editedData.rows.map((row) => [...row]);
+      const columnsToRemove = new Set<string>();
+
+      for (const [mainCol, allyCols] of Object.entries(allianceMap)) {
+        let mainIdx = newHeaders.indexOf(mainCol);
+        if (mainIdx === -1) {
+          // Main party column not in data — create new column
+          console.log(`SpreadsheetEditor - Creating new column: ${mainCol}`);
+          newHeaders = [...newHeaders, mainCol];
+          mainIdx = newHeaders.length - 1;
+          newRows = newRows.map((row) => [...row, 0]);
+        } else {
+          console.log(`SpreadsheetEditor - Using existing column: ${mainCol} at index ${mainIdx}`);
+        }
+
+        for (let r = 0; r < newRows.length; r++) {
+          let mainVal = safeNumber(newRows[r][mainIdx]);
+          for (const allyCol of allyCols) {
+            const allyIdx = newHeaders.indexOf(allyCol);
+            if (allyIdx === -1) {
+              console.warn(`SpreadsheetEditor - Alliance column not found: ${allyCol}`);
+              continue;
+            }
+            const allyVal = safeNumber(newRows[r][allyIdx]);
+            mainVal += allyVal;
+          }
+          newRows[r][mainIdx] = mainVal;
+        }
+        // Mark alliance columns for removal
+        for (const allyCol of allyCols) {
+          if (newHeaders.indexOf(allyCol) !== -1) {
+            columnsToRemove.add(allyCol);
+          }
+        }
+      }
+
+      // Remove alliance columns
+      if (columnsToRemove.size > 0) {
+        const keepIndices = newHeaders
+          .map((h, i) => ({ h, i }))
+          .filter(({ h }) => !columnsToRemove.has(h))
+          .map(({ i }) => i);
+        newHeaders = keepIndices.map((i) => newHeaders[i]);
+        newRows = newRows.map((row) => keepIndices.map((i) => row[i]));
+      }
+
+      const updatedData = { headers: newHeaders, rows: newRows };
+      console.log("SpreadsheetEditor - Updated Headers:", newHeaders);
+      console.log("SpreadsheetEditor - Columns Removed:", Array.from(columnsToRemove));
+      console.log("SpreadsheetEditor - Alliance applied successfully. Rows:", newRows.length);
+
+      setEditedData(updatedData);
+      setAllianceApplied(true);
+      onColumnsChange?.(newHeaders);
+      onDataChange?.(updatedData);  // ✅ CRITICAL: Notify parent of data change
+
+      console.log("SpreadsheetEditor - State updated: allianceApplied=true, editedData rows=", updatedData.rows.length);
+    },
+    [editedData, taskId, onColumnsChange, onDataChange]
+  );
+
+  // Alliance: reset to pre-alliance data
+  const handleResetAlliance = useCallback(() => {
+    if (!preAllianceData) return;
+    setEditedData({
+      headers: preAllianceData.headers.map((h) => h),
+      rows: preAllianceData.rows.map((row) => [...row]),
+    });
+    setPreAllianceData(null);
+    setAllianceApplied(false);
+    setAllianceWarnings([]);
+    onColumnsChange?.(preAllianceData.headers);
+  }, [preAllianceData, onColumnsChange]);
 
   // Download Excel with edited data
   const handleDownload = useCallback(async () => {
@@ -609,6 +744,7 @@ export function SpreadsheetEditor({
   const outputFilename = filename.replace(".pdf", ".xlsx");
 
   return (
+    <>
     <DialogPrimitive.Root open={isOpen} onOpenChange={onClose}>
       <DialogPrimitive.Portal>
         <DialogPrimitive.Overlay className="fixed inset-0 z-50 bg-black/50" />
@@ -629,6 +765,7 @@ export function SpreadsheetEditor({
             <div className="flex items-center justify-between w-full">
               <div className="flex items-center gap-4">
                 <button
+                  type="button"
                   onClick={onClose}
                   className="text-gray-600 hover:text-gray-900 p-2 hover:bg-gray-100 rounded-lg transition-colors"
                   aria-label="Close"
@@ -650,6 +787,7 @@ export function SpreadsheetEditor({
               <div className="flex items-center gap-3">
                 {isBoothView && (
                   <button
+                    type="button"
                     onClick={() => {
                       if (editedData && editedData.headers.length > 0) {
                         setSelectedSourceColumn(editedData.headers[0]);
@@ -665,6 +803,7 @@ export function SpreadsheetEditor({
                 )}
                 {onFilterColumns && (
                   <button
+                    type="button"
                     onClick={onFilterColumns}
                     disabled={loading || !!error}
                     className="flex items-center gap-2 px-4 py-2 bg-white border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
@@ -674,7 +813,41 @@ export function SpreadsheetEditor({
                   </button>
                 )}
 
+                {!isBoothView && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => setAllianceModalOpen(true)}
+                      disabled={loading || !!error || allianceApplied}
+                      className="flex items-center gap-2 px-4 py-2 bg-white border border-blue-300 text-blue-700 rounded-lg hover:bg-blue-50 font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      <Users className="w-4 h-4" />
+                      Add Alliance
+                    </button>
+                    {allianceApplied && (
+                      <button
+                        type="button"
+                        onClick={handleResetAlliance}
+                        className="flex items-center gap-2 px-4 py-2 bg-white border border-red-300 text-red-700 rounded-lg hover:bg-red-50 font-medium transition-colors"
+                      >
+                        <RotateCcw className="w-4 h-4" />
+                        Reset Alliance
+                      </button>
+                    )}
+                  </>
+                )}
+
+                {allianceWarnings.length > 0 && (
+                  <div className="flex items-center gap-2 px-3 py-1.5 bg-yellow-50 border border-yellow-200 rounded-lg">
+                    <AlertCircle className="w-4 h-4 text-yellow-600 flex-shrink-0" />
+                    <span className="text-xs text-yellow-700">
+                      {allianceWarnings.length} column{allianceWarnings.length > 1 ? "s" : ""} not found
+                    </span>
+                  </div>
+                )}
+
                 <button
+                  type="button"
                   onClick={openGeocodeDialog}
                   disabled={loading || !!error || geocoding}
                   className="flex items-center gap-2 px-4 py-2 bg-white border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
@@ -686,6 +859,7 @@ export function SpreadsheetEditor({
                 {/* Language Dropdown */}
                 <div className="relative" ref={languageDropdownRef}>
                   <button
+                    type="button"
                     onClick={() => !translating && !loading && !error && setShowLanguageDropdown(!showLanguageDropdown)}
                     disabled={loading || !!error || translating}
                     className="flex items-center gap-2 px-4 py-2 bg-white border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed min-w-[180px] justify-between"
@@ -729,6 +903,7 @@ export function SpreadsheetEditor({
                 </div>
 
                 <button
+                  type="button"
                   onClick={handleDownload}
                   disabled={loading || !!error || downloading}
                   className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
@@ -1215,5 +1390,15 @@ export function SpreadsheetEditor({
         </DialogPrimitive.Content>
       </DialogPrimitive.Portal>
     </DialogPrimitive.Root>
+
+      {/* Alliance Modal */}
+      <AllianceModal
+        isOpen={allianceModalOpen}
+        onClose={() => setAllianceModalOpen(false)}
+        onApply={handleApplyAlliance}
+        availableColumns={editedData?.headers ?? []}
+        allianceConfig={undefined}
+      />
+    </>
   );
 }

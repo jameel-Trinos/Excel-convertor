@@ -10,9 +10,10 @@ import {
   DialogFooter,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
-import { Loader2, X, Download, Info } from "lucide-react";
-import { filterExcel } from "@/lib/api";
+import { Loader2, X, Download, ArrowLeft, ArrowRight } from "lucide-react";
+import { filterExcel, downloadModifiedExcel } from "@/lib/api";
 import { matchColumnLabel } from "@/lib/partyHeaderMapper";
+import type { CellValue } from "@/types";
 
 interface ColumnFilterProps {
   isOpen: boolean;
@@ -20,6 +21,7 @@ interface ColumnFilterProps {
   taskId: string;
   columns: string[];
   filename: string;
+  editedData?: { headers: string[]; rows: CellValue[][] } | null;
 }
 
 // Color schemes for different party types
@@ -82,26 +84,32 @@ export function ColumnFilter({
   taskId,
   columns,
   filename,
+  editedData,
 }: ColumnFilterProps) {
   const [selectedColumns, setSelectedColumns] = useState<Set<string>>(new Set());
+  const [sumOtherSet, setSumOtherSet] = useState<Set<string>>(new Set());
   const [searchQuery, setSearchQuery] = useState("");
-  const [includeOthers, setIncludeOthers] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [showOthersDialog, setShowOthersDialog] = useState(false);
-  const [selectedOthersColumns, setSelectedOthersColumns] = useState<Set<string>>(new Set());
+  const [step, setStep] = useState<1 | 2>(1);
+
+  // Use editedData.headers if available (post-alliance), otherwise use columns prop
+  // This ensures we show only columns that actually exist in the current data state
+  const effectiveColumns = useMemo(() => {
+    return editedData?.headers ?? columns;
+  }, [editedData, columns]);
 
   // Build unique keys for each column to handle duplicates (e.g., multiple "DNI" columns)
   const uniqueColumns = useMemo(() => {
     const nameCounts: Record<string, number> = {};
-    return columns.map((col, idx) => {
+    return effectiveColumns.map((col, idx) => {
       nameCounts[col] = (nameCounts[col] || 0) + 1;
       const count = nameCounts[col];
       // For first occurrence keep original name, for duplicates append index
       const uniqueKey = count === 1 ? col : `${col} (${count})`;
       return { uniqueKey, originalName: col, index: idx };
     });
-  }, [columns]);
+  }, [effectiveColumns]);
 
   // All unique keys for convenience
   const allUniqueKeys = useMemo(() => uniqueColumns.map(c => c.uniqueKey), [uniqueColumns]);
@@ -110,13 +118,35 @@ export function ColumnFilter({
   useEffect(() => {
     if (isOpen) {
       setSelectedColumns(new Set(allUniqueKeys));
+      setSumOtherSet(new Set());
       setSearchQuery("");
-      setIncludeOthers(false);
       setError(null);
-      setShowOthersDialog(false);
-      setSelectedOthersColumns(new Set());
+      setStep(1);
     }
   }, [isOpen, allUniqueKeys]);
+
+  // Compute unselected party columns (candidates for "Other" summing)
+  const unselectedPartyKeys = useMemo(() => {
+    return allUniqueKeys.filter((key) => {
+      if (selectedColumns.has(key)) return false;
+      const originalName = uniqueColumns.find(c => c.uniqueKey === key)?.originalName || key;
+      const match = matchColumnLabel(originalName);
+      // Only party vote columns are candidates for "Other"
+      return match?.type === "party";
+    });
+  }, [allUniqueKeys, selectedColumns, uniqueColumns]);
+
+  // Clean up sumOtherSet: remove keys that are no longer unselected party columns
+  // (e.g. user re-selected a column). User manually checks the ones they want summed.
+  useEffect(() => {
+    setSumOtherSet((prev) => {
+      const next = new Set(prev);
+      for (const key of prev) {
+        if (!unselectedPartyKeys.includes(key)) next.delete(key);
+      }
+      return next;
+    });
+  }, [unselectedPartyKeys]);
 
   // Group columns - show each column separately
   const columnGroups = useMemo(() => {
@@ -230,28 +260,24 @@ export function ColumnFilter({
     }
   };
 
-  // Get unselected columns for OTHERS dialog
-  const unselectedColumns = useMemo(() => {
-    return allUniqueKeys.filter(key => !selectedColumns.has(key));
-  }, [allUniqueKeys, selectedColumns]);
-
   const handleSubmit = async () => {
     if (selectedColumns.size === 0) {
       setError("Please select at least one column");
       return;
     }
 
-    // If there are unselected columns, show dialog to ask about OTHERS
-    if (unselectedColumns.length > 0) {
-      // Initialize with all unselected columns selected by default
-      setSelectedOthersColumns(new Set(unselectedColumns));
-      setError(null);
-      setShowOthersDialog(true);
-      return;
+    if (step === 1) {
+      // If there are unselected party columns, go to step 2
+      if (unselectedPartyKeys.length > 0) {
+        // Default: all unselected party columns selected for "Other"
+        setSumOtherSet(new Set(unselectedPartyKeys));
+        setStep(2);
+        return;
+      }
+      // No unselected party columns — download directly
     }
 
-    // If all columns are selected, proceed with normal download
-    await performFilter([]);
+    await performFilter();
   };
 
   // Helper to map unique keys back to original column names
@@ -263,16 +289,24 @@ export function ColumnFilter({
     return map;
   }, [uniqueColumns]);
 
-  const performFilter = async (othersColumns: string[]) => {
+  // Helper to map unique keys directly to their column indices (for handling duplicates correctly)
+  const uniqueKeyToIndex = useMemo(() => {
+    const map: Record<string, number> = {};
+    for (const { uniqueKey, index } of uniqueColumns) {
+      map[uniqueKey] = index;
+    }
+    return map;
+  }, [uniqueColumns]);
+
+  const performFilter = async () => {
     setLoading(true);
     setError(null);
 
     try {
-      // Map unique keys back to original column names for the API
+      // Map unique keys back to original column names
       const columnsToInclude = Array.from(selectedColumns).map(key => uniqueKeyToOriginal[key] || key);
-      const othersOriginal = othersColumns.map(key => uniqueKeyToOriginal[key] || key);
+
       // Build header overrides so downloaded Excel uses abbreviated party labels
-      // e.g., "BHARATIYA JANATA PARTY" → "BJP Votes"
       const headerOverrides: Record<string, string> = {};
       for (const col of columnsToInclude) {
         const match = matchColumnLabel(col);
@@ -281,7 +315,67 @@ export function ColumnFilter({
         }
       }
 
-      await filterExcel(taskId, columnsToInclude, filename, othersOriginal, headerOverrides);
+      // Map manually selected "sum into Other" keys back to original column names
+      const sumOtherColumns: string[] = Array.from(sumOtherSet).map(
+        (key) => uniqueKeyToOriginal[key] || key
+      );
+
+      if (editedData) {
+        // Client-side filtering: use post-alliance data directly
+        const srcHeaders = editedData.headers;
+        const srcRows = editedData.rows;
+
+        // Build reverse mapping from selected unique keys to their indices
+        // This handles duplicate column names correctly
+        const selectedUniqueKeys = Array.from(selectedColumns);
+        const selectedIndices: number[] = selectedUniqueKeys
+          .map(key => uniqueKeyToIndex[key])
+          .filter(idx => idx !== undefined);
+
+        // Build filtered headers with overrides applied
+        const filteredHeaders = selectedIndices.map((i) => {
+          const orig = srcHeaders[i];
+          return headerOverrides[orig] || orig;
+        });
+
+        // Build filtered rows
+        let filteredRows: CellValue[][] = srcRows.map((row) =>
+          selectedIndices.map((i) => row[i])
+        );
+
+        // Compute "Others Votes" from unselected party columns
+        // Use indices directly to handle duplicate column names correctly
+        if (sumOtherSet.size > 0) {
+          const otherIndices: number[] = Array.from(sumOtherSet)
+            .map(key => uniqueKeyToIndex[key])
+            .filter(idx => idx !== undefined);
+
+          if (otherIndices.length > 0) {
+            console.log("ColumnFilter - Computing Others Votes from indices:", otherIndices);
+            filteredHeaders.push("Others Votes");
+            filteredRows = filteredRows.map((row, rowIdx) => {
+              let othersSum = 0;
+              for (const oi of otherIndices) {
+                const val = Number(srcRows[rowIdx][oi]);
+                if (!isNaN(val)) othersSum += val;
+              }
+              return [...row, othersSum];
+            });
+          }
+        }
+
+        await downloadModifiedExcel(taskId, filteredHeaders, filteredRows, filename);
+      } else {
+        // Backend filtering: original Excel file flow
+        await filterExcel(
+          taskId,
+          columnsToInclude,
+          filename,
+          headerOverrides,
+          sumOtherColumns.length > 0 ? sumOtherColumns : undefined
+        );
+      }
+
       onClose();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to filter Excel");
@@ -290,18 +384,8 @@ export function ColumnFilter({
     }
   };
 
-  const handleOthersDialogConfirm = () => {
-    if (selectedOthersColumns.size === 0) {
-      setError("Please select at least one column to include in OTHERS");
-      return;
-    }
-    setShowOthersDialog(false);
-    performFilter(Array.from(selectedOthersColumns));
-  };
-
   const allSelected = selectedColumns.size === allUniqueKeys.length;
   const someSelected = selectedColumns.size > 0 && selectedColumns.size < allUniqueKeys.length;
-  const totalColumnsToDownload = selectedColumns.size + (includeOthers ? 1 : 0);
 
   return (
     <>
@@ -320,251 +404,35 @@ export function ColumnFilter({
               <div className="px-4 py-3 border-b border-gray-200 flex items-center justify-between">
                 <div>
                   <h2 className="text-base font-bold text-gray-900">
-                    Select Columns to Export
+                    {step === 1 ? "Select Columns to Export" : "Sum into \"Other\" Column"}
                   </h2>
                   <p className="text-xs text-gray-600 mt-0.5">
-                    Choose which columns to include in your Excel file
+                    {step === 1
+                      ? "Choose which columns to include in your Excel file"
+                      : "Select which deselected party columns to sum into an \"Other\" column"}
                   </p>
                 </div>
-                <button
-                  onClick={onClose}
-                  className="text-gray-400 hover:text-gray-600 p-1 hover:bg-gray-100 rounded-lg transition-colors"
-                >
-                  <X className="w-5 h-5" />
-                </button>
+                <div className="flex items-center gap-2">
+                  {step === 2 && (
+                    <span className="text-[10px] text-gray-400 font-medium">Step 2 of 2</span>
+                  )}
+                  <button
+                    onClick={onClose}
+                    className="text-gray-400 hover:text-gray-600 p-1 hover:bg-gray-100 rounded-lg transition-colors"
+                  >
+                    <X className="w-5 h-5" />
+                  </button>
+                </div>
               </div>
 
               {/* Content */}
               <div className="flex-1 overflow-hidden flex flex-col gap-3 px-4 py-3">
-                {/* Search Box */}
-                <div className="relative">
-            <svg
-              className="absolute left-2.5 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400"
-              fill="none"
-              stroke="currentColor"
-              viewBox="0 0 24 24"
-            >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth={2}
-                d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"
-              />
-            </svg>
-            <input
-              type="text"
-              placeholder="Search columns or parties..."
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              className="w-full pl-9 pr-3 py-2 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-            />
-          </div>
-
-                {/* Select All / Deselect All */}
-                <div className="flex items-center justify-between">
-            <div className="flex items-center gap-3">
-              <button
-                onClick={() => setSelectedColumns(new Set(allUniqueKeys))}
-                className="text-xs text-blue-600 hover:text-blue-700 font-medium transition-colors"
-              >
-                Select All
-              </button>
-              <button
-                onClick={() => setSelectedColumns(new Set())}
-                className="text-xs text-blue-600 hover:text-blue-700 font-medium transition-colors"
-              >
-                Deselect All
-              </button>
-            </div>
-            <span className="text-xs text-gray-600">
-              <span className="font-semibold text-gray-900">{selectedColumns.size}</span> of {allUniqueKeys.length} selected
-            </span>
-          </div>
-
-                {/* Column List */}
-                <div className="flex-1 overflow-auto">
-            {filteredGroupKeys.length === 0 ? (
-              <div className="text-center py-6 text-gray-500">
-                <p className="text-sm">No columns match "{searchQuery}"</p>
-              </div>
-            ) : (
-              <div className="space-y-2">
-                {filteredGroupKeys.map((groupKey) => {
-                  const group = columnGroups[groupKey];
-                  const cols = group?.cols ?? [];
-                  const selected = isGroupSelected(groupKey);
-                  const partial = isGroupPartial(groupKey);
-                  const isHighlighted =
-                    !!searchQuery.trim() &&
-                    (groupKey.toLowerCase().includes(searchQuery.toLowerCase()) ||
-                      cols.some((c) => c.toLowerCase().includes(searchQuery.toLowerCase())));
-
-                  // Since we're showing each column separately, each group should have exactly 1 column
-                  const isSingle = cols.length === 1 && cols[0] === groupKey;
-                  
-                  // Get party label for display (if available)
-                  const match = matchColumnLabel(groupKey);
-                  const displayLabel = match?.label || groupKey;
-                  const colors = getPartyColors(displayLabel);
-
-                  // Determine badge type based on matched column type
-                  let badgeText = "Numeric";
-                  let badgeColor = colors.badge + " " + colors.badgeText;
-
-                  if (match?.type === "identifier") {
-                    badgeText = "ID";
-                    badgeColor = "bg-slate-100 text-slate-700";
-                  } else if (match?.type === "location") {
-                    badgeText = "Location";
-                    badgeColor = "bg-sky-100 text-sky-700";
-                  } else if (match?.type === "count" || groupKey.includes("TOTAL")) {
-                    badgeText = "Count";
-                    badgeColor = "bg-indigo-100 text-indigo-700";
-                  }
-
-                  return (
-                    <label
-                      key={groupKey}
-                      className={`flex items-start gap-2.5 p-3 rounded-lg border cursor-pointer transition-all ${
-                        selected
-                          ? `${colors.border} ${colors.bg}`
-                          : `${colors.border} bg-white hover:${colors.bg}`
-                      } ${isHighlighted ? "ring-1 ring-yellow-300" : ""}`}
-                    >
-                      <input
-                        type="checkbox"
-                        checked={selected}
-                        onChange={() => toggleColumn(groupKey)}
-                        className="w-4 h-4 text-blue-600 rounded mt-0.5"
-                      />
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-1.5 mb-0.5">
-                          <h3 className="font-semibold text-gray-900 text-sm truncate">{displayLabel}</h3>
-                          <span className={`px-1.5 py-0.5 ${badgeColor} text-xs font-medium rounded flex-shrink-0`}>
-                            {badgeText}
-                          </span>
-                        </div>
-                        {/* Show original column name if it differs from display label */}
-                        {groupKey !== displayLabel && (
-                          <p className="text-xs text-gray-600 truncate">{groupKey}</p>
-                        )}
-                      </div>
-                    </label>
-                  );
-                })}
-
-              </div>
-            )}
-          </div>
-
-                {/* Unselected Info */}
-                {unselectedColumns.length > 0 && (
-                  <div className="p-2.5 bg-blue-50 border border-blue-200 rounded-lg">
-              <div className="flex items-start gap-1.5">
-                <Info className="w-4 h-4 text-blue-600 flex-shrink-0 mt-0.5" />
-                <div className="flex-1">
-                  <p className="text-xs font-medium text-blue-900">
-                    {unselectedColumns.length} unselected column{unselectedColumns.length !== 1 ? 's' : ''}
-                  </p>
-                  <p className="text-xs text-blue-700 mt-0.5">
-                    Sum them into an "OTHERS" column?
-                  </p>
-                </div>
-              </div>
-            </div>
-          )}
-
-                {/* Error Message */}
-                {error && (
-                  <div className="bg-red-50 border border-red-200 rounded-lg p-2.5">
-              <div className="flex items-start gap-1.5">
-                <svg
-                  className="w-4 h-4 text-red-600 flex-shrink-0 mt-0.5"
-                  fill="none"
-                  stroke="currentColor"
-                  viewBox="0 0 24 24"
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth={2}
-                    d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
-                  />
-                </svg>
-                <p className="text-xs text-red-600">{error}</p>
-              </div>
-            </div>
-          )}
-              </div>
-
-              {/* Footer */}
-              <div className="flex items-center gap-2 px-4 py-3 border-t border-gray-200">
-                <Button
-                  variant="outline"
-                  onClick={onClose}
-                  disabled={loading}
-                  className="px-3 py-2 text-xs h-8"
-                >
-                  Cancel
-                </Button>
-                <Button
-                  onClick={handleSubmit}
-                  disabled={loading || selectedColumns.size === 0}
-                  className="flex-1 px-4 py-2 text-xs h-8 bg-blue-600 text-white hover:bg-blue-700 flex items-center justify-center gap-1.5"
-                >
-                  {loading ? (
-                    <>
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                      Processing...
-                    </>
-                  ) : (
-                    <>
-                      <Download className="h-4 w-4" />
-                      Continue
-                    </>
-                  )}
-                </Button>
-              </div>
-            </div>
-          </div>
-        </>
-      )}
-
-      {/* OTHERS Column Selection Dialog */}
-      {showOthersDialog && (
-        <>
-          {/* Backdrop with blur */}
-          <div
-            className="fixed inset-0 bg-black/50 backdrop-blur-sm z-40"
-            onClick={() => setShowOthersDialog(false)}
-          />
-
-          {/* Modal Content */}
-          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 pointer-events-none">
-            <div className="w-full max-w-md max-h-[75vh] bg-white rounded-xl shadow-2xl overflow-hidden flex flex-col pointer-events-auto">
-              {/* Header */}
-              <div className="px-4 py-2.5 border-b border-gray-200">
-                <div className="flex items-center justify-between mb-1">
-                  <h2 className="text-sm font-bold text-gray-900">
-                    Configure "OTHERS" Column
-                  </h2>
-                  <button
-                    onClick={() => setShowOthersDialog(false)}
-                    className="text-gray-400 hover:text-gray-600 p-1 hover:bg-gray-100 rounded transition-colors"
-                  >
-                    <X className="w-4 h-4" />
-                  </button>
-                </div>
-                <p className="text-xs text-gray-600">
-                  Select which unselected columns to sum into the "OTHERS" column
-                </p>
-
-                {/* Summary Bar */}
-                <div className="mt-2 p-2 bg-gradient-to-r from-blue-50 to-purple-50 rounded-lg">
-                  <div className="flex items-center justify-between text-xs">
-                    <div className="flex items-center gap-1.5">
+                {step === 1 ? (
+                  <>
+                    {/* Search Box */}
+                    <div className="relative">
                       <svg
-                        className="w-3.5 h-3.5 text-blue-600"
+                        className="absolute left-2.5 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400"
                         fill="none"
                         stroke="currentColor"
                         viewBox="0 0 24 24"
@@ -573,167 +441,274 @@ export function ColumnFilter({
                           strokeLinecap="round"
                           strokeLinejoin="round"
                           strokeWidth={2}
-                          d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
+                          d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"
                         />
                       </svg>
-                      <span className="font-medium text-gray-900">
-                        {unselectedColumns.length} unselected
+                      <input
+                        type="text"
+                        placeholder="Search columns or parties..."
+                        value={searchQuery}
+                        onChange={(e) => setSearchQuery(e.target.value)}
+                        className="w-full pl-9 pr-3 py-2 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                      />
+                    </div>
+
+                    {/* Select All / Deselect All */}
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-3">
+                        <button
+                          onClick={() => setSelectedColumns(new Set(allUniqueKeys))}
+                          className="text-xs text-blue-600 hover:text-blue-700 font-medium transition-colors"
+                        >
+                          Select All
+                        </button>
+                        <button
+                          onClick={() => setSelectedColumns(new Set())}
+                          className="text-xs text-blue-600 hover:text-blue-700 font-medium transition-colors"
+                        >
+                          Deselect All
+                        </button>
+                      </div>
+                      <span className="text-xs text-gray-600">
+                        <span className="font-semibold text-gray-900">{selectedColumns.size}</span> of {allUniqueKeys.length} selected
                       </span>
                     </div>
-                    <div className="flex items-center gap-2">
-                      <button
-                        onClick={() => setSelectedOthersColumns(new Set(unselectedColumns))}
-                        className="text-blue-600 hover:text-blue-700 font-medium text-xs"
-                      >
-                        Select All
-                      </button>
-                      <button
-                        onClick={() => setSelectedOthersColumns(new Set())}
-                        className="text-blue-600 hover:text-blue-700 font-medium text-xs"
-                      >
-                        Deselect All
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              </div>
 
-              {/* Content */}
-              <div className="flex-1 overflow-hidden flex flex-col gap-2.5 px-4 py-3">
-                {/* Column List */}
-                <div className="flex-1 overflow-auto">
-              {unselectedColumns.length === 0 ? (
-                <div className="text-center py-8">
-                  <svg
-                    className="w-12 h-12 text-gray-300 mx-auto mb-3"
-                    fill="none"
-                    stroke="currentColor"
-                    viewBox="0 0 24 24"
-                  >
-                    <path
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      strokeWidth={2}
-                      d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
-                    />
-                  </svg>
-                  <p className="text-gray-600 font-medium text-sm">All columns are selected</p>
-                  <p className="text-xs text-gray-500 mt-1">Unselect columns to use the OTHERS feature</p>
-                </div>
-              ) : (
-                <div className="space-y-1.5">
-                  {unselectedColumns.map((col) => {
-                    const isSelected = selectedOthersColumns.has(col);
-                    const match = matchColumnLabel(col);
-                    const displayLabel = match?.label || col;
-                    const colors = getPartyColors(displayLabel);
-
-                    return (
-                      <label
-                        key={col}
-                        className={`flex items-start gap-2 p-2.5 bg-gray-50 rounded-lg hover:bg-gray-100 cursor-pointer border ${
-                          isSelected
-                            ? "border-blue-300"
-                            : "border-gray-200"
-                        } hover:border-blue-300 transition-colors`}
-                      >
-                        <input
-                          type="checkbox"
-                          checked={isSelected}
-                          onChange={() => {
-                            setSelectedOthersColumns((prev) => {
-                              const next = new Set(prev);
-                              if (next.has(col)) {
-                                next.delete(col);
-                              } else {
-                                next.add(col);
-                              }
-                              return next;
-                            });
-                          }}
-                          className="w-4 h-4 text-blue-600 rounded mt-0.5"
-                        />
-                        <div className="flex-1 min-w-0">
-                          <p className="font-medium text-gray-900 text-sm truncate">{displayLabel}</p>
-                          {col !== displayLabel && (
-                            <p className="text-xs text-gray-600 mt-0.5 truncate">{col}</p>
-                          )}
+                    {/* Column List */}
+                    <div className="flex-1 overflow-auto">
+                      {filteredGroupKeys.length === 0 ? (
+                        <div className="text-center py-6 text-gray-500">
+                          <p className="text-sm">No columns match &quot;{searchQuery}&quot;</p>
                         </div>
-                      </label>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
+                      ) : (
+                        <div className="space-y-2">
+                          {filteredGroupKeys.map((groupKey) => {
+                            const group = columnGroups[groupKey];
+                            const cols = group?.cols ?? [];
+                            const selected = isGroupSelected(groupKey);
+                            const isHighlighted =
+                              !!searchQuery.trim() &&
+                              (groupKey.toLowerCase().includes(searchQuery.toLowerCase()) ||
+                                cols.some((c) => c.toLowerCase().includes(searchQuery.toLowerCase())));
 
-                {/* Info Box */}
-                <div className="p-2.5 bg-blue-50 border border-blue-200 rounded-lg">
-              <div className="flex items-start gap-1.5 text-xs">
-                <Info className="w-4 h-4 text-blue-600 flex-shrink-0 mt-0.5" />
-                <div className="flex-1">
-                  <p className="font-medium text-blue-900">
-                    {selectedOthersColumns.size} column{selectedOthersColumns.size !== 1 ? 's' : ''} will be summed into "OTHERS"
-                  </p>
-                  <p className="text-xs text-blue-700 mt-0.5">
-                    The OTHERS column will contain the sum of selected columns
-                  </p>
-                </div>
-              </div>
-            </div>
+                            const match = matchColumnLabel(groupKey);
+                            const displayLabel = match?.label || groupKey;
+                            const colors = getPartyColors(displayLabel);
+
+                            let badgeText = "Numeric";
+                            let badgeColor = colors.badge + " " + colors.badgeText;
+
+                            if (match?.type === "identifier") {
+                              badgeText = "ID";
+                              badgeColor = "bg-slate-100 text-slate-700";
+                            } else if (match?.type === "location") {
+                              badgeText = "Location";
+                              badgeColor = "bg-sky-100 text-sky-700";
+                            } else if (match?.type === "count" || groupKey.includes("TOTAL")) {
+                              badgeText = "Count";
+                              badgeColor = "bg-indigo-100 text-indigo-700";
+                            }
+
+                            return (
+                              <label
+                                key={groupKey}
+                                className={`flex items-start gap-2.5 p-3 rounded-lg border cursor-pointer transition-all ${
+                                  selected
+                                    ? `${colors.border} ${colors.bg}`
+                                    : `${colors.border} bg-white hover:${colors.bg}`
+                                } ${isHighlighted ? "ring-1 ring-yellow-300" : ""}`}
+                              >
+                                <input
+                                  type="checkbox"
+                                  checked={selected}
+                                  onChange={() => toggleColumn(groupKey)}
+                                  className="w-4 h-4 text-blue-600 rounded mt-0.5"
+                                />
+                                <div className="flex-1 min-w-0">
+                                  <div className="flex items-center gap-1.5 mb-0.5">
+                                    <h3 className="font-semibold text-gray-900 text-sm truncate">{displayLabel}</h3>
+                                    <span className={`px-1.5 py-0.5 ${badgeColor} text-xs font-medium rounded flex-shrink-0`}>
+                                      {badgeText}
+                                    </span>
+                                  </div>
+                                  {groupKey !== displayLabel && (
+                                    <p className="text-xs text-gray-600 truncate">{groupKey}</p>
+                                  )}
+                                </div>
+                              </label>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    {/* Step 2: Sum into "Other" column */}
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-3">
+                        <button
+                          onClick={() => setSumOtherSet(new Set(unselectedPartyKeys))}
+                          className="text-xs text-blue-600 hover:text-blue-700 font-medium transition-colors"
+                        >
+                          Select All
+                        </button>
+                        <button
+                          onClick={() => setSumOtherSet(new Set())}
+                          className="text-xs text-blue-600 hover:text-blue-700 font-medium transition-colors"
+                        >
+                          Deselect All
+                        </button>
+                      </div>
+                      <span className="text-xs text-gray-600">
+                        <span className="font-semibold text-gray-900">{sumOtherSet.size}</span> of {unselectedPartyKeys.length} selected
+                      </span>
+                    </div>
+
+                    <div className="flex-1 overflow-auto">
+                      <div className="space-y-2">
+                        {unselectedPartyKeys.map((key) => {
+                          const originalName = uniqueColumns.find(c => c.uniqueKey === key)?.originalName || key;
+                          const match = matchColumnLabel(originalName);
+                          const displayLabel = match?.label || key;
+                          const colors = getPartyColors(displayLabel);
+                          const checked = sumOtherSet.has(key);
+
+                          return (
+                            <label
+                              key={key}
+                              className={`flex items-start gap-2.5 p-3 rounded-lg border cursor-pointer transition-all ${
+                                checked
+                                  ? `${colors.border} ${colors.bg}`
+                                  : `${colors.border} bg-white hover:${colors.bg}`
+                              }`}
+                            >
+                              <input
+                                type="checkbox"
+                                checked={checked}
+                                onChange={() => {
+                                  setSumOtherSet((prev) => {
+                                    const next = new Set(prev);
+                                    if (next.has(key)) next.delete(key);
+                                    else next.add(key);
+                                    return next;
+                                  });
+                                }}
+                                className="w-4 h-4 text-amber-600 rounded mt-0.5"
+                              />
+                              <div className="flex-1 min-w-0">
+                                <div className="flex items-center gap-1.5 mb-0.5">
+                                  <h3 className="font-semibold text-gray-900 text-sm truncate">{displayLabel}</h3>
+                                  <span className="px-1.5 py-0.5 bg-amber-100 text-amber-700 text-xs font-medium rounded flex-shrink-0">
+                                    Party
+                                  </span>
+                                </div>
+                                {key !== displayLabel && (
+                                  <p className="text-xs text-gray-600 truncate">{key}</p>
+                                )}
+                              </div>
+                            </label>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  </>
+                )}
 
                 {/* Error Message */}
                 {error && (
                   <div className="bg-red-50 border border-red-200 rounded-lg p-2.5">
-                <div className="flex items-start gap-1.5">
-                  <svg
-                    className="w-4 h-4 text-red-600 flex-shrink-0 mt-0.5"
-                    fill="none"
-                    stroke="currentColor"
-                    viewBox="0 0 24 24"
-                  >
-                    <path
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      strokeWidth={2}
-                      d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
-                    />
-                  </svg>
-                  <p className="text-xs text-red-600">{error}</p>
-                </div>
-              </div>
-            )}
+                    <div className="flex items-start gap-1.5">
+                      <svg
+                        className="w-4 h-4 text-red-600 flex-shrink-0 mt-0.5"
+                        fill="none"
+                        stroke="currentColor"
+                        viewBox="0 0 24 24"
+                      >
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth={2}
+                          d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
+                        />
+                      </svg>
+                      <p className="text-xs text-red-600">{error}</p>
+                    </div>
+                  </div>
+                )}
               </div>
 
               {/* Footer */}
-              <div className="flex items-center gap-2 px-4 py-2.5 border-t border-gray-200">
-                <Button
-                  variant="outline"
-                  onClick={() => {
-                    setShowOthersDialog(false);
-                    setError(null);
-                  }}
-                  disabled={loading}
-                  className="px-3 py-1.5 text-xs h-8"
-                >
-                  Skip
-                </Button>
-                <Button
-                  onClick={handleOthersDialogConfirm}
-                  disabled={loading || selectedOthersColumns.size === 0}
-                  className="flex-1 px-3 py-1.5 text-xs h-8 bg-gradient-to-r from-blue-600 to-purple-600 text-white hover:from-blue-700 hover:to-purple-700 flex items-center justify-center gap-1.5"
-                >
-                  {loading ? (
-                    <>
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                      Processing...
-                    </>
-                  ) : (
-                    <>
-                      <Download className="h-4 w-4" />
-                      Download with OTHERS
-                    </>
-                  )}
-                </Button>
+              <div className="flex items-center gap-2 px-4 py-3 border-t border-gray-200">
+                {step === 1 ? (
+                  <>
+                    <Button
+                      variant="outline"
+                      onClick={onClose}
+                      disabled={loading}
+                      className="px-3 py-2 text-xs h-8"
+                    >
+                      Cancel
+                    </Button>
+                    <Button
+                      onClick={handleSubmit}
+                      disabled={loading || selectedColumns.size === 0}
+                      className="flex-1 px-4 py-2 text-xs h-8 bg-blue-600 text-white hover:bg-blue-700 flex items-center justify-center gap-1.5"
+                    >
+                      {loading ? (
+                        <>
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                          Processing...
+                        </>
+                      ) : (
+                        <>
+                          <ArrowRight className="h-4 w-4" />
+                          Continue
+                        </>
+                      )}
+                    </Button>
+                  </>
+                ) : (
+                  <>
+                    <Button
+                      variant="outline"
+                      onClick={() => setStep(1)}
+                      disabled={loading}
+                      className="px-3 py-2 text-xs h-8 flex items-center gap-1.5"
+                    >
+                      <ArrowLeft className="h-3.5 w-3.5" />
+                      Back
+                    </Button>
+                    <Button
+                      variant="outline"
+                      onClick={() => {
+                        setSumOtherSet(new Set());
+                        performFilter();
+                      }}
+                      disabled={loading}
+                      className="px-3 py-2 text-xs h-8"
+                    >
+                      Skip
+                    </Button>
+                    <Button
+                      onClick={handleSubmit}
+                      disabled={loading}
+                      className="flex-1 px-4 py-2 text-xs h-8 bg-blue-600 text-white hover:bg-blue-700 flex items-center justify-center gap-1.5"
+                    >
+                      {loading ? (
+                        <>
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                          Processing...
+                        </>
+                      ) : (
+                        <>
+                          <Download className="h-4 w-4" />
+                          Download
+                        </>
+                      )}
+                    </Button>
+                  </>
+                )}
               </div>
             </div>
           </div>

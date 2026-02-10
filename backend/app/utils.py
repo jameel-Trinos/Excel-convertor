@@ -240,13 +240,35 @@ def sanitize_text(value: Optional[str], single_line: bool = True) -> str:
     # Also check for common reversed patterns even without RTL marker
     elif text and _is_likely_reversed(text):
         original_text = text
-        text = text[::-1]
+        # Try character-level reversal first
+        char_reversed = text[::-1]
+        # Also try word-order reversal for multi-word text
+        words = text.split()
+        word_reversed = " ".join(reversed(words)) if len(words) > 1 else text
+        
+        # Score all options
+        original_score = _score_text_naturalness(original_text)
+        char_reversed_score = _score_text_naturalness(char_reversed)
+        word_reversed_score = _score_text_naturalness(word_reversed) if len(words) > 1 else -1
+        
+        # Choose the best option
+        best_text = original_text
+        best_score = original_score
+        
+        if char_reversed_score > best_score:
+            best_text = char_reversed
+            best_score = char_reversed_score
+        
+        if word_reversed_score > best_score:
+            best_text = word_reversed
+            best_score = word_reversed_score
+        
+        text = best_text
+        
         # Verify the fix improved the text (not double-reversed)
         if _is_likely_reversed(text):
             # If still reversed, might be incorrectly detected - check scores
-            original_score = _score_text_naturalness(original_text)
-            fixed_score = _score_text_naturalness(text)
-            if original_score >= fixed_score:
+            if original_score >= _score_text_naturalness(text):
                 # Original was better, don't reverse
                 text = original_text
 
@@ -279,7 +301,17 @@ def _score_text_naturalness(text: str) -> float:
         'POLLING', 'STATION', 'ELECTOR', 'OVERSEAS', 'VALID',
         'VOTES', 'CANDIDATE', 'PARTY', 'ABBREVIATION', 'TOTAL',
         'REJECTED', 'TENDERED', 'NOTA', 'BUILDING', 'LOCATION',
-        'AREA', 'AREAS', 'SIVAPURAM', 'PITCHIVAKKAM', 'EDAIYARPAKKAM'
+        'AREA', 'AREAS', 'SIVAPURAM', 'PITCHIVAKKAM', 'EDAIYARPAKKAM',
+        # Booth/constituency location terms
+        'SCHOOL', 'PANCHAYAT', 'PRIMARY', 'UNION', 'GOVERNMENT',
+        'COMMUNITY', 'HALL', 'HIGH', 'MIDDLE', 'SIDE', 'RIGHT',
+        'LEFT', 'NORTH', 'SOUTH', 'EAST', 'WEST', 'FACING',
+        'VOTERS', 'ELECTORS',
+        # Tamil political party names (when correct)
+        'DRAVIDA', 'MUNNETRA', 'KAZHAGAM', 'KATCHI', 'ANNA',
+        'NAGARAJAN', 'CHANDRASEKHAR', 'MAKKAL', 'NEEDHI', 'SIVASAN',
+        'INDIA', 'ALL', 'INDEPENDENT', 'CONGRESS', 'BHARATIYA',
+        'JANATA', 'SAMATA', 'PURATCHI', 'KATCHI',
     ]
     
     # Tamil place name endings (when correct)
@@ -317,7 +349,18 @@ def _score_text_naturalness(text: str) -> float:
     
     # Penalty for reversed patterns
     reversed_penalty = 0
-    reversed_indicators = ['TEERTS', 'DRAW', 'RAGAN', 'SROTCEL', 'SAESREVO', 'MARUPAVIS']
+    reversed_indicators = [
+        'TEERTS', 'DRAW', 'RAGAN', 'SROTCEL', 'SAESREVO', 'MARUPAVIS',
+        # Booth/constituency location reversed indicators
+        'LOOHCS', 'TAYAHCNAP', 'YRAMIRP', 'NOINU', 'TNEMNREVOG',
+        'YTINUMMOC', 'LLAH', 'GNIDLIUB', 'HGIH', 'ELDDIIM',
+        'EDIS', 'THGIR', 'TFEL', 'GNICAF', 'SRETOV',
+        # Reversed Tamil party name patterns
+        'MAGAHZAK', 'ISARALIMAT', 'ARTENNUM', 'ADIVARD',  # DRAVIDA MUNNETRA KAZHAGAM reversed
+        'IHCTAK', 'AYIRPAGUMNAHS', 'RALIMAT', 'MAAN',  # Common reversed party patterns
+        'NAMAK', 'KAGAZ', 'ARTENNUM', 'ADIVARD',  # More reversed patterns
+        'KATCHI', 'IHCTAK',  # KATCHI reversed
+    ]
     for indicator in reversed_indicators:
         if indicator in clean_text:
             reversed_penalty += 5
@@ -406,6 +449,20 @@ def _is_likely_reversed(text: str) -> bool:
         "KMDMD",             # MDMK
         "IPC",               # CPI
         "MPC",               # CPM
+        # Corrupted/reversed Tamil party names (from OCR issues)
+        "MAGAHZAK",          # KAZHAGAM reversed/corrupted
+        "ISARALIMAT",        # TAMIL/party name reversed
+        "ARTENNUM",          # MUNNETRA reversed
+        "ADIVARD",           # DRAVIDA reversed
+        "IHCTAK",            # KATCHI reversed
+        "AYIRPAGUMNAHS",     # SHNAMGAPIRYA (corrupted)
+        "RALIMAT",           # TAMILAR reversed
+        "MAAN",              # NAAM reversed
+        "NAMAK",             # KAMAN reversed
+        "KAGAZ",             # ZAGAK (corrupted)
+        "ARTENNUM ADIVARD",  # DRAVIDA MUNNETRA reversed
+        "MAGAHZAK.A",        # A.KAZHAGAM reversed
+        "IHCTAK.M",          # M.KATCHI reversed
         # Common Tamil name patterns (reversed)
         "NAR",               # RAN (common ending)
         "MAR",               # RAM
@@ -452,13 +509,53 @@ def _is_likely_reversed(text: str) -> bool:
         "daor teertS",       # Street road (reversed)
         "udan teertS",       # Street nadu (reversed)
         "liokanajaB teertS", # Street Bajakanoli (reversed)
+        # Booth/constituency location reversed patterns (UPPERCASE)
+        # These are critical for detecting reversed booth location data
+        "LOOHCS",            # SCHOOL reversed
+        "TAYAHCNAP",         # PANCHAYAT reversed
+        "YRAMIRP",           # PRIMARY reversed
+        "NOINU",             # UNION reversed
+        "TNEMNREVOG",        # GOVERNMENT reversed
+        "YTINUMMOC",         # COMMUNITY reversed
+        "LLAH",              # HALL reversed
+        "GNIDLIUB",          # BUILDING reversed
+        "HGIH",              # HIGH reversed
+        "ELDDIIM",           # MIDDLE reversed
+        "EDIS",              # SIDE reversed (as in LEFT SIDE / RIGHT SIDE)
+        "THGIR",             # RIGHT reversed
+        "TFEL",              # LEFT reversed
+        "HTRON",             # NORTH reversed
+        "HTUOS",             # SOUTH reversed
+        "TSAE",              # EAST reversed
+        "TSEW",              # WEST reversed
+        "GNICAF",            # FACING reversed
+        "loohcS",            # School reversed (mixed case)
+        "tayahcnaP",         # Panchayat reversed
+        "yramirP",           # Primary reversed
+        "noinU",             # Union reversed
+        "tnemnrevoG",        # Government reversed
+        "ytinummoC",         # Community reversed
+        "llaH",              # Hall reversed
+        "gnidliuB",          # Building reversed
+        "hgiH",              # High reversed
+        "elddiM",            # Middle reversed
+        "SRETOV LLA",        # ALL VOTERS reversed
+        "sretov llA",        # All voters reversed
+        "SRETOV",            # VOTERS reversed
+        "sretoV",            # Voters reversed
+        "SROTCELE SAESREVO", # OVERSEAS ELECTORS reversed
     ]
     
     # Check for corrupted text patterns (reversed street names, addresses)
     # Pattern: words ending with common reversed suffixes
     words = text_stripped.split()
     if len(words) > 1:
-        reversed_suffixes = ["teertS", "draw", "ragaN", "rayireP", "ssorC", "srotcelE", "saesrevO", "marupaviS", "ynoloc"]
+        reversed_suffixes = [
+            "teertS", "draw", "ragaN", "rayireP", "ssorC", "srotcelE", "saesrevO", "marupaviS", "ynoloc",
+            # Uppercase booth location reversed suffixes
+            "LOOHCS", "TAYAHCNAP", "YRAMIRP", "NOINU", "TNEMNREVOG", "YTINUMMOC", "LLAH", "GNIDLIUB",
+            "loohcS", "tayahcnaP", "yramirP", "noinU", "tnemnrevoG", "ytinummoC", "llaH", "gnidliuB",
+        ]
         for word in words:
             for suffix in reversed_suffixes:
                 if word.endswith(suffix) or word.startswith(suffix):
@@ -478,12 +575,36 @@ def _is_likely_reversed(text: str) -> bool:
             return True
     
     # Check if starts with punctuation (often indicates reversed text)
-    # This includes closing parentheses/brackets which are common in reversed text
+    # This includes closing parentheses/brackets and dash which are common in reversed text
     if text_stripped and text_stripped[0] in ".,;:)]}" and len(text_stripped) > 1:
         # Check if reversing makes it start with a letter or opening bracket
         reversed_text = text_stripped[::-1]
         if reversed_text[0].isalpha() or reversed_text[0] in "[({":
             return True
+
+    # Check for reversed short location names starting with "- " or "-"
+    # Pattern: "- ILIKEHT" is reversed "THEKILI -" (place name with dash suffix)
+    if text_stripped.startswith("- ") and len(text_stripped) > 3:
+        name_part = text_stripped[2:].strip()
+        if name_part and name_part.isalpha() and name_part.isupper():
+            # Check if reversing gives a more natural name (ends with common Tamil endings)
+            reversed_name = name_part[::-1]
+            tamil_endings = ['AI', 'AM', 'UR', 'AR', 'AY', 'IN', 'AN', 'AL', 'IL', 'UL', 'BI', 'DI', 'LI', 'HI']
+            if any(reversed_name.upper().endswith(ending) for ending in tamil_endings):
+                return True
+            # Also check bigram naturalness for the name
+            if len(name_part) >= 5:
+                fwd_score = _score_text_naturalness(name_part)
+                rev_score = _score_text_naturalness(reversed_name)
+                if rev_score > fwd_score:
+                    return True
+    elif text_stripped.startswith("-") and len(text_stripped) > 2 and text_stripped[1].isalpha():
+        name_part = text_stripped[1:].strip()
+        if name_part and name_part.isalpha() and name_part.isupper():
+            reversed_name = name_part[::-1]
+            tamil_endings = ['AI', 'AM', 'UR', 'AR', 'AY', 'IN', 'AN', 'AL', 'IL', 'UL', 'BI', 'DI', 'LI', 'HI', 'NY']
+            if any(reversed_name.upper().endswith(ending) for ending in tamil_endings):
+                return True
     
     # Context-aware detection: If text contains polling area keywords, be more aggressive
     # Check for known polling area context words that suggest this is polling area text
