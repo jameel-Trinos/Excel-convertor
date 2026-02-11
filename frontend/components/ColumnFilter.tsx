@@ -125,16 +125,13 @@ export function ColumnFilter({
     }
   }, [isOpen, allUniqueKeys]);
 
-  // Compute unselected party columns (candidates for "Other" summing)
+  // Compute unselected columns (candidates for "Other" summing)
+  // Show ALL unselected columns so the user can pick which to sum into "Others Votes"
   const unselectedPartyKeys = useMemo(() => {
     return allUniqueKeys.filter((key) => {
-      if (selectedColumns.has(key)) return false;
-      const originalName = uniqueColumns.find(c => c.uniqueKey === key)?.originalName || key;
-      const match = matchColumnLabel(originalName);
-      // Only party vote columns are candidates for "Other"
-      return match?.type === "party";
+      return !selectedColumns.has(key);
     });
-  }, [allUniqueKeys, selectedColumns, uniqueColumns]);
+  }, [allUniqueKeys, selectedColumns]);
 
   // Clean up sumOtherSet: remove keys that are no longer unselected party columns
   // (e.g. user re-selected a column). User manually checks the ones they want summed.
