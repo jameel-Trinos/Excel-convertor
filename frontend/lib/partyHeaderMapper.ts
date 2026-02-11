@@ -106,12 +106,20 @@ const PARTIES: PartyDefinition[] = [
     ],
   },
   {
+    label: "NCP Votes",
+    abbreviations: ["NCP"],
+    variants: [
+      "NATIONALIST CONGRESS PARTY",
+      "N.C.P.",
+      "N C P",
+    ],
+  },
+  {
     label: "CONGRESS Votes",
     abbreviations: ["CONGRESS", "INC"],
     variants: [
       "INDIAN NATIONAL CONGRESS",
       "CONGRESS",
-      "NATIONAL CONGRESS",
       "I.N.C.",
       "I N C",
     ],
