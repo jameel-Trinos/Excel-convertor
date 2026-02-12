@@ -298,3 +298,10 @@ class AddBoothNameColumnRequest(BaseModel):
 
     task_id: str = Field(..., description="Task ID of the Excel file")
     source_column: str = Field(..., description="Column name to extract booth names from")
+
+
+class NormalizeColumnRequest(BaseModel):
+    """Request model for normalizing a column."""
+
+    task_id: str = Field(..., description="Task ID of the Excel file")
+    column_name: str = Field(..., description="Column name to normalize")

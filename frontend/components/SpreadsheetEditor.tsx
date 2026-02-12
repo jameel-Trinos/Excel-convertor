@@ -26,27 +26,23 @@ import {
   applyGeocoding,
   cancelGeocoding,
   addBoothNameColumn,
+  normalizeColumn,
+  normalizeHeaders,
 } from "@/lib/api";
 import {
   startTranslation,
   subscribeToTranslateProgress,
-  downloadTranslatedExcel,
   getTranslateStatus,
+  downloadTranslatedExcel,
   getTranslatedFullPreview,
 } from "@/lib/translation-api";
 import type {
-  FullPreviewData,
   CellValue,
-  GeocodeProgressEvent,
-  TranslateProgressEvent,
+  FullPreviewData,
   Language,
+  TranslateProgressEvent,
+  GeocodeProgressEvent,
 } from "@/types";
-
-function safeNumber(val: CellValue): number {
-  if (val === null || val === undefined || val === "") return 0;
-  const n = Number(val);
-  return isNaN(n) ? 0 : n;
-}
 
 interface SpreadsheetEditorProps {
   isOpen: boolean;
@@ -54,16 +50,9 @@ interface SpreadsheetEditorProps {
   taskId: string;
   filename: string;
   onFilterColumns?: () => void;
-  isBoothView?: boolean;
   onColumnsChange?: (columns: string[]) => void;
   onDataChange?: (data: { headers: string[]; rows: CellValue[][] }) => void;
-}
-
-interface ContextMenuPosition {
-  x: number;
-  y: number;
-  row: number;
-  col: number;
+  isBoothView?: boolean;
 }
 
 export function SpreadsheetEditor({
@@ -72,50 +61,77 @@ export function SpreadsheetEditor({
   taskId,
   filename,
   onFilterColumns,
-  isBoothView = false,
   onColumnsChange,
   onDataChange,
+  isBoothView = false,
 }: SpreadsheetEditorProps) {
-  const [previewData, setPreviewData] = useState<FullPreviewData | null>(null);
-  const [loading, setLoading] = useState(true);
+  // Preview and editing state
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [downloading, setDownloading] = useState(false);
+  const [previewData, setPreviewData] = useState<FullPreviewData | null>(null);
   const [editedData, setEditedData] = useState<{
     headers: string[];
     rows: CellValue[][];
   } | null>(null);
-  const [contextMenu, setContextMenu] = useState<ContextMenuPosition | null>(null);
-  const contextMenuRef = useRef<HTMLDivElement>(null);
+  const [downloading, setDownloading] = useState(false);
+
+  // Translation state
+  const [currentLanguage, setCurrentLanguage] = useState<Language>("original");
+  const [showLanguageDropdown, setShowLanguageDropdown] = useState(false);
+  const [translating, setTranslating] = useState(false);
+  const [translationProgress, setTranslationProgress] = useState(0);
+  const [translationProgressMessage, setTranslationProgressMessage] = useState("");
+  const [availableTranslations, setAvailableTranslations] = useState<{
+    tamil: boolean;
+    hindi: boolean;
+    english: boolean;
+  }>({ tamil: false, hindi: false, english: false });
+  const translateUnsubscribeRef = useRef<(() => void) | null>(null);
 
   // Geocoding state
   const [geocodeDialogOpen, setGeocodeDialogOpen] = useState(false);
   const [geocoding, setGeocoding] = useState(false);
-  const [geocodeProgress, setGeocodeProgress] = useState<GeocodeProgressEvent | null>(null);
   const [geocodeTaskId, setGeocodeTaskId] = useState<string | null>(null);
+  const [geocodeProgress, setGeocodeProgress] = useState<GeocodeProgressEvent | null>(null);
+  const [geocodeResult, setGeocodeResult] = useState<{
+    successful: number;
+    failed: number;
+  } | null>(null);
   const [selectedAddressColumn, setSelectedAddressColumn] = useState<string>("");
-  const [regionHint, setRegionHint] = useState("Tamil Nadu, India");
   const [useRegionHint, setUseRegionHint] = useState(true);
-  const [geocodeResult, setGeocodeResult] = useState<{ successful: number; failed: number } | null>(null);
+  const [regionHint, setRegionHint] = useState("Tamil Nadu, India");
   const geocodeUnsubscribeRef = useRef<(() => void) | null>(null);
 
-  // Translation state
-  const [currentLanguage, setCurrentLanguage] = useState<Language>("original");
-  const [translating, setTranslating] = useState(false);
-  const [translationProgress, setTranslationProgress] = useState(0);
-  const [translationProgressMessage, setTranslationProgressMessage] = useState("");
-  const [showLanguageDropdown, setShowLanguageDropdown] = useState(false);
-  const [availableTranslations, setAvailableTranslations] = useState({
-    tamil: false,
-    hindi: false,
-    english: false,
-  });
-  const translateUnsubscribeRef = useRef<(() => void) | null>(null);
+  // Context menu state
+  const [contextMenu, setContextMenu] = useState<{
+    x: number;
+    y: number;
+    row: number;
+    col: number;
+  } | null>(null);
+  const contextMenuRef = useRef<HTMLDivElement>(null);
+
+  // Utility: convert cell value to number safely
+  const safeNumber = (val: CellValue): number => {
+    if (typeof val === "number") return val;
+    if (typeof val === "string") {
+      const parsed = parseFloat(val.replace(/,/g, ""));
+      return isNaN(parsed) ? 0 : parsed;
+    }
+    return 0;
+  };
+
   const languageDropdownRef = useRef<HTMLDivElement>(null);
 
   // Booth name column state
   const [boothNameDialogOpen, setBoothNameDialogOpen] = useState(false);
   const [selectedSourceColumn, setSelectedSourceColumn] = useState<string>("");
   const [addingBoothName, setAddingBoothName] = useState(false);
+
+  // Normalization state
+  const [normalizationDialogOpen, setNormalizationDialogOpen] = useState(false);
+  const [normalizing, setNormalizing] = useState(false);
+  const [selectedNormalizeColumn, setSelectedNormalizeColumn] = useState<string>("");
 
   // Alliance state
   const [allianceModalOpen, setAllianceModalOpen] = useState(false);
@@ -545,26 +561,26 @@ export function SpreadsheetEditor({
     if (editedData && editedData.headers.length > 0) {
       // Try to auto-select the address column with better detection
       const addressKeywords = [
-        "address", "location", "building", "place", "area", 
+        "address", "location", "building", "place", "area",
         "street", "road", "venue", "site", "premises"
       ];
-      
+
       // First, try exact matches or strong keyword matches
       let addressColumnIndex = editedData.headers.findIndex((h) => {
         const headerLower = h.toLowerCase();
-        return addressKeywords.some(keyword => 
-          headerLower.includes(keyword) || 
+        return addressKeywords.some(keyword =>
+          headerLower.includes(keyword) ||
           headerLower === keyword ||
           headerLower.startsWith(keyword + " ") ||
           headerLower.endsWith(" " + keyword)
         );
       });
-      
+
       // If no match found, use first column as fallback
       if (addressColumnIndex < 0) {
         addressColumnIndex = 0;
       }
-      
+
       setSelectedAddressColumn(editedData.headers[addressColumnIndex]);
     } else {
       // If no data, set empty string
@@ -656,8 +672,8 @@ export function SpreadsheetEditor({
       geocodeUnsubscribeRef.current = unsubscribe;
     } catch (err) {
       console.error("Failed to start geocoding:", err);
-      const errorMessage = err instanceof Error 
-        ? err.message 
+      const errorMessage = err instanceof Error
+        ? err.message
         : "Failed to start geocoding. Please check your connection and try again.";
       setError(errorMessage);
       setGeocoding(false);
@@ -718,8 +734,8 @@ export function SpreadsheetEditor({
       setBoothNameDialogOpen(false);
     } catch (err) {
       console.error("Failed to add booth name column:", err);
-      const errorMessage = err instanceof Error 
-        ? err.message 
+      const errorMessage = err instanceof Error
+        ? err.message
         : "Failed to add booth name column. Please try again.";
       setError(errorMessage);
     } finally {
@@ -731,6 +747,100 @@ export function SpreadsheetEditor({
     setBoothNameDialogOpen(false);
     setError(null);
   }, []);
+
+  // Normalization handlers
+  const handleNormalizeColumn = useCallback(async () => {
+    if (!taskId || !editedData || !selectedNormalizeColumn) {
+      setError("Missing required data. Please ensure the spreadsheet is loaded and a column is selected.");
+      return;
+    }
+
+    if (!editedData.headers.includes(selectedNormalizeColumn)) {
+      setError(`Column "${selectedNormalizeColumn}" not found.`);
+      return;
+    }
+
+    setNormalizing(true);
+    setError(null);
+
+    try {
+      const result = await normalizeColumn(taskId, selectedNormalizeColumn);
+
+      // Update data
+      setEditedData({
+        headers: result.headers,
+        rows: result.rows,
+      });
+
+      // Update preview
+      setPreviewData(result);
+
+      setNormalizationDialogOpen(false);
+    } catch (err) {
+      console.error("Failed to normalize column:", err);
+      const errorMessage = err instanceof Error
+        ? err.message
+        : "Failed to normalize column. Please try again.";
+      setError(errorMessage);
+    } finally {
+      setNormalizing(false);
+    }
+  }, [taskId, editedData, selectedNormalizeColumn]);
+
+  const openNormalizationDialog = useCallback(() => {
+    if (editedData && editedData.headers.length > 0) {
+      // Try to auto-select "Party" column
+      const partyKeywords = ["party", "abbreviation", "candidate"];
+      let colIndex = editedData.headers.findIndex(h => {
+        const lower = h.toLowerCase();
+        return partyKeywords.some(k => lower.includes(k));
+      });
+
+      if (colIndex < 0) colIndex = 0;
+      setSelectedNormalizeColumn(editedData.headers[colIndex]);
+    } else {
+      setSelectedNormalizeColumn("");
+    }
+    setNormalizationDialogOpen(true);
+    setError(null);
+  }, [editedData]);
+
+
+  const handleNormalizeHeaders = useCallback(async () => {
+    if (!taskId || !editedData) {
+      setError("Missing required data.");
+      return;
+    }
+
+    setNormalizing(true);
+    setError(null);
+
+    try {
+      const result = await normalizeHeaders(taskId);
+
+      // Update data
+      setEditedData({
+        headers: result.headers,
+        rows: result.rows,
+      });
+
+      // Update preview
+      setPreviewData(result);
+
+      // Notify parent
+      onColumnsChange?.(result.headers);
+      onDataChange?.({ headers: result.headers, rows: result.rows });
+
+    } catch (err) {
+      console.error("Failed to normalize headers:", err);
+      const errorMessage = err instanceof Error
+        ? err.message
+        : "Failed to normalize headers. Please try again.";
+      setError(errorMessage);
+    } finally {
+      setNormalizing(false);
+    }
+  }, [taskId, editedData, onColumnsChange, onDataChange]);
 
   // Cleanup geocoding subscription on unmount
   useEffect(() => {
@@ -765,679 +875,695 @@ export function SpreadsheetEditor({
 
   return (
     <>
-    <DialogPrimitive.Root open={isOpen} onOpenChange={onClose}>
-      <DialogPrimitive.Portal>
-        <DialogPrimitive.Overlay className="fixed inset-0 z-50 bg-black/50" />
-        <DialogPrimitive.Content
-          className="fixed inset-0 z-50 bg-white flex flex-col"
-          style={{ width: '100vw', height: '100vh', maxWidth: '100vw', maxHeight: '100vh' }}
-          aria-describedby="spreadsheet-description"
-        >
-          <DialogPrimitive.Title className="sr-only">
-            {previewData?.document_title || outputFilename || "Spreadsheet Editor"}
-          </DialogPrimitive.Title>
-          <DialogPrimitive.Description id="spreadsheet-description" className="sr-only">
-            {editedData ? `Edit and download spreadsheet with ${editedData.rows.length} rows and ${editedData.headers.length} columns` : "Loading spreadsheet data"}
-          </DialogPrimitive.Description>
+      <DialogPrimitive.Root open={isOpen} onOpenChange={onClose}>
+        <DialogPrimitive.Portal>
+          <DialogPrimitive.Overlay className="fixed inset-0 z-50 bg-black/50" />
+          <DialogPrimitive.Content
+            className="fixed inset-0 z-50 bg-white flex flex-col"
+            style={{ width: '100vw', height: '100vh', maxWidth: '100vw', maxHeight: '100vh' }}
+            aria-describedby="spreadsheet-description"
+          >
+            <DialogPrimitive.Title className="sr-only">
+              {previewData?.document_title || outputFilename || "Spreadsheet Editor"}
+            </DialogPrimitive.Title>
+            <DialogPrimitive.Description id="spreadsheet-description" className="sr-only">
+              {editedData ? `Edit and download spreadsheet with ${editedData.rows.length} rows and ${editedData.headers.length} columns` : "Loading spreadsheet data"}
+            </DialogPrimitive.Description>
 
-          {/* Header */}
-          <header className="bg-white border-b border-gray-200 h-16 flex items-center px-6 sticky top-0 z-50 shrink-0">
-            <div className="flex items-center justify-between w-full">
-              <div className="flex items-center gap-4">
-                <button
-                  type="button"
-                  onClick={onClose}
-                  className="text-gray-600 hover:text-gray-900 p-2 hover:bg-gray-100 rounded-lg transition-colors"
-                  aria-label="Close"
-                >
-                  <X className="w-6 h-6" />
-                </button>
-                <div>
-                  <h1 className="text-lg font-semibold text-gray-900">
-                    {outputFilename}
-                  </h1>
-                  {editedData && (
-                    <p className="text-xs text-gray-500">
-                      {editedData.rows.length} rows × {editedData.headers.length} columns
-                    </p>
-                  )}
-                </div>
-              </div>
-
-              <div className="flex items-center gap-3">
-                {isBoothView && (
+            {/* Header */}
+            <header className="bg-white border-b border-gray-200 h-16 flex items-center px-6 sticky top-0 z-50 shrink-0">
+              <div className="flex items-center justify-between w-full">
+                <div className="flex items-center gap-4">
                   <button
                     type="button"
-                    onClick={() => {
-                      if (editedData && editedData.headers.length > 0) {
-                        setSelectedSourceColumn(editedData.headers[0]);
-                      }
-                      setBoothNameDialogOpen(true);
-                    }}
-                    disabled={loading || !!error || !editedData}
-                    className="flex items-center gap-2 px-4 py-2 bg-white border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                    onClick={onClose}
+                    className="text-gray-600 hover:text-gray-900 p-2 hover:bg-gray-100 rounded-lg transition-colors"
+                    aria-label="Close"
                   >
-                    <Edit className="w-4 h-4" />
-                    Edit
+                    <X className="w-6 h-6" />
                   </button>
-                )}
-                {onFilterColumns && (
-                  <button
-                    type="button"
-                    onClick={onFilterColumns}
-                    disabled={loading || !!error}
-                    className="flex items-center gap-2 px-4 py-2 bg-white border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                  >
-                    <Filter className="w-4 h-4" />
-                    Filter Columns
-                  </button>
-                )}
-
-                {!isBoothView && (
-                  <>
-                    <div className="relative" ref={allianceDropdownRef}>
-                      <button
-                        type="button"
-                        onClick={() => !allianceApplied && setAllianceDropdownOpen(!allianceDropdownOpen)}
-                        disabled={loading || !!error || allianceApplied}
-                        className="flex items-center gap-2 px-4 py-2 bg-white border border-blue-300 text-blue-700 rounded-lg hover:bg-blue-50 font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                      >
-                        <Users className="w-4 h-4" />
-                        Add Alliance
-                        <ChevronDown className="w-4 h-4" />
-                      </button>
-
-                      {allianceDropdownOpen && (
-                        <div className="absolute top-full right-0 mt-1 w-48 bg-white border border-gray-300 rounded-lg shadow-lg z-10 overflow-hidden">
-                          <button
-                            onClick={() => {
-                              setSelectedAllianceType("loksabha");
-                              setAllianceDropdownOpen(false);
-                              setAllianceModalOpen(true);
-                            }}
-                            className="w-full px-4 py-2.5 text-left hover:bg-blue-50 transition-colors text-sm font-medium text-gray-700 flex items-center gap-2"
-                          >
-                            Loksabha
-                          </button>
-                          <button
-                            onClick={() => {
-                              setSelectedAllianceType("assembly");
-                              setAllianceDropdownOpen(false);
-                              setAllianceModalOpen(true);
-                            }}
-                            className="w-full px-4 py-2.5 text-left hover:bg-blue-50 transition-colors text-sm font-medium text-gray-700 flex items-center gap-2 border-t border-gray-100"
-                          >
-                            Assembly
-                          </button>
-                        </div>
-                      )}
-                    </div>
-                    {allianceApplied && (
-                      <button
-                        type="button"
-                        onClick={handleResetAlliance}
-                        className="flex items-center gap-2 px-4 py-2 bg-white border border-red-300 text-red-700 rounded-lg hover:bg-red-50 font-medium transition-colors"
-                      >
-                        <RotateCcw className="w-4 h-4" />
-                        Reset Alliance
-                      </button>
+                  <div>
+                    <h1 className="text-lg font-semibold text-gray-900">
+                      {outputFilename}
+                    </h1>
+                    {editedData && (
+                      <p className="text-xs text-gray-500">
+                        {editedData.rows.length} rows × {editedData.headers.length} columns
+                      </p>
                     )}
-                  </>
-                )}
-
-                {allianceWarnings.length > 0 && (
-                  <div className="flex items-center gap-2 px-3 py-1.5 bg-yellow-50 border border-yellow-200 rounded-lg">
-                    <AlertCircle className="w-4 h-4 text-yellow-600 flex-shrink-0" />
-                    <span className="text-xs text-yellow-700">
-                      {allianceWarnings.length} column{allianceWarnings.length > 1 ? "s" : ""} not found
-                    </span>
                   </div>
-                )}
+                </div>
 
-                <button
-                  type="button"
-                  onClick={openGeocodeDialog}
-                  disabled={loading || !!error || geocoding}
-                  className="flex items-center gap-2 px-4 py-2 bg-white border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  <MapPin className="w-4 h-4" />
-                  Geocode Addresses
-                </button>
+                <div className="flex items-center gap-3">
+                  {isBoothView && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (editedData && editedData.headers.length > 0) {
+                          setSelectedSourceColumn(editedData.headers[0]);
+                        }
+                        setBoothNameDialogOpen(true);
+                      }}
+                      disabled={loading || !!error || !editedData}
+                      className="flex items-center gap-2 px-4 py-2 bg-white border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      <Edit className="w-4 h-4" />
+                      Edit
+                    </button>
+                  )}
+                  {/* Removed Normalize (column) button, only Normalize Header remains */}
 
-                {/* Language Dropdown */}
-                <div className="relative" ref={languageDropdownRef}>
                   <button
                     type="button"
-                    onClick={() => !translating && !loading && !error && setShowLanguageDropdown(!showLanguageDropdown)}
-                    disabled={loading || !!error || translating}
-                    className="flex items-center gap-2 px-4 py-2 bg-white border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed min-w-[180px] justify-between"
-                    title={translationProgressMessage || undefined}
+                    onClick={handleNormalizeHeaders}
+                    disabled={loading || !!error || !editedData || normalizing}
+                    className="flex items-center gap-2 px-4 py-2 bg-white border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                    title="Rename headers from Candidate Names to Party Names"
                   >
-                    {translating ? (
-                      <>
-                        <Loader2 className="w-4 h-4 animate-spin" />
-                        <span className="flex-1">Translating... {Math.round(translationProgress)}%</span>
-                      </>
+                    {normalizing ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
                     ) : (
-                      <>
-                        <Languages className="w-4 h-4" />
-                        <span className="flex-1 text-left">{getCurrentLanguageDisplay()}</span>
-                        <ChevronDown className="w-4 h-4" />
-                      </>
+                      <Edit className="w-4 h-4" />
                     )}
+                    Normalize Header
                   </button>
 
-                  {showLanguageDropdown && !translating && (
-                    <div className="absolute top-full right-0 mt-1 w-full bg-white border border-gray-300 rounded-lg shadow-lg z-10 overflow-hidden">
-                      {LANGUAGE_OPTIONS.map((option) => (
-                        <button
-                          key={option.value}
-                          onClick={() => handleLanguageSelect(option.value)}
-                          className={`w-full px-4 py-2 text-left hover:bg-gray-100 transition-colors flex items-center gap-2 ${
-                            currentLanguage === option.value
-                              ? "bg-blue-50 text-blue-700 font-medium"
-                              : "text-gray-700"
-                          }`}
-                        >
-                          <span className="text-lg">{option.emoji}</span>
-                          <span className="flex-1">{option.label}</span>
-                          {option.value !== "original" && availableTranslations[option.value] && (
-                            <span className="text-xs text-green-600">✓</span>
-                          )}
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                </div>
-
-                <button
-                  type="button"
-                  onClick={handleDownload}
-                  disabled={loading || !!error || downloading}
-                  className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  {downloading ? (
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                  ) : (
-                    <Download className="w-4 h-4" />
-                  )}
-                  Download Excel
-                </button>
-              </div>
-            </div>
-          </header>
-
-          {/* Loading State */}
-          {loading && (
-            <div className="flex items-center justify-center h-[calc(100vh-64px)]">
-              <div className="text-center">
-                <Loader2 className="w-12 h-12 text-blue-600 animate-spin mx-auto mb-4" />
-                <p className="text-gray-600 font-medium">Loading spreadsheet data...</p>
-              </div>
-            </div>
-          )}
-
-          {/* Error State */}
-          {error && (
-            <div className="flex items-center justify-center h-[calc(100vh-64px)]">
-              <div className="text-center max-w-md">
-                <div className="w-16 h-16 bg-red-100 rounded-full flex items-center justify-center mx-auto mb-4">
-                  <X className="w-8 h-8 text-red-600" />
-                </div>
-                <h3 className="text-lg font-semibold text-gray-900 mb-2">Failed to Load Data</h3>
-                <p className="text-gray-600 mb-4">{error}</p>
-                <button
-                  onClick={onClose}
-                  className="px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium transition-colors"
-                >
-                  Go Back
-                </button>
-              </div>
-            </div>
-          )}
-
-          {/* Spreadsheet Content */}
-          {!loading && !error && editedData && (
-            <div className="flex-1 overflow-auto">
-              <table className="w-full border-collapse text-[13px]">
-                <thead>
-                  <tr>
-                    <th className="bg-[#366092] text-white font-semibold p-3 text-center border border-[#2d5078] sticky top-0 left-0 z-20 text-[11px] whitespace-nowrap min-w-[60px]">
-                      PS No.
-                    </th>
-                    {editedData.headers.map((header, idx) => (
-                      <th
-                        key={idx}
-                        className="bg-[#366092] text-white font-semibold p-3 text-center border border-[#2d5078] sticky top-0 z-10 text-[11px] whitespace-nowrap min-w-[80px]"
-                      >
-                        {header}
-                      </th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {editedData.rows.map((row, rowIndex) => (
-                    <tr key={rowIndex} className="hover:bg-gray-50">
-                      <td className="bg-gray-100 font-semibold text-gray-600 p-2 border border-gray-300 text-center sticky left-0 z-5 min-w-[60px]">
-                        {rowIndex + 1}
-                      </td>
-                      {row.map((cell, colIndex) => (
-                        <td
-                          key={colIndex}
-                          className="p-2 border border-gray-300 text-center bg-white min-w-[80px] focus:outline focus:outline-2 focus:outline-blue-500 focus:outline-offset-[-1px]"
-                          contentEditable
-                          suppressContentEditableWarning
-                          onBlur={(e) => handleCellEdit(rowIndex, colIndex, e.currentTarget.textContent || "")}
-                          onContextMenu={(e) => handleContextMenu(e, rowIndex, colIndex)}
-                          onKeyDown={(e) => {
-                            if (e.key === 'Enter' && !e.shiftKey) {
-                              e.preventDefault();
-                              (e.currentTarget as HTMLElement).blur();
-                            }
-                          }}
-                        >
-                          {cell !== null && cell !== undefined ? String(cell) : ""}
-                        </td>
-                      ))}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-
-          {/* Context Menu */}
-          {contextMenu && (
-            <div
-              ref={contextMenuRef}
-              className="fixed bg-white border border-gray-200 shadow-lg rounded-lg py-1 z-[60] min-w-[180px]"
-              style={{ left: contextMenu.x, top: contextMenu.y }}
-            >
-              <button
-                onClick={handleCopyCell}
-                className="w-full px-4 py-2 text-left text-sm text-gray-700 hover:bg-gray-100 flex items-center gap-2"
-              >
-                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2m0 0h2a2 2 0 012 2v3m2 4H10m0 0l3-3m-3 3l3 3" />
-                </svg>
-                Copy
-              </button>
-              <div className="border-t border-gray-200 my-1"></div>
-              <button
-                onClick={handleInsertRowAbove}
-                className="w-full px-4 py-2 text-left text-sm text-gray-700 hover:bg-gray-100 flex items-center gap-2"
-              >
-                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
-                </svg>
-                Insert Row Above
-              </button>
-              <button
-                onClick={handleInsertRowBelow}
-                className="w-full px-4 py-2 text-left text-sm text-gray-700 hover:bg-gray-100 flex items-center gap-2"
-              >
-                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
-                </svg>
-                Insert Row Below
-              </button>
-              <button
-                onClick={handleDeleteRow}
-                className="w-full px-4 py-2 text-left text-sm text-red-600 hover:bg-red-50 flex items-center gap-2"
-              >
-                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                </svg>
-                Delete Row
-              </button>
-            </div>
-          )}
-
-          {/* Geocode Dialog */}
-          {geocodeDialogOpen && (
-            <div className="fixed inset-0 z-[70] flex items-center justify-center">
-              <div
-                className="absolute inset-0 bg-black/30"
-                onClick={closeGeocodeDialog}
-              />
-              <div className="relative bg-white rounded-xl shadow-2xl w-full max-w-md mx-4 overflow-hidden">
-                {/* Dialog Header */}
-                <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200">
-                  <h2 className="text-lg font-semibold text-gray-900 flex items-center gap-2">
-                    <MapPin className="w-5 h-5 text-blue-600" />
-                    Geocode Addresses
-                  </h2>
-                  <button
-                    onClick={closeGeocodeDialog}
-                    className="p-1 text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded-lg transition-colors"
-                  >
-                    <X className="w-5 h-5" />
-                  </button>
-                </div>
-
-                {/* Dialog Content */}
-                <div className="px-6 py-4">
-                  {/* Error Display */}
-                  {error && (
-                    <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-lg">
-                      <div className="flex items-start gap-2">
-                        <AlertCircle className="w-5 h-5 text-red-600 flex-shrink-0 mt-0.5" />
-                        <div className="flex-1">
-                          <p className="text-sm font-medium text-red-800">Error</p>
-                          <p className="text-sm text-red-700 mt-1">{error}</p>
-                        </div>
-                        <button
-                          onClick={() => setError(null)}
-                          className="text-red-400 hover:text-red-600"
-                        >
-                          <X className="w-4 h-4" />
-                        </button>
-                      </div>
-                    </div>
+                  {onFilterColumns && (
+                    <button
+                      type="button"
+                      onClick={onFilterColumns}
+                      disabled={loading || !!error}
+                      className="flex items-center gap-2 px-4 py-2 bg-white border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      <Filter className="w-4 h-4" />
+                      Filter Columns
+                    </button>
                   )}
 
-                  {!geocoding && !geocodeResult && (
+                  {!isBoothView && (
                     <>
-                      {/* Address Column Selection */}
-                      <div className="mb-4">
-                        <label className="block text-sm font-medium text-gray-700 mb-2">
-                          Address Column
-                        </label>
-                        <select
-                          value={selectedAddressColumn}
-                          onChange={(e) => {
-                            setSelectedAddressColumn(e.target.value);
-                            setError(null); // Clear error when column changes
-                          }}
-                          className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none"
+                      <div className="relative" ref={allianceDropdownRef}>
+                        <button
+                          type="button"
+                          onClick={() => !allianceApplied && setAllianceDropdownOpen(!allianceDropdownOpen)}
+                          disabled={loading || !!error || allianceApplied}
+                          className="flex items-center gap-2 px-4 py-2 bg-white border border-blue-300 text-blue-700 rounded-lg hover:bg-blue-50 font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                         >
-                          {editedData && editedData.headers.length > 0 ? (
-                            editedData.headers.map((header, idx) => (
-                              <option key={idx} value={header}>
-                                {header}
-                              </option>
-                            ))
-                          ) : (
-                            <option value="">No columns available</option>
-                          )}
-                        </select>
-                        {editedData && editedData.headers.length > 0 && (
-                          <p className="mt-1 text-xs text-gray-500">
-                            Select the column containing address or location data
-                          </p>
+                          <Users className="w-4 h-4" />
+                          Add Alliance
+                          <ChevronDown className="w-4 h-4" />
+                        </button>
+
+                        {allianceDropdownOpen && (
+                          <div className="absolute top-full right-0 mt-1 w-48 bg-white border border-gray-300 rounded-lg shadow-lg z-10 overflow-hidden">
+                            <button
+                              onClick={() => {
+                                setSelectedAllianceType("loksabha");
+                                setAllianceDropdownOpen(false);
+                                setAllianceModalOpen(true);
+                              }}
+                              className="w-full px-4 py-2.5 text-left hover:bg-blue-50 transition-colors text-sm font-medium text-gray-700 flex items-center gap-2"
+                            >
+                              Loksabha
+                            </button>
+                            <button
+                              onClick={() => {
+                                setSelectedAllianceType("assembly");
+                                setAllianceDropdownOpen(false);
+                                setAllianceModalOpen(true);
+                              }}
+                              className="w-full px-4 py-2.5 text-left hover:bg-blue-50 transition-colors text-sm font-medium text-gray-700 flex items-center gap-2 border-t border-gray-100"
+                            >
+                              Assembly
+                            </button>
+                          </div>
                         )}
                       </div>
-
-                      {/* Region Hint */}
-                      <div className="mb-4">
-                        <label className="flex items-center gap-2 cursor-pointer">
-                          <input
-                            type="checkbox"
-                            checked={useRegionHint}
-                            onChange={(e) => setUseRegionHint(e.target.checked)}
-                            className="w-4 h-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500"
-                          />
-                          <span className="text-sm font-medium text-gray-700">
-                            Add region hint for better accuracy
-                          </span>
-                        </label>
-                        {useRegionHint && (
-                          <input
-                            type="text"
-                            value={regionHint}
-                            onChange={(e) => setRegionHint(e.target.value)}
-                            placeholder="e.g., Tamil Nadu, India"
-                            className="w-full mt-2 px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none"
-                          />
-                        )}
-                      </div>
-
-                      {/* Info */}
-                      <div className="p-3 bg-blue-50 rounded-lg mb-4">
-                        <p className="text-sm text-blue-800">
-                          This will add <strong>Latitude</strong> and <strong>Longitude</strong> columns
-                          to your spreadsheet by geocoding addresses using OpenStreetMap.
-                        </p>
-                      </div>
+                      {allianceApplied && (
+                        <button
+                          type="button"
+                          onClick={handleResetAlliance}
+                          className="flex items-center gap-2 px-4 py-2 bg-white border border-red-300 text-red-700 rounded-lg hover:bg-red-50 font-medium transition-colors"
+                        >
+                          <RotateCcw className="w-4 h-4" />
+                          Reset Alliance
+                        </button>
+                      )}
                     </>
                   )}
 
-                  {/* Progress State */}
-                  {geocoding && geocodeProgress && (
-                    <div className="py-4">
-                      {geocodeProgress.status === "failed" ? (
-                        <div className="p-3 bg-red-50 border border-red-200 rounded-lg">
-                          <div className="flex items-start gap-2">
-                            <AlertCircle className="w-5 h-5 text-red-600 flex-shrink-0 mt-0.5" />
-                            <div className="flex-1">
-                              <p className="text-sm font-medium text-red-800">Geocoding Failed</p>
-                              <p className="text-sm text-red-700 mt-1">
-                                {geocodeProgress.message || "An error occurred during geocoding. Please try again."}
-                              </p>
-                            </div>
-                          </div>
-                        </div>
+                  {allianceWarnings.length > 0 && (
+                    <div className="flex items-center gap-2 px-3 py-1.5 bg-yellow-50 border border-yellow-200 rounded-lg">
+                      <AlertCircle className="w-4 h-4 text-yellow-600 flex-shrink-0" />
+                      <span className="text-xs text-yellow-700">
+                        {allianceWarnings.length} column{allianceWarnings.length > 1 ? "s" : ""} not found
+                      </span>
+                    </div>
+                  )}
+
+                  <button
+                    type="button"
+                    onClick={openGeocodeDialog}
+                    disabled={loading || !!error || geocoding}
+                    className="flex items-center gap-2 px-4 py-2 bg-white border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    <MapPin className="w-4 h-4" />
+                    Geocode Addresses
+                  </button>
+
+                  {/* Language Dropdown */}
+                  <div className="relative" ref={languageDropdownRef}>
+                    <button
+                      type="button"
+                      onClick={() => !translating && !loading && !error && setShowLanguageDropdown(!showLanguageDropdown)}
+                      disabled={loading || !!error || translating}
+                      className="flex items-center gap-2 px-4 py-2 bg-white border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed min-w-[180px] justify-between"
+                      title={translationProgressMessage || undefined}
+                    >
+                      {translating ? (
+                        <>
+                          <Loader2 className="w-4 h-4 animate-spin" />
+                          <span className="flex-1">Translating... {Math.round(translationProgress)}%</span>
+                        </>
                       ) : (
                         <>
-                          <div className="mb-4">
-                            <div className="flex justify-between text-sm text-gray-600 mb-2">
-                              <span>Geocoding addresses...</span>
-                              <span>{geocodeProgress.current} / {geocodeProgress.total}</span>
-                            </div>
-                            <div className="w-full bg-gray-200 rounded-full h-2.5">
-                              <div
-                                className="bg-blue-600 h-2.5 rounded-full transition-all duration-300"
-                                style={{
-                                  width: `${geocodeProgress.total > 0 
-                                    ? (geocodeProgress.current / geocodeProgress.total) * 100 
-                                    : 0}%`,
-                                }}
-                              />
-                            </div>
-                          </div>
-
-                          <div className="flex gap-4 text-sm">
-                            <div className="flex items-center gap-1 text-green-600">
-                              <CheckCircle2 className="w-4 h-4" />
-                              <span>{geocodeProgress.success_count} successful</span>
-                            </div>
-                            <div className="flex items-center gap-1 text-amber-600">
-                              <AlertCircle className="w-4 h-4" />
-                              <span>{geocodeProgress.failed_count} not found</span>
-                            </div>
-                          </div>
-
-                          <p className="mt-3 text-xs text-gray-500 truncate">
-                            {geocodeProgress.message}
-                          </p>
+                          <Languages className="w-4 h-4" />
+                          <span className="flex-1 text-left">{getCurrentLanguageDisplay()}</span>
+                          <ChevronDown className="w-4 h-4" />
                         </>
                       )}
-                    </div>
-                  )}
-
-                  {/* Result State */}
-                  {geocodeResult && (
-                    <div className="py-4 text-center">
-                      <div className="w-16 h-16 bg-green-100 rounded-full flex items-center justify-center mx-auto mb-4">
-                        <CheckCircle2 className="w-8 h-8 text-green-600" />
-                      </div>
-                      <h3 className="text-lg font-semibold text-gray-900 mb-2">
-                        Geocoding Complete!
-                      </h3>
-                      <div className="flex justify-center gap-6 text-sm mb-4">
-                        <div className="text-green-600">
-                          <span className="font-semibold">{geocodeResult.successful}</span> successful
-                        </div>
-                        <div className="text-amber-600">
-                          <span className="font-semibold">{geocodeResult.failed}</span> not found
-                        </div>
-                      </div>
-                      <p className="text-sm text-gray-600">
-                        Latitude and Longitude columns have been added to your spreadsheet.
-                      </p>
-                    </div>
-                  )}
-                </div>
-
-                {/* Dialog Footer */}
-                <div className="flex justify-end gap-3 px-6 py-4 border-t border-gray-200 bg-gray-50">
-                  {!geocoding && !geocodeResult && (
-                    <>
-                      <button
-                        onClick={closeGeocodeDialog}
-                        className="px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-100 rounded-lg transition-colors"
-                      >
-                        Cancel
-                      </button>
-                      <button
-                        onClick={handleStartGeocoding}
-                        disabled={!selectedAddressColumn || !editedData || editedData.headers.length === 0}
-                        className="px-4 py-2 text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
-                      >
-                        <MapPin className="w-4 h-4" />
-                        Start Geocoding
-                      </button>
-                    </>
-                  )}
-
-                  {geocoding && (
-                    <button
-                      onClick={handleCancelGeocoding}
-                      className="px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-100 rounded-lg transition-colors"
-                    >
-                      Cancel
                     </button>
-                  )}
 
-                  {geocodeResult && (
-                    <button
-                      onClick={closeGeocodeDialog}
-                      className="px-4 py-2 text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors"
-                    >
-                      Done
-                    </button>
-                  )}
-                </div>
-              </div>
-            </div>
-          )}
+                    {showLanguageDropdown && !translating && (
+                      <div className="absolute top-full right-0 mt-1 w-full bg-white border border-gray-300 rounded-lg shadow-lg z-10 overflow-hidden">
+                        {LANGUAGE_OPTIONS.map((option) => (
+                          <button
+                            key={option.value}
+                            onClick={() => handleLanguageSelect(option.value)}
+                            className={`w-full px-4 py-2 text-left hover:bg-gray-100 transition-colors flex items-center gap-2 ${currentLanguage === option.value
+                              ? "bg-blue-50 text-blue-700 font-medium"
+                              : "text-gray-700"
+                              }`}
+                          >
+                            <span className="text-lg">{option.emoji}</span>
+                            <span className="flex-1">{option.label}</span>
+                            {option.value !== "original" && availableTranslations[option.value] && (
+                              <span className="text-xs text-green-600">✓</span>
+                            )}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
 
-          {/* Booth Name Dialog */}
-          {boothNameDialogOpen && (
-            <div className="fixed inset-0 z-[70] flex items-center justify-center">
-              <div
-                className="absolute inset-0 bg-black/30"
-                onClick={closeBoothNameDialog}
-              />
-              <div className="relative bg-white rounded-xl shadow-2xl w-full max-w-md mx-4 overflow-hidden">
-                {/* Dialog Header */}
-                <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200">
-                  <h2 className="text-lg font-semibold text-gray-900 flex items-center gap-2">
-                    <Edit className="w-5 h-5 text-blue-600" />
-                    Add Booth Name Column
-                  </h2>
                   <button
-                    onClick={closeBoothNameDialog}
-                    className="p-1 text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded-lg transition-colors"
+                    type="button"
+                    onClick={handleDownload}
+                    disabled={loading || !!error || downloading}
+                    className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                   >
-                    <X className="w-5 h-5" />
+                    {downloading ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <Download className="w-4 h-4" />
+                    )}
+                    Download Excel
                   </button>
                 </div>
+              </div>
+            </header>
 
-                {/* Dialog Content */}
-                <div className="px-6 py-4">
-                  {/* Error Display */}
-                  {error && (
-                    <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-lg">
-                      <div className="flex items-start gap-2">
-                        <AlertCircle className="w-5 h-5 text-red-600 flex-shrink-0 mt-0.5" />
-                        <div className="flex-1">
-                          <p className="text-sm font-medium text-red-800">Error</p>
-                          <p className="text-sm text-red-700 mt-1">{error}</p>
+            {/* Loading State */}
+            {loading && (
+              <div className="flex items-center justify-center h-[calc(100vh-64px)]">
+                <div className="text-center">
+                  <Loader2 className="w-12 h-12 text-blue-600 animate-spin mx-auto mb-4" />
+                  <p className="text-gray-600 font-medium">Loading spreadsheet data...</p>
+                </div>
+              </div>
+            )}
+
+            {/* Error State */}
+            {error && (
+              <div className="flex items-center justify-center h-[calc(100vh-64px)]">
+                <div className="text-center max-w-md">
+                  <div className="w-16 h-16 bg-red-100 rounded-full flex items-center justify-center mx-auto mb-4">
+                    <X className="w-8 h-8 text-red-600" />
+                  </div>
+                  <h3 className="text-lg font-semibold text-gray-900 mb-2">Failed to Load Data</h3>
+                  <p className="text-gray-600 mb-4">{error}</p>
+                  <button
+                    onClick={onClose}
+                    className="px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium transition-colors"
+                  >
+                    Go Back
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Spreadsheet Content */}
+            {!loading && !error && editedData && (
+              <div className="flex-1 overflow-auto">
+                <table className="w-full border-collapse text-[13px]">
+                  <thead>
+                    <tr>
+                      <th className="bg-[#366092] text-white font-semibold p-3 text-center border border-[#2d5078] sticky top-0 left-0 z-20 text-[11px] whitespace-nowrap min-w-[60px]">
+                        PS No.
+                      </th>
+                      {editedData.headers.map((header, idx) => (
+                        <th
+                          key={idx}
+                          className="bg-[#366092] text-white font-semibold p-3 text-center border border-[#2d5078] sticky top-0 z-10 text-[11px] whitespace-nowrap min-w-[80px]"
+                        >
+                          {header}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {editedData.rows.map((row, rowIndex) => (
+                      <tr key={rowIndex} className="hover:bg-gray-50">
+                        <td className="bg-gray-100 font-semibold text-gray-600 p-2 border border-gray-300 text-center sticky left-0 z-5 min-w-[60px]">
+                          {rowIndex + 1}
+                        </td>
+                        {row.map((cell, colIndex) => (
+                          <td
+                            key={colIndex}
+                            className="p-2 border border-gray-300 text-center bg-white min-w-[80px] focus:outline focus:outline-2 focus:outline-blue-500 focus:outline-offset-[-1px]"
+                            contentEditable
+                            suppressContentEditableWarning
+                            onBlur={(e) => handleCellEdit(rowIndex, colIndex, e.currentTarget.textContent || "")}
+                            onContextMenu={(e) => handleContextMenu(e, rowIndex, colIndex)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter' && !e.shiftKey) {
+                                e.preventDefault();
+                                (e.currentTarget as HTMLElement).blur();
+                              }
+                            }}
+                          >
+                            {cell !== null && cell !== undefined ? String(cell) : ""}
+                          </td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+            {/* Context Menu */}
+            {contextMenu && (
+              <div
+                ref={contextMenuRef}
+                className="fixed bg-white border border-gray-200 shadow-lg rounded-lg py-1 z-[60] min-w-[180px]"
+                style={{ left: contextMenu.x, top: contextMenu.y }}
+              >
+                <button
+                  onClick={handleCopyCell}
+                  className="w-full px-4 py-2 text-left text-sm text-gray-700 hover:bg-gray-100 flex items-center gap-2"
+                >
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2m0 0h2a2 2 0 012 2v3m2 4H10m0 0l3-3m-3 3l3 3" />
+                  </svg>
+                  Copy
+                </button>
+                <div className="border-t border-gray-200 my-1"></div>
+                <button
+                  onClick={handleInsertRowAbove}
+                  className="w-full px-4 py-2 text-left text-sm text-gray-700 hover:bg-gray-100 flex items-center gap-2"
+                >
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
+                  </svg>
+                  Insert Row Above
+                </button>
+                <button
+                  onClick={handleInsertRowBelow}
+                  className="w-full px-4 py-2 text-left text-sm text-gray-700 hover:bg-gray-100 flex items-center gap-2"
+                >
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
+                  </svg>
+                  Insert Row Below
+                </button>
+                <button
+                  onClick={handleDeleteRow}
+                  className="w-full px-4 py-2 text-left text-sm text-red-600 hover:bg-red-50 flex items-center gap-2"
+                >
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                  </svg>
+                  Delete Row
+                </button>
+              </div>
+            )}
+
+            {/* Geocode Dialog */}
+            {geocodeDialogOpen && (
+              <div className="fixed inset-0 z-[70] flex items-center justify-center">
+                <div
+                  className="absolute inset-0 bg-black/30"
+                  onClick={closeGeocodeDialog}
+                />
+                <div className="relative bg-white rounded-xl shadow-2xl w-full max-w-md mx-4 overflow-hidden">
+                  {/* Dialog Header */}
+                  <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200">
+                    <h2 className="text-lg font-semibold text-gray-900 flex items-center gap-2">
+                      <MapPin className="w-5 h-5 text-blue-600" />
+                      Geocode Addresses
+                    </h2>
+                    <button
+                      onClick={closeGeocodeDialog}
+                      className="p-1 text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded-lg transition-colors"
+                    >
+                      <X className="w-5 h-5" />
+                    </button>
+                  </div>
+
+                  {/* Dialog Content */}
+                  <div className="px-6 py-4">
+                    {/* Error Display */}
+                    {error && (
+                      <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-lg">
+                        <div className="flex items-start gap-2">
+                          <AlertCircle className="w-5 h-5 text-red-600 flex-shrink-0 mt-0.5" />
+                          <div className="flex-1">
+                            <p className="text-sm font-medium text-red-800">Error</p>
+                            <p className="text-sm text-red-700 mt-1">{error}</p>
+                          </div>
+                          <button
+                            onClick={() => setError(null)}
+                            className="text-red-400 hover:text-red-600"
+                          >
+                            <X className="w-4 h-4" />
+                          </button>
                         </div>
-                        <button
-                          onClick={() => setError(null)}
-                          className="text-red-400 hover:text-red-600"
-                        >
-                          <X className="w-4 h-4" />
-                        </button>
                       </div>
-                    </div>
-                  )}
+                    )}
 
-                  {!addingBoothName && (
-                    <>
-                      <p className="text-sm text-gray-600 mb-4">
-                        Select a column to extract booth names from. The system will extract the core institution/building name by removing pincodes, location details after commas, and truncating after institution keywords (School, College, Hall, etc.).
-                      </p>
-
-                      {/* Source Column Selection */}
-                      <div className="mb-4">
-                        <label className="block text-sm font-medium text-gray-700 mb-2">
-                          Source Column
-                        </label>
-                        <select
-                          value={selectedSourceColumn}
-                          onChange={(e) => {
-                            setSelectedSourceColumn(e.target.value);
-                            setError(null);
-                          }}
-                          className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none"
-                        >
-                          {editedData && editedData.headers.length > 0 ? (
-                            editedData.headers.map((header, idx) => (
-                              <option key={idx} value={header}>
-                                {header}
-                              </option>
-                            ))
-                          ) : (
-                            <option value="">No columns available</option>
+                    {!geocoding && !geocodeResult && (
+                      <>
+                        {/* Address Column Selection */}
+                        <div className="mb-4">
+                          <label className="block text-sm font-medium text-gray-700 mb-2">
+                            Address Column
+                          </label>
+                          <select
+                            value={selectedAddressColumn}
+                            onChange={(e) => {
+                              setSelectedAddressColumn(e.target.value);
+                              setError(null); // Clear error when column changes
+                            }}
+                            className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none"
+                          >
+                            {editedData && editedData.headers.length > 0 ? (
+                              editedData.headers.map((header, idx) => (
+                                <option key={idx} value={header}>
+                                  {header}
+                                </option>
+                              ))
+                            ) : (
+                              <option value="">No columns available</option>
+                            )}
+                          </select>
+                          {editedData && editedData.headers.length > 0 && (
+                            <p className="mt-1 text-xs text-gray-500">
+                              Select the column containing address or location data
+                            </p>
                           )}
-                        </select>
-                        {editedData && editedData.headers.length > 0 && (
-                          <p className="mt-1 text-xs text-gray-500">
-                            Select the column containing building/location names (e.g., "Location and name of the Building...")
+                        </div>
+
+                        {/* Region Hint */}
+                        <div className="mb-4">
+                          <label className="flex items-center gap-2 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={useRegionHint}
+                              onChange={(e) => setUseRegionHint(e.target.checked)}
+                              className="w-4 h-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500"
+                            />
+                            <span className="text-sm font-medium text-gray-700">
+                              Add region hint for better accuracy
+                            </span>
+                          </label>
+                          {useRegionHint && (
+                            <input
+                              type="text"
+                              value={regionHint}
+                              onChange={(e) => setRegionHint(e.target.value)}
+                              placeholder="e.g., Tamil Nadu, India"
+                              className="w-full mt-2 px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none"
+                            />
+                          )}
+                        </div>
+
+                        {/* Info */}
+                        <div className="p-3 bg-blue-50 rounded-lg mb-4">
+                          <p className="text-sm text-blue-800">
+                            This will add <strong>Latitude</strong> and <strong>Longitude</strong> columns
+                            to your spreadsheet by geocoding addresses using OpenStreetMap.
                           </p>
+                        </div>
+                      </>
+                    )}
+
+                    {/* Progress State */}
+                    {geocoding && geocodeProgress && (
+                      <div className="py-4">
+                        {geocodeProgress.status === "failed" ? (
+                          <div className="p-3 bg-red-50 border border-red-200 rounded-lg">
+                            <div className="flex items-start gap-2">
+                              <AlertCircle className="w-5 h-5 text-red-600 flex-shrink-0 mt-0.5" />
+                              <div className="flex-1">
+                                <p className="text-sm font-medium text-red-800">Geocoding Failed</p>
+                                <p className="text-sm text-red-700 mt-1">
+                                  {geocodeProgress.message || "An error occurred during geocoding. Please try again."}
+                                </p>
+                              </div>
+                            </div>
+                          </div>
+                        ) : (
+                          <>
+                            <div className="mb-4">
+                              <div className="flex justify-between text-sm text-gray-600 mb-2">
+                                <span>Geocoding addresses...</span>
+                                <span>{geocodeProgress.current} / {geocodeProgress.total}</span>
+                              </div>
+                              <div className="w-full bg-gray-200 rounded-full h-2.5">
+                                <div
+                                  className="bg-blue-600 h-2.5 rounded-full transition-all duration-300"
+                                  style={{
+                                    width: `${geocodeProgress.total > 0
+                                      ? (geocodeProgress.current / geocodeProgress.total) * 100
+                                      : 0}%`,
+                                  }}
+                                />
+                              </div>
+                            </div>
+
+                            <div className="flex gap-4 text-sm">
+                              <div className="flex items-center gap-1 text-green-600">
+                                <CheckCircle2 className="w-4 h-4" />
+                                <span>{geocodeProgress.success_count} successful</span>
+                              </div>
+                              <div className="flex items-center gap-1 text-amber-600">
+                                <AlertCircle className="w-4 h-4" />
+                                <span>{geocodeProgress.failed_count} not found</span>
+                              </div>
+                            </div>
+
+                            <p className="mt-3 text-xs text-gray-500 truncate">
+                              {geocodeProgress.message}
+                            </p>
+                          </>
                         )}
                       </div>
-                    </>
-                  )}
+                    )}
 
-                  {addingBoothName && (
-                    <div className="py-8 text-center">
-                      <Loader2 className="w-8 h-8 text-blue-600 animate-spin mx-auto mb-4" />
-                      <p className="text-sm text-gray-600">Adding Booth name column...</p>
-                    </div>
-                  )}
-                </div>
+                    {/* Result State */}
+                    {geocodeResult && (
+                      <div className="py-4 text-center">
+                        <div className="w-16 h-16 bg-green-100 rounded-full flex items-center justify-center mx-auto mb-4">
+                          <CheckCircle2 className="w-8 h-8 text-green-600" />
+                        </div>
+                        <h3 className="text-lg font-semibold text-gray-900 mb-2">
+                          Geocoding Complete!
+                        </h3>
+                        <div className="flex justify-center gap-6 text-sm mb-4">
+                          <div className="text-green-600">
+                            <span className="font-semibold">{geocodeResult.successful}</span> successful
+                          </div>
+                          <div className="text-amber-600">
+                            <span className="font-semibold">{geocodeResult.failed}</span> not found
+                          </div>
+                        </div>
+                        <p className="text-sm text-gray-600">
+                          Latitude and Longitude columns have been added to your spreadsheet.
+                        </p>
+                      </div>
+                    )}
+                  </div>
 
-                {/* Dialog Footer */}
-                <div className="flex justify-end gap-3 px-6 py-4 border-t border-gray-200 bg-gray-50">
-                  {!addingBoothName && (
-                    <>
+                  {/* Dialog Footer */}
+                  <div className="flex justify-end gap-3 px-6 py-4 border-t border-gray-200 bg-gray-50">
+                    {!geocoding && !geocodeResult && (
+                      <>
+                        <button
+                          onClick={closeGeocodeDialog}
+                          className="px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-100 rounded-lg transition-colors"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          onClick={handleStartGeocoding}
+                          disabled={!selectedAddressColumn || !editedData || editedData.headers.length === 0}
+                          className="px-4 py-2 text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+                        >
+                          <MapPin className="w-4 h-4" />
+                          Start Geocoding
+                        </button>
+                      </>
+                    )}
+
+                    {geocoding && (
                       <button
-                        onClick={closeBoothNameDialog}
+                        onClick={handleCancelGeocoding}
                         className="px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-100 rounded-lg transition-colors"
                       >
                         Cancel
                       </button>
+                    )}
+
+                    {geocodeResult && (
                       <button
-                        onClick={handleAddBoothNameColumn}
-                        disabled={!selectedSourceColumn || !editedData || editedData.headers.length === 0}
-                        className="px-4 py-2 text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+                        onClick={closeGeocodeDialog}
+                        className="px-4 py-2 text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors"
                       >
-                        <Edit className="w-4 h-4" />
-                        Add Booth Name Column
+                        Done
                       </button>
-                    </>
-                  )}
+                    )}
+                  </div>
                 </div>
               </div>
-            </div>
-          )}
-        </DialogPrimitive.Content>
-      </DialogPrimitive.Portal>
-    </DialogPrimitive.Root>
+            )}
+
+            {/* Booth Name Dialog */}
+            {boothNameDialogOpen && (
+              <div className="fixed inset-0 z-[70] flex items-center justify-center">
+                <div
+                  className="absolute inset-0 bg-black/30"
+                  onClick={closeBoothNameDialog}
+                />
+                <div className="relative bg-white rounded-xl shadow-2xl w-full max-w-md mx-4 overflow-hidden">
+                  {/* Dialog Header */}
+                  <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200">
+                    <h2 className="text-lg font-semibold text-gray-900 flex items-center gap-2">
+                      <Edit className="w-5 h-5 text-blue-600" />
+                      Add Booth Name Column
+                    </h2>
+                    <button
+                      onClick={closeBoothNameDialog}
+                      className="p-1 text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded-lg transition-colors"
+                    >
+                      <X className="w-5 h-5" />
+                    </button>
+                  </div>
+
+                  {/* Dialog Content */}
+                  <div className="px-6 py-4">
+                    {/* Error Display */}
+                    {error && (
+                      <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-lg">
+                        <div className="flex items-start gap-2">
+                          <AlertCircle className="w-5 h-5 text-red-600 flex-shrink-0 mt-0.5" />
+                          <div className="flex-1">
+                            <p className="text-sm font-medium text-red-800">Error</p>
+                            <p className="text-sm text-red-700 mt-1">{error}</p>
+                          </div>
+                          <button
+                            onClick={() => setError(null)}
+                            className="text-red-400 hover:text-red-600"
+                          >
+                            <X className="w-4 h-4" />
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                    {!addingBoothName && (
+                      <>
+                        <p className="text-sm text-gray-600 mb-4">
+                          Select a column to extract booth names from. The system will extract the core institution/building name by removing pincodes, location details after commas, and truncating after institution keywords (School, College, Hall, etc.).
+                        </p>
+
+                        {/* Source Column Selection */}
+                        <div className="mb-4">
+                          <label className="block text-sm font-medium text-gray-700 mb-2">
+                            Source Column
+                          </label>
+                          <select
+                            value={selectedSourceColumn}
+                            onChange={(e) => {
+                              setSelectedSourceColumn(e.target.value);
+                              setError(null);
+                            }}
+                            className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none"
+                          >
+                            {editedData && editedData.headers.length > 0 ? (
+                              editedData.headers.map((header, idx) => (
+                                <option key={idx} value={header}>
+                                  {header}
+                                </option>
+                              ))
+                            ) : (
+                              <option value="">No columns available</option>
+                            )}
+                          </select>
+                          {editedData && editedData.headers.length > 0 && (
+                            <p className="mt-1 text-xs text-gray-500">
+                              Select the column containing building/location names (e.g., "Location and name of the Building...")
+                            </p>
+                          )}
+                        </div>
+                      </>
+                    )}
+
+                    {addingBoothName && (
+                      <div className="py-8 text-center">
+                        <Loader2 className="w-8 h-8 text-blue-600 animate-spin mx-auto mb-4" />
+                        <p className="text-sm text-gray-600">Adding Booth name column...</p>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Dialog Footer */}
+                  <div className="flex justify-end gap-3 px-6 py-4 border-t border-gray-200 bg-gray-50">
+                    {!addingBoothName && (
+                      <>
+                        <button
+                          onClick={closeBoothNameDialog}
+                          className="px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-100 rounded-lg transition-colors"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          onClick={handleAddBoothNameColumn}
+                          disabled={!selectedSourceColumn || !editedData || editedData.headers.length === 0}
+                          className="px-4 py-2 text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+                        >
+                          <Edit className="w-4 h-4" />
+                          Add Booth Name Column
+                        </button>
+                      </>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+          </DialogPrimitive.Content>
+        </DialogPrimitive.Portal>
+      </DialogPrimitive.Root>
 
       {/* Alliance Modal */}
       <AllianceModal
@@ -1447,6 +1573,70 @@ export function SpreadsheetEditor({
         availableColumns={editedData?.headers ?? []}
         allianceConfig={selectedAllianceType === "assembly" ? ASSEMBLY_ALLIANCE_CONFIG : ALLIANCE_CONFIG}
       />
+      {/* Normalization Dialog */}
+      <DialogPrimitive.Root open={normalizationDialogOpen} onOpenChange={setNormalizationDialogOpen}>
+        <DialogPrimitive.Portal>
+          <DialogPrimitive.Overlay className="fixed inset-0 z-50 bg-black/50" />
+          <DialogPrimitive.Content className="fixed top-[50%] left-[50%] max-h-[85vh] w-[90vw] max-w-[500px] translate-x-[-50%] translate-y-[-50%] rounded-[6px] bg-white p-[25px] shadow-[hsl(206_22%_7%_/_35%)_0px_10px_38px_-10px,_hsl(206_22%_7%_/_20%)_0px_10px_20px_-15px] focus:outline-none z-50">
+            <DialogPrimitive.Title className="text-mauve12 m-0 text-[17px] font-medium mb-4">
+              Normalize Party Names
+            </DialogPrimitive.Title>
+            <DialogPrimitive.Description className="text-mauve11 mt-[10px] mb-5 text-[15px] leading-normal">
+              Select the column containing Candidate Names or Party abbreviations.
+              This will convert names to standard Party Names (e.g., "Candidate X (DMK)" &rarr; "DMK").
+            </DialogPrimitive.Description>
+
+            <div className="flex flex-col gap-4">
+              <label className="text-sm font-medium text-gray-700">
+                Select Column
+                <select
+                  className="mt-1 block w-full rounded-md border-gray-300 py-2 pl-3 pr-10 text-base focus:border-blue-500 focus:outline-none focus:ring-blue-500 sm:text-sm border"
+                  value={selectedNormalizeColumn}
+                  onChange={(e) => setSelectedNormalizeColumn(e.target.value)}
+                >
+                  {editedData?.headers.map((header) => (
+                    <option key={header} value={header}>
+                      {header}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              {error && (
+                <div className="p-3 bg-red-50 text-red-700 rounded text-sm flex items-start gap-2">
+                  <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
+                  <span>{error}</span>
+                </div>
+              )}
+
+              <div className="flex justify-end gap-[25px] mt-4">
+                <button
+                  onClick={() => setNormalizationDialogOpen(false)}
+                  className="bg-gray-100 text-gray-900 hover:bg-gray-200 inline-flex h-[35px] items-center justify-center rounded-[4px] px-[15px] font-medium leading-none focus:shadow-[0_0_0_2px] focus:shadow-gray-400 focus:outline-none"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={handleNormalizeColumn}
+                  disabled={normalizing}
+                  className="bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed inline-flex h-[35px] items-center justify-center rounded-[4px] px-[15px] font-medium leading-none focus:shadow-[0_0_0_2px] focus:shadow-blue-400 focus:outline-none gap-2"
+                >
+                  {normalizing && <Loader2 className="w-4 h-4 animate-spin" />}
+                  {normalizing ? "Normalizing..." : "Normalize"}
+                </button>
+              </div>
+            </div>
+            <DialogPrimitive.Close asChild>
+              <button
+                className="text-gray-400 hover:text-gray-500 absolute top-[10px] right-[10px] inline-flex h-[25px] w-[25px] appearance-none items-center justify-center rounded-full focus:shadow-[0_0_0_2px] focus:shadow-blue-400 focus:outline-none"
+                aria-label="Close"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </DialogPrimitive.Close>
+          </DialogPrimitive.Content>
+        </DialogPrimitive.Portal>
+      </DialogPrimitive.Root>
     </>
   );
 }

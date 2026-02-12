@@ -15,6 +15,7 @@ import type {
   GeocodeProgressEvent,
   GeocodeApplyResponse,
 } from "@/types";
+import { cleanFilename } from "@/lib/utils";
 
 const API_BASE_URL =
   process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
@@ -151,7 +152,7 @@ export async function downloadExcel(
   const url = window.URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = filename.replace(".pdf", ".xlsx");
+  a.download = cleanFilename(filename.replace(".pdf", ".xlsx"));
   document.body.appendChild(a);
   a.click();
   window.URL.revokeObjectURL(url);
@@ -198,7 +199,15 @@ export async function filterExcel(
   const url = window.URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = filename.replace(".pdf", "_filtered.xlsx");
+  const cleanName = cleanFilename(filename);
+  // Re-add _filtered suffix if needed, or just keep it clean? 
+  // User asked for "just name.xls", so maybe we should avoid _filtered too?
+  // But filterExcel implies a different content. I'll stick to cleaning the base name and adding suffix if appropriate,
+  // or just clean it. The user said "saved as just name.xls".
+  // Let's use cleanFilename for the base and add _filtered.xlsx, BUT maybe cleanFilename removes suffixes?
+  // cleanFilename removes _modified. It doesn't remove _filtered.
+  // safely: cleanFilename("xx_name.pdf") -> "name.pdf" -> replace .pdf with _filtered.xlsx
+  a.download = cleanFilename(filename).replace(/\.[^/.]+$/, "") + "_filtered.xlsx";
   document.body.appendChild(a);
   a.click();
   window.URL.revokeObjectURL(url);
@@ -268,7 +277,12 @@ export async function downloadModifiedExcel(
   const url = window.URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = filename.replace(".pdf", "_modified.xlsx");
+  // User explicitly asked for "just name.xls" instead of "xx_name_modified..."
+  // `cleanFilename` removes `_modified` suffix and prefixes.
+  // So cleanFilename("01_Name.pdf") -> "Name.pdf"
+  // cleanFilename("Name_modified.xlsx") -> "Name.xlsx"
+  // Here filename is likely the original PDF name.
+  a.download = cleanFilename(filename).replace(/\.[^/.]+$/, "") + ".xlsx";
   document.body.appendChild(a);
   a.click();
   window.URL.revokeObjectURL(url);
@@ -419,3 +433,54 @@ export async function addBoothNameColumn(
   return response.json();
 }
 
+
+/**
+ * Normalize a column to Party Names
+ */
+export async function normalizeColumn(
+  taskId: string,
+  columnName: string
+): Promise<FullPreviewData> {
+  const response = await fetch(`${API_BASE_URL}/api/normalize-column`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      task_id: taskId,
+      column_name: columnName,
+    }),
+  });
+
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}));
+    throw new Error(error.detail || "Failed to normalize column");
+  }
+
+  return response.json();
+}
+
+/**
+ * Normalize all headers to Party Names
+ */
+export async function normalizeHeaders(
+  taskId: string
+): Promise<FullPreviewData> {
+  const response = await fetch(`${API_BASE_URL}/api/normalize-headers`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      task_id: taskId,
+      column_name: "", // Not used
+    }),
+  });
+
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}));
+    throw new Error(error.detail || "Failed to normalize headers");
+  }
+
+  return response.json();
+}
