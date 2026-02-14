@@ -10,16 +10,10 @@ camelot-py>=0.11.0
 opencv-python-headless>=4.8.0
 ghostscript>=0.7
 
-# OCR Processing (for scanned/image-based PDFs)
-pytesseract>=0.3.10
-pdf2image>=1.16.3
-easyocr>=1.7.0  # Fallback OCR engine
-# Note: Tesseract OCR must be installed on the system:
-#   macOS: brew install tesseract
-#   Ubuntu: sudo apt-get install tesseract-ocr
-# Note: Poppler is required for pdf2image:
-#   macOS: brew install poppler
-#   Ubuntu: sudo apt-get install poppler-utils
+# Azure Document Intelligence (for scanned/image-based PDFs)
+azure-ai-documentintelligence>=1.0.0
+azure-core>=1.30.0
+rich>=13.0.0  # Used by pdf_table_extractor.py
 
 # Excel Creation
 openpyxl>=3.1.5
@@ -49,3 +43,4 @@ deep-translator==1.11.4
 
 # Geocoding
 geopy>=2.4.0
+

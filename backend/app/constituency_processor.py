@@ -99,8 +99,8 @@ class ConstituencyProcessor(PDFProcessor):
                     result = await self._extract_with_pdfplumber_constituency(update_progress)
                     
                     if not result.tables or all(t.is_empty for t in result.tables):
-                        logger.info("No tables found with pdfplumber, falling back to OCR...")
-                        update_progress(50, "No text tables found, trying OCR...")
+                        logger.info("No tables found with pdfplumber, falling back to Azure DI...")
+                        update_progress(50, "No text tables found, trying Azure DI...")
                         result = await self._extract_with_ocr_constituency(update_progress)
 
             # Validate extraction results
@@ -312,40 +312,14 @@ class ConstituencyProcessor(PDFProcessor):
         self,
         progress_callback: Optional[Callable[[int, str], None]] = None,
     ) -> ExtractionResult:
-        """Extract tables using OCR with constituency-specific logic."""
-        from .ocr_processor import OCRProcessor, OCRConfig
-
-        def update_progress(progress: int, message: str):
-            if progress_callback:
-                adjusted = int(10 + (progress * 0.8))
-                progress_callback(adjusted, message)
-
-        logger.info("Starting OCR extraction for constituency...")
-        update_progress(0, "Initializing OCR processor...")
-
-        config = OCRConfig(
-            dpi=300,
-            denoise=True,
-            deskew=True,
-            contrast_enhance=True,
-            use_easyocr_fallback=True,
-            min_confidence=50.0,
-        )
-
-        ocr_processor = OCRProcessor(str(self.file_path), config)
-        
-        # Use base OCR extraction, then post-process for constituency
-        result = await asyncio.to_thread(
-            ocr_processor.extract_tables,
-            update_progress
-        )
+        """Extract tables using Azure Document Intelligence with constituency-specific logic."""
+        # Reuse the parent class Azure DI extraction
+        result = await self._extract_with_ocr(progress_callback)
 
         if not result.tables or all(t.is_empty for t in result.tables):
-            raise ValueError("OCR extraction found no tables in the PDF")
+            raise ValueError("Azure DI extraction found no tables in the PDF")
 
-        # Post-process: extract headers from all pages and align
-        # For now, use the first table's headers as master
-        # In a full implementation, we'd process each page separately
+        # Post-process: use first table's headers as master
         if result.tables:
             first_table = result.tables[0]
             self.master_headers = first_table.headers
@@ -353,14 +327,14 @@ class ConstituencyProcessor(PDFProcessor):
             all_rows = []
             for table in result.tables:
                 all_rows.extend(table.rows)
-            
+
             merged_table = TableData(
                 headers=self.master_headers,
                 rows=all_rows,
                 page_number=1,
-                extraction_method="constituency_ocr",
+                extraction_method="constituency_azure_di",
             )
-            
+
             return ExtractionResult(
                 tables=[merged_table],
                 page_texts=result.page_texts,
