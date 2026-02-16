@@ -7,6 +7,7 @@ Dependencies: azure-ai-documentintelligence, azure-core, openpyxl, rich, python-
 
 import os
 import sys
+import re
 import argparse
 import time
 import tkinter as tk
@@ -15,7 +16,7 @@ from pathlib import Path
 from dataclasses import dataclass
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parent / "backend" / ".env")
 
 from azure.core.credentials import AzureKeyCredential
 from azure.ai.documentintelligence import DocumentIntelligenceClient
@@ -35,6 +36,114 @@ HEADER_ROWS = 2
 
 # Azure Document Intelligence Layout pricing: $10 per 1000 pages
 COST_PER_PAGE = 10.0 / 1000
+
+
+INSTITUTION_KEYWORDS = [
+    'School', 'College', 'University', 'Academy', 'Institute',
+    'Vidyalaya', 'Vidyalayam', 'Patasala', 'Hall', 'Mandapam',
+    'Kalyanamandapam', 'Mahal', 'Choultry', 'Hospital', 'Dispensary',
+    'Library', 'Madrasa', 'Madarasa', 'Seminary',
+]
+
+DESCRIPTOR_KEYWORDS = [
+    'BUILDING', 'BLDG', 'PORTION', 'WING', 'BLOCK', 'FLOOR', 'ROOM',
+    'SHED', 'SIDE', 'SECTION', 'ANNEX', 'EXTENSION', 'ADDL', 'ADDITIONAL',
+    'NEW', 'OLD', 'MAIN', 'NORTH', 'SOUTH', 'EAST', 'WEST', 'LEFT', 'RIGHT',
+    'UPPER', 'LOWER', 'GROUND', 'FIRST', 'SECOND', 'THIRD', 'FRONT', 'REAR',
+    'BACK', 'CENTRAL', 'MIDDLE',
+]
+
+BOOTH_COLUMN_KEYWORDS = ['polling station', 'booth', 'building name', 'address', 'location']
+
+
+def extract_booth_name(text):
+    """Extract the core institution/building name from a polling station address."""
+    if not text or not isinstance(text, str):
+        return ""
+
+    # Step 1: Take text before first comma
+    text = text.split(",", 1)[0].strip()
+
+    # Step 2: Remove pincode patterns (6-digit numbers, optionally preceded by dash/space)
+    text = re.sub(r'[\s\-]*\d{6}\b', '', text).strip()
+
+    # Step 3: Remove trailing parenthetical descriptors
+    match = re.search(r'\(([^)]+)\)\s*$', text)
+    if match:
+        paren_content = match.group(1).upper()
+        if any(kw in paren_content for kw in DESCRIPTOR_KEYWORDS):
+            text = text[:match.start()].strip()
+
+    # Step 4A: Standalone institution keyword — return text up to and including it
+    for keyword in INSTITUTION_KEYWORDS:
+        pattern = re.compile(r'^(.*?\b' + re.escape(keyword) + r'\b)', re.IGNORECASE)
+        m = pattern.search(text)
+        if m:
+            return m.group(1).strip()
+
+    # Step 4B: Dotted abbreviation at start (e.g. P.U.M.S, P.U.E.S, P.U.M.School)
+    m = re.match(r'^((?:[A-Z]\.){2,}[A-Za-z]*)', text)
+    if m:
+        return m.group(1).strip()
+
+    # Fallback: return cleaned text as-is
+    return text.strip()
+
+
+def add_booth_name_column(header_rows, data_rows, source_col_idx):
+    """Insert a 'Booth Name' column immediately after the source column."""
+    new_headers = []
+    for i, row in enumerate(header_rows):
+        new_row = list(row)
+        label = "Booth Name" if i == 0 else ""
+        new_row.insert(source_col_idx + 1, label)
+        new_headers.append(new_row)
+
+    new_data = []
+    for row in data_rows:
+        new_row = list(row)
+        source_text = row[source_col_idx] if source_col_idx < len(row) else ""
+        booth_name = extract_booth_name(source_text)
+        new_row.insert(source_col_idx + 1, booth_name)
+        new_data.append(new_row)
+
+    return new_headers, new_data
+
+
+def pick_booth_column(header_rows):
+    """Display column headers and let user pick the source column interactively."""
+    from rich.prompt import IntPrompt
+
+    # Combine multi-row headers into single labels
+    if not header_rows:
+        return None
+
+    col_count = max(len(row) for row in header_rows)
+    labels = []
+    for c in range(col_count):
+        parts = [str(row[c]).strip() for row in header_rows if c < len(row) and str(row[c]).strip()]
+        labels.append(" | ".join(parts) if parts else f"(Column {c + 1})")
+
+    console.print()
+    console.print("[bold]Select the source column for booth name extraction:[/bold]")
+    table = Table(show_header=True, header_style="bold cyan")
+    table.add_column("#", justify="right", width=4)
+    table.add_column("Column Name")
+    for i, label in enumerate(labels):
+        table.add_row(str(i + 1), label)
+    console.print(table)
+
+    choice = IntPrompt.ask(
+        "Enter column number",
+        default=1,
+        console=console,
+    )
+    idx = choice - 1
+    if idx < 0 or idx >= col_count:
+        console.print("[red]Invalid choice. Skipping booth name extraction.[/red]")
+        return None
+    console.print(f"[green]Selected:[/green] {labels[idx]}")
+    return idx
 
 
 @dataclass
@@ -126,7 +235,7 @@ def write_excel(header_rows, data_rows, output_path):
     wb.save(output_path)
 
 
-def process_pdf(client, pdf_path, output_path, progress, file_task_id):
+def process_pdf(client, pdf_path, output_path, progress, file_task_id, booth_col_idx=None):
     """Analyze a single PDF and save the extracted table as an Excel file."""
     filename = os.path.basename(pdf_path)
     start = time.perf_counter()
@@ -154,6 +263,12 @@ def process_pdf(client, pdf_path, output_path, progress, file_task_id):
     # Step 2: Extract tables
     progress.update(file_task_id, description=f"[cyan]Extracting tables from [bold]{filename}[/bold]... ({page_count} pages)")
     header_rows, data_rows = tables_to_rows(result)
+
+    # Step 2.5: Add booth name column if requested
+    if booth_col_idx is not None:
+        progress.update(file_task_id, description=f"[cyan]Extracting booth names from [bold]{filename}[/bold]...")
+        header_rows, data_rows = add_booth_name_column(header_rows, data_rows, booth_col_idx)
+
     result_info.rows = len(header_rows) + len(data_rows)
 
     # Step 3: Write Excel
@@ -170,7 +285,7 @@ def process_pdf(client, pdf_path, output_path, progress, file_task_id):
     return result_info
 
 
-def run_batch(client, pdf_files, output_dir):
+def run_batch(client, pdf_files, output_dir, booth_col_idx=None):
     """Process a list of PDF files with rich progress UI."""
     results = []
     total_start = time.perf_counter()
@@ -191,7 +306,7 @@ def run_batch(client, pdf_files, output_dir):
 
         for pdf_file in pdf_files:
             xlsx_path = output_dir / (pdf_file.stem + ".xlsx")
-            info = process_pdf(client, str(pdf_file), str(xlsx_path), progress, file_task)
+            info = process_pdf(client, str(pdf_file), str(xlsx_path), progress, file_task, booth_col_idx)
             results.append(info)
 
             if info.success:
@@ -298,6 +413,11 @@ def main():
         help="Output .xlsx file path (single file) or folder (batch mode). "
              "If omitted, a folder picker dialog will open."
     )
+    parser.add_argument(
+        "--extract-booth", action="store_true",
+        help="Extract booth/institution names into a new column. "
+             "You will be prompted to pick the source column interactively."
+    )
     args = parser.parse_args()
 
     console.print(Panel("[bold]PDF Table Extractor[/bold]\nAzure Document Intelligence + Excel", border_style="blue"))
@@ -336,7 +456,24 @@ def main():
     console.print(f"[bold]{len(pdf_files)}[/bold] PDF file(s) selected")
     console.print(f"Output folder: [dim]{output_dir}[/dim]")
 
-    run_batch(client, pdf_files, output_dir)
+    # --- Booth name extraction: peek at first PDF to let user pick column ---
+    booth_col_idx = None
+    if args.extract_booth:
+        console.print()
+        console.print("[bold yellow]Booth name extraction enabled.[/bold yellow]")
+        console.print("Peeking at first PDF to detect columns...")
+        try:
+            peek_result = analyze_pdf(client, str(pdf_files[0]))
+            peek_headers, _ = tables_to_rows(peek_result)
+            if peek_headers:
+                booth_col_idx = pick_booth_column(peek_headers)
+            else:
+                console.print("[red]No headers found in first PDF. Skipping booth extraction.[/red]")
+        except Exception as e:
+            console.print(f"[red]Failed to peek at first PDF: {e}[/red]")
+            console.print("[yellow]Continuing without booth extraction.[/yellow]")
+
+    run_batch(client, pdf_files, output_dir, booth_col_idx)
 
 
 if __name__ == "__main__":

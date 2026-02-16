@@ -14,6 +14,7 @@ ghostscript>=0.7
 azure-ai-documentintelligence>=1.0.0
 azure-core>=1.30.0
 rich>=13.0.0  # Used by pdf_table_extractor.py
+pypdf>=4.0.0  # PDF rotation fix before Azure DI processing
 
 # Excel Creation
 openpyxl>=3.1.5
