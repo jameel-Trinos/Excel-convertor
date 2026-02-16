@@ -31,7 +31,7 @@ from rich.text import Text
 
 console = Console()
 
-# Number of header rows repeated on each page of the PDF table.
+# Number of header rows at the top of each table page.
 HEADER_ROWS = 2
 
 # Azure Document Intelligence Layout pricing: $10 per 1000 pages
@@ -114,15 +114,17 @@ def pick_booth_column(header_rows):
     """Display column headers and let user pick the source column interactively."""
     from rich.prompt import IntPrompt
 
-    # Combine multi-row headers into single labels
     if not header_rows:
         return None
 
-    col_count = max(len(row) for row in header_rows)
+    # Use only the first header row (actual column names),
+    # skip serial number rows and any other sub-headers
+    first_row = header_rows[0]
+    col_count = len(first_row)
     labels = []
     for c in range(col_count):
-        parts = [str(row[c]).strip() for row in header_rows if c < len(row) and str(row[c]).strip()]
-        labels.append(" | ".join(parts) if parts else f"(Column {c + 1})")
+        val = str(first_row[c]).strip()
+        labels.append(val if val else f"(Column {c + 1})")
 
     console.print()
     console.print("[bold]Select the source column for booth name extraction:[/bold]")
@@ -182,7 +184,11 @@ def analyze_pdf(client, pdf_path):
 
 
 def tables_to_rows(result):
-    """Convert Azure DI tables into a single list of rows, deduplicating headers."""
+    """Convert Azure DI tables into a single list of rows, deduplicating headers.
+
+    First 2 rows of each table are headers. Only kept from the first table,
+    skipped on subsequent tables to avoid duplicates.
+    """
     if not result.tables:
         return [], []
 
@@ -413,15 +419,26 @@ def main():
         help="Output .xlsx file path (single file) or folder (batch mode). "
              "If omitted, a folder picker dialog will open."
     )
-    parser.add_argument(
-        "--extract-booth", action="store_true",
-        help="Extract booth/institution names into a new column. "
-             "You will be prompted to pick the source column interactively."
-    )
     args = parser.parse_args()
 
     console.print(Panel("[bold]PDF Table Extractor[/bold]\nAzure Document Intelligence + Excel", border_style="blue"))
 
+    # --- Interactive mode selector ---
+    from rich.prompt import IntPrompt
+    console.print()
+    console.print("[bold]What would you like to do?[/bold]")
+    mode_table = Table(show_header=True, header_style="bold cyan")
+    mode_table.add_column("#", justify="right", width=4)
+    mode_table.add_column("Mode")
+    mode_table.add_column("Description")
+    mode_table.add_row("1", "Booth Extraction", "Extract tables + add booth/institution name column")
+    mode_table.add_row("2", "Standard Extraction", "Extract tables to Excel as-is")
+    console.print(mode_table)
+
+    mode_choice = IntPrompt.ask("Select mode", default=1, console=console)
+    extract_booth = mode_choice == 1
+
+    console.print()
     client = get_client()
 
     # --- Determine PDF files and output directory ---
@@ -458,7 +475,7 @@ def main():
 
     # --- Booth name extraction: peek at first PDF to let user pick column ---
     booth_col_idx = None
-    if args.extract_booth:
+    if extract_booth:
         console.print()
         console.print("[bold yellow]Booth name extraction enabled.[/bold yellow]")
         console.print("Peeking at first PDF to detect columns...")

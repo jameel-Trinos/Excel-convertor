@@ -224,8 +224,8 @@ class PDFProcessor:
         if not header_rows:
             raise ExtractionError("Azure DI could not extract headers from the PDF")
 
-        # Build headers from header_rows (use last row as most specific)
-        headers = header_rows[-1] if header_rows else []
+        # Use first header row as column names
+        headers = header_rows[0]
 
         # Normalize data row lengths to match headers
         for i, row in enumerate(data_rows):

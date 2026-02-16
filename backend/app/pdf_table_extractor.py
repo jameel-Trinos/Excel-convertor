@@ -30,7 +30,7 @@ from rich.text import Text
 
 console = Console()
 
-# Number of header rows repeated on each page of the PDF table.
+# Number of header rows at the top of each table page.
 HEADER_ROWS = 2
 
 # Azure Document Intelligence Layout pricing: $10 per 1000 pages
@@ -61,8 +61,8 @@ def get_client():
     )
 
 
-def _send_to_azure(client, pdf_path):
-    """Send a PDF to Azure DI and return the raw result."""
+def analyze_pdf(client, pdf_path):
+    """Send a local PDF to Azure Document Intelligence and return the result."""
     with open(pdf_path, "rb") as f:
         poller = client.begin_analyze_document(
             "prebuilt-layout",
@@ -72,74 +72,12 @@ def _send_to_azure(client, pdf_path):
     return poller.result()
 
 
-def _fix_rotated_pdf(pdf_path, page_angles):
-    """Create a corrected PDF using rotation angles detected by Azure DI.
-
-    Args:
-        pdf_path: Original PDF path.
-        page_angles: dict of {page_index: angle} for pages that need fixing.
-
-    Returns:
-        temp_file_path — caller must delete after use.
-    """
-    import tempfile
-    from pypdf import PdfReader, PdfWriter
-
-    reader = PdfReader(pdf_path)
-    writer = PdfWriter()
-
-    for i, page in enumerate(reader.pages):
-        if i in page_angles:
-            angle = page_angles[i]
-            # Round to nearest 90° and counter-rotate
-            correction = -round(angle / 90) * 90
-            console.print(f"  [yellow]Page {i+1}: detected {angle}° — applying {correction}° correction[/]")
-            page.rotate(correction)
-        writer.add_page(page)
-
-    tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
-    writer.write(tmp)
-    tmp.close()
-    return tmp.name
-
-
-def analyze_pdf(client, pdf_path):
-    """Send a PDF to Azure DI with automatic rotation correction.
-
-    Pass 1: Send original PDF, check page angles from the result.
-    Pass 2: If any page is rotated (|angle| > 5°), correct with pypdf
-             and re-send for accurate table extraction.
-    """
-    # Pass 1 — detect rotation
-    result = _send_to_azure(client, pdf_path)
-
-    if not result.pages:
-        return result
-
-    # Check which pages are rotated
-    rotated = {}
-    for page in result.pages:
-        angle = getattr(page, "angle", 0) or 0
-        if abs(angle) > 5:
-            rotated[page.page_number - 1] = angle  # 0-indexed
-
-    if not rotated:
-        return result  # No rotation — pass 1 result is good
-
-    # Pass 2 — fix and re-send
-    console.print(
-        f"[yellow]Rotated pages detected (pages {[i+1 for i in sorted(rotated)]}) "
-        f"— correcting and re-analysing...[/]"
-    )
-    temp_file = _fix_rotated_pdf(pdf_path, rotated)
-    try:
-        return _send_to_azure(client, temp_file)
-    finally:
-        os.unlink(temp_file)
-
-
 def tables_to_rows(result):
-    """Convert Azure DI tables into a single list of rows, deduplicating headers."""
+    """Convert Azure DI tables into a single list of rows, deduplicating headers.
+
+    First 2 rows of each table are headers. Only kept from the first table,
+    skipped on subsequent tables to avoid duplicates.
+    """
     if not result.tables:
         return [], []
 
