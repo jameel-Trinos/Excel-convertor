@@ -43,11 +43,15 @@ from .models import (
     TranslateStartResponse,
     TranslateStatusResponse,
     UploadResponse,
+    NormalizeColumnRequest,
 )
 from .geocoding_service import GeocodingService, extract_addresses_from_column
 from .pdf_processor import PDFProcessor
 from .translation_service import TranslationAPIError
-from .utils import cleanup_file, validate_pdf_file, sanitize_text
+from .utils import cleanup_file, validate_pdf_file, sanitize_text, clean_excel_filename
+
+import openpyxl
+from .party_normalizer import PartyNormalizer
 
 # Load environment variables from .env file
 load_dotenv()
@@ -798,6 +802,421 @@ async def get_preview(task_id: str):
         )
 
 
+@app.get("/api/preview-full/{task_id}", response_model=FullPreviewData)
+async def get_full_preview(task_id: str):
+    """
+    Get full data for spreadsheet editor.
+    """
+    if task_id not in tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    task = tasks[task_id]
+
+    if task.status != "completed":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Task not completed. Current status: {task.status}",
+        )
+
+    if not task.output_file or not Path(task.output_file).exists():
+        raise HTTPException(status_code=404, detail="Output file not found")
+
+    # Read Excel file
+    try:
+        import openpyxl
+
+        wb = openpyxl.load_workbook(task.output_file, data_only=True)
+        ws = wb.active
+
+        # Reuse logic to find data boundaries
+        actual_max_row = ws.max_row if ws.max_row else 0
+        actual_max_col = ws.max_column if ws.max_column else 0
+
+        last_data_row = actual_max_row
+        scan_limit = max(actual_max_row + 100, 1000)
+        for row in range(1, min(scan_limit + 1, 2000)):
+            for col in range(1, min(actual_max_col + 100, 200)):
+                cell = ws.cell(row, col)
+                if cell.value is not None and str(cell.value).strip():
+                    actual_max_row = max(actual_max_row, row)
+                    actual_max_col = max(actual_max_col, col)
+                    last_data_row = row
+            if row > last_data_row + 50:
+                break
+
+        if actual_max_row == 0:
+            actual_max_row = ws.max_row if ws.max_row else 100
+        if actual_max_col == 0:
+            actual_max_col = ws.max_column if ws.max_column else 50
+
+        # Find data start row
+        data_start_row = 1
+        document_title = None
+        for row in range(1, min(20, actual_max_row + 1)):
+            cell_value = ws.cell(row, 1).value
+            if cell_value and str(cell_value).strip():
+                if row == 1 and "FORM" in str(cell_value).upper():
+                    document_title = str(cell_value).strip()
+                    continue
+                non_empty_count = sum(
+                    1 for col in range(1, min(actual_max_col + 1, 20))
+                    if ws.cell(row, col).value and str(ws.cell(row, col).value).strip()
+                )
+                if non_empty_count >= 2:
+                    data_start_row = row
+                    break
+        
+        first_data_row = data_start_row + 1
+        for row in range(data_start_row + 1, min(data_start_row + 10, actual_max_row + 1)):
+            cell_val = ws.cell(row, 1).value
+            if cell_val is not None:
+                if isinstance(cell_val, (int, float)) or (isinstance(cell_val, str) and cell_val.strip().isdigit()):
+                    first_data_row = row
+                    break
+
+        num_header_rows = first_data_row - data_start_row
+
+        headers = []
+        for col in range(1, actual_max_col + 1):
+            header_parts = []
+            for header_row in range(data_start_row, data_start_row + num_header_rows):
+                value = ws.cell(header_row, col).value
+                if value is not None and str(value).strip():
+                    clean_value = str(value).strip()
+                    if clean_value.upper() not in ['PARTY ABBREVIATION', 'NO. OF VALID VOTES CAST IN FAVOUR OF']:
+                        header_parts.append(clean_value)
+            
+            if header_parts:
+                if len(header_parts) == 1:
+                    headers.append(header_parts[0])
+                else:
+                    combined = " - ".join(header_parts[-2:]) if len(header_parts) >= 2 else header_parts[-1]
+                    headers.append(combined)
+            else:
+                headers.append(f"Column {col}")
+
+        if not headers:
+             for col in range(1, min(actual_max_col + 1, 50)):
+                headers.append(f"Column {col}")
+
+        rows = []
+        for row_idx in range(first_data_row, actual_max_row + 1):
+            row_data = []
+            num_cols_to_read = max(len(headers), actual_max_col)
+            for col in range(1, num_cols_to_read + 1):
+                value = ws.cell(row_idx, col).value
+                if isinstance(value, str):
+                    value = sanitize_text(value, single_line=False)
+                row_data.append(value)
+            while len(row_data) < len(headers):
+                row_data.append(None)
+            if len(row_data) > len(headers):
+                row_data = row_data[:len(headers)]
+            rows.append(row_data)
+
+        # Calculate pages processed (simplified)
+        pages_processed = 1
+        
+        return FullPreviewData(
+            headers=headers,
+            rows=rows,
+            total_rows=len(rows),
+            total_columns=len(headers),
+            pages_processed=pages_processed,
+            document_title=document_title,
+        )
+
+    except Exception as e:
+        logger.error(f"Failed to get full preview: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get full preview: {str(e)}",
+        )
+
+
+@app.post("/api/normalize-column", response_model=FullPreviewData)
+async def normalize_column(request: NormalizeColumnRequest):
+    """
+    Normalize a column to Party Names using reference data.
+    
+    Uses fuzzy matching and reverse text detection to map candidate names
+    to their respective parties based on dets.json key-value pairs.
+    """
+    if request.task_id not in tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    task = tasks[request.task_id]
+
+    if task.status != "completed":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Task not completed. Current status: {task.status}",
+        )
+
+    if not task.output_file or not Path(task.output_file).exists():
+        raise HTTPException(status_code=404, detail="Output file not found")
+
+    try:
+        import openpyxl
+
+        # Initialize normalizer
+        normalizer = PartyNormalizer()
+        
+        wb = openpyxl.load_workbook(task.output_file, data_only=True)
+        ws = wb.active
+
+        # Find actual data range (reuse logic from add_booth_name_column)
+        actual_max_row = ws.max_row if ws.max_row else 0
+        actual_max_col = ws.max_column if ws.max_column else 0
+
+        # Scan to find actual data boundaries
+        last_data_row = actual_max_row
+        scan_limit = max(actual_max_row + 100, 1000)
+        for row in range(1, min(scan_limit + 1, 2000)):
+            for col in range(1, min(actual_max_col + 100, 200)):
+                cell = ws.cell(row, col)
+                if cell.value is not None and str(cell.value).strip():
+                    actual_max_row = max(actual_max_row, row)
+                    actual_max_col = max(actual_max_col, col)
+                    last_data_row = row
+            if row > last_data_row + 50:
+                break
+        
+        if actual_max_row == 0:
+            actual_max_row = ws.max_row if ws.max_row else 100
+        if actual_max_col == 0:
+            actual_max_col = ws.max_column if ws.max_column else 50
+
+        # Find data start row
+        data_start_row = 1
+        document_title = None
+        for row in range(1, min(20, actual_max_row + 1)):
+            cell_value = ws.cell(row, 1).value
+            if cell_value and str(cell_value).strip():
+                if row == 1 and "FORM" in str(cell_value).upper():
+                    document_title = str(cell_value).strip()
+                    continue
+                non_empty_count = sum(
+                    1 for col in range(1, min(actual_max_col + 1, 20))
+                    if ws.cell(row, col).value and str(ws.cell(row, col).value).strip()
+                )
+                if non_empty_count >= 2:
+                    data_start_row = row
+                    break
+        
+        first_data_row = data_start_row + 1
+        # Find where numeric data starts to confirm data rows
+        for row in range(data_start_row + 1, min(data_start_row + 10, actual_max_row + 1)):
+            cell_val = ws.cell(row, 1).value
+            if cell_val is not None:
+                if isinstance(cell_val, (int, float)) or (isinstance(cell_val, str) and cell_val.strip().isdigit()):
+                    first_data_row = row
+                    break
+
+        num_header_rows = first_data_row - data_start_row
+
+        # Get headers
+        headers = []
+        for col in range(1, actual_max_col + 1):
+            header_parts = []
+            for header_row in range(data_start_row, data_start_row + num_header_rows):
+                value = ws.cell(header_row, col).value
+                if value is not None and str(value).strip():
+                    clean_value = str(value).strip()
+                    if clean_value.upper() not in ['PARTY ABBREVIATION', 'NO. OF VALID VOTES CAST IN FAVOUR OF']:
+                        header_parts.append(clean_value)
+            
+            if header_parts:
+                if len(header_parts) == 1:
+                    headers.append(header_parts[0])
+                else:
+                    combined = " - ".join(header_parts[-2:]) if len(header_parts) >= 2 else header_parts[-1]
+                    headers.append(combined)
+            else:
+                headers.append(f"Column {col}")
+        
+        if not headers:
+             for col in range(1, min(actual_max_col + 1, 50)):
+                headers.append(f"Column {col}")
+
+        # Find target column index
+        target_col_idx = None
+        for idx, header in enumerate(headers):
+            if header == request.column_name:
+                target_col_idx = idx + 1 # 1-based index for openpyxl
+                break
+        
+        if target_col_idx is None:
+            # Fallback check for simplified match
+            for idx, header in enumerate(headers):
+                if request.column_name in header:
+                    target_col_idx = idx + 1
+                    break
+
+        if target_col_idx is None:
+             raise HTTPException(
+                status_code=400,
+                detail=f"Column '{request.column_name}' not found",
+            )
+
+        # Find Constituency column index for context (optional)
+        constituency_col_idx = None
+        for idx, header in enumerate(headers):
+            if "CONSTITUENCY" in header.upper():
+                constituency_col_idx = idx + 1
+                break
+
+        # Normalize values in the column
+        normalized_count = 0
+        wb_save = openpyxl.load_workbook(task.output_file)
+        ws_save = wb_save.active
+        
+        for row_idx in range(first_data_row, actual_max_row + 1):
+            # Read from data_only workbook
+            cell = ws.cell(row_idx, target_col_idx)
+            original_value = cell.value
+            
+            if original_value and isinstance(original_value, str):
+                # Construct context for collision handling
+                context_parts = []
+                if document_title:
+                    context_parts.append(document_title)
+                
+                if constituency_col_idx:
+                    const_cell = ws.cell(row_idx, constituency_col_idx)
+                    const_val = const_cell.value
+                    if const_val and str(const_val).strip():
+                        context_parts.append(str(const_val).strip())
+                
+                context = " ".join(context_parts)
+                normalized_value = normalizer.normalize_value(original_value, context)
+                if normalized_value != original_value:
+                    # Write to save workbook
+                    ws_save.cell(row_idx, target_col_idx).value = normalized_value
+                    normalized_count += 1
+        
+        logger.info(f"Normalized {normalized_count} values in column {request.column_name}")
+        
+        # Save updated workbook
+        wb_save.save(task.output_file)
+        wb_save.close()
+        wb.close()
+
+        # Reload for response via get_full_preview logic
+        return await get_full_preview(task.task_id)
+
+    except Exception as e:
+        logger.error(f"Column normalization error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/normalize-headers", response_model=FullPreviewData)
+async def normalize_headers(request: NormalizeColumnRequest):
+    """
+    Normalize all headers in the first data row (column names) to Party Names.
+    Uses 'Constellation Strategy': detected constituency from headers to resolve ambiguity.
+    """
+    if request.task_id not in tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    task = tasks[request.task_id]
+
+    if task.status != "completed":
+        raise HTTPException(status_code=400, detail="Task processing not completed")
+
+    if not os.path.exists(task.output_file):
+        raise HTTPException(status_code=404, detail="Output file not found")
+
+    try:
+        # Load workbook
+        wb = openpyxl.load_workbook(task.output_file)
+        ws = wb.active
+
+        # Identify header row
+        header_row = None
+        
+        # Scan first 20 rows
+        for row in range(1, 21):
+            non_empty_count = sum(1 for col in range(1, 20) if ws.cell(row, col).value)
+            if non_empty_count >= 2:
+                header_row = row
+                break
+        
+        if not header_row:
+             wb.close()
+             raise HTTPException(status_code=400, detail="Could not detect header row")
+
+        # Get all headers
+        max_col = ws.max_column
+        headers = []
+        header_cells = []
+        for col in range(1, max_col + 1):
+            cell = ws.cell(header_row, col)
+            val = str(cell.value) if cell.value else ""
+            headers.append(val)
+            header_cells.append(cell)
+
+        # 1. Detect Constituency from all headers
+        normalizer = PartyNormalizer()
+        
+        # We need to collect valid candidate names to detect constituency
+        # normalizer.detect_constituency takes a list of strings
+        detected_constituency = normalizer.detect_constituency(headers)
+        
+        if detected_constituency:
+            logger.info(f"Detected constituency context '{detected_constituency}' for task {task.task_id}")
+        else:
+            logger.warning(f"No constituency context detected for task {task.task_id}")
+
+        # 2. Normalize each header
+        normalized_count = 0
+        skipped_count = 0
+        no_match_count = 0
+
+        for idx, header in enumerate(headers):
+            if not header:
+                continue
+
+            # Use constituency-filtered normalization if constituency detected
+            if detected_constituency:
+                # Use strict constituency-based matching
+                normalized_value = normalizer.normalize_value(
+                    header,
+                    constituency=detected_constituency,
+                    use_constituency_filter=True  # Enable conservative matching
+                )
+            else:
+                # Fallback to original logic if no constituency detected
+                logger.warning(f"No constituency detected, using legacy normalization for '{header}'")
+                normalized_value = normalizer.normalize_value(header, use_constituency_filter=False)
+
+            if normalized_value != header and normalized_value != "None":
+                # Valid normalization occurred
+                # Update cell value
+                header_cells[idx].value = normalized_value
+                normalized_count += 1
+                logger.info(f"✓ Normalized: '{header}' -> '{normalized_value}'")
+            elif normalized_value == header:
+                # No match found or blacklisted
+                no_match_count += 1
+                logger.debug(f"○ Kept original: '{header}' (no match or blacklisted)")
+            else:
+                skipped_count += 1
+
+        logger.info(f"Normalization complete: {normalized_count} normalized, "
+                   f"{no_match_count} kept original, {skipped_count} skipped")
+
+        wb.save(task.output_file)
+        wb.close()
+
+        # Return updated preview
+        return await get_full_preview(task.task_id)
+
+    except Exception as e:
+        logger.error(f"Header normalization error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/columns/{task_id}")
 async def get_columns(task_id: str):
     """
@@ -948,7 +1367,8 @@ async def download_excel(task_id: str):
 
     # Generate download filename
     original_name = Path(task.filename).stem
-    download_name = f"{original_name}.xlsx"
+    clean_name = clean_excel_filename(original_name)
+    download_name = f"{clean_name}.xlsx"
 
     return FileResponse(
         task.output_file,
@@ -1393,7 +1813,8 @@ async def download_modified_excel(request: DownloadModifiedRequest):
 
         # Return file for download
         original_name = Path(task.filename).stem if task.filename else "data"
-        download_name = f"{original_name}_modified.xlsx"
+        clean_name = clean_excel_filename(original_name)
+        download_name = f"{clean_name}.xlsx"
 
         return FileResponse(
             str(output_path),

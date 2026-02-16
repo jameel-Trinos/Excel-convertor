@@ -1,4 +1,4 @@
-"""PDF table extraction with automatic text/image detection and OCR support."""
+"""PDF table extraction with automatic text/image detection and Azure DI support."""
 
 import asyncio
 import hashlib
@@ -121,28 +121,30 @@ class PDFProcessor:
             else:
                 use_ocr = self.force_ocr
 
-            # Extract using appropriate method
+            # Route to appropriate extraction method
             if use_ocr:
+                # Use Azure Document Intelligence for image/scanned PDFs
                 result = await self._extract_with_ocr(update_progress)
-                extraction_method = "ocr"
+                extraction_method = "azure_di"
             else:
+                # Use pdfplumber for text-based PDFs
                 update_progress(10, "Extracting tables from PDF...")
                 tables = await asyncio.to_thread(self._extract_with_pdfplumber, update_progress)
 
                 if not tables or all(t.is_empty for t in tables):
-                    # Fallback to OCR if pdfplumber finds nothing
-                    logger.info("No tables found with pdfplumber, falling back to OCR...")
-                    update_progress(50, "No text tables found, trying OCR...")
+                    # Fallback to Azure DI
+                    logger.info("No tables found with pdfplumber, falling back to Azure DI...")
+                    update_progress(50, "Trying Azure DI fallback...")
                     result = await self._extract_with_ocr(update_progress)
-                    extraction_method = "ocr_fallback"
+                    extraction_method = "azure_di_fallback"
                 else:
                     # Merge all tables into a single table
                     update_progress(80, "Merging tables from all pages...")
                     merged_table = self._merge_tables(tables)
-                    
+
                     # Extract page texts for AC number extraction
                     page_texts = await asyncio.to_thread(self._extract_page_texts)
-                    
+
                     result = ExtractionResult(
                         tables=[merged_table],
                         page_texts=page_texts,
@@ -181,47 +183,84 @@ class PDFProcessor:
         progress_callback: Optional[Callable[[int, str], None]] = None,
     ) -> ExtractionResult:
         """
-        Extract tables using OCR.
+        Extract tables using Azure Document Intelligence (pdf_table_extractor).
+
+        Uses the existing pdf_table_extractor.py functions:
+        - get_client() to create the Azure DI client
+        - analyze_pdf() to send the PDF to Azure DI
+        - tables_to_rows() to convert Azure DI tables to header/data rows
 
         Args:
             progress_callback: Progress callback function
 
         Returns:
-            ExtractionResult from OCR extraction
+            ExtractionResult from Azure DI extraction
         """
-        from .ocr_processor import OCRProcessor, OCRConfig
+        from .pdf_table_extractor import get_client, analyze_pdf, tables_to_rows
 
         def update_progress(progress: int, message: str):
             if progress_callback:
-                # Adjust progress range for OCR phase (10-90%)
                 adjusted = int(10 + (progress * 0.8))
                 progress_callback(adjusted, message)
 
-        logger.info("Starting OCR extraction...")
-        update_progress(0, "Initializing OCR processor...")
+        logger.info("Starting Azure Document Intelligence extraction...")
+        update_progress(5, "Sending PDF to Azure Document Intelligence...")
 
-        # Configure OCR
-        config = OCRConfig(
-            dpi=300,
-            denoise=True,
-            deskew=True,
-            contrast_enhance=True,
-            use_grid_detection=True,
-            use_easyocr_fallback=False,  # Disabled: EasyOCR has NumPy 2.x incompatibility
-            min_confidence=50.0,
+        client = get_client()
+        result = await asyncio.to_thread(analyze_pdf, client, str(self.file_path))
+
+        page_count = len(result.pages) if result.pages else 0
+        table_count = len(result.tables) if result.tables else 0
+        logger.info(f"Azure DI: {page_count} pages, {table_count} tables found")
+        update_progress(60, f"Analyzed {page_count} pages, found {table_count} tables")
+
+        if table_count == 0:
+            raise ExtractionError("Azure DI found no tables in the PDF")
+
+        # Convert Azure DI tables to header rows + data rows
+        update_progress(70, "Processing extracted tables...")
+        header_rows, data_rows = tables_to_rows(result)
+
+        if not header_rows:
+            raise ExtractionError("Azure DI could not extract headers from the PDF")
+
+        # Build headers from header_rows (use last row as most specific)
+        headers = header_rows[-1] if header_rows else []
+
+        # Normalize data row lengths to match headers
+        for i, row in enumerate(data_rows):
+            if len(row) < len(headers):
+                data_rows[i] = row + [""] * (len(headers) - len(row))
+            elif len(row) > len(headers):
+                data_rows[i] = row[:len(headers)]
+
+        table_data = TableData(
+            headers=headers,
+            rows=data_rows,
+            page_number=1,
+            extraction_method="azure_di",
+            confidence_score=0.90,
+            header_rows=header_rows,
         )
 
-        # Run OCR extraction
-        ocr_processor = OCRProcessor(str(self.file_path), config)
-        result = await asyncio.to_thread(
-            ocr_processor.extract_tables,
-            update_progress
+        # Extract page texts from Azure DI result
+        update_progress(85, "Extracting page texts...")
+        page_texts = []
+        if result.pages:
+            for page in result.pages:
+                page_text_parts = []
+                if hasattr(page, "words") and page.words:
+                    for word in page.words:
+                        page_text_parts.append(word.content)
+                page_texts.append(" ".join(page_text_parts) if page_text_parts else "")
+
+        update_progress(95, "Azure DI extraction complete")
+        logger.info(f"Azure DI: {len(headers)} headers, {len(data_rows)} data rows")
+
+        return ExtractionResult(
+            tables=[table_data],
+            page_texts=page_texts,
         )
-
-        if not result.tables or all(t.is_empty for t in result.tables):
-            raise ExtractionError("OCR extraction found no tables in the PDF")
-
-        return result
 
     def _extract_with_pdfplumber(
         self,

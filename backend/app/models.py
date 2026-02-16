@@ -84,8 +84,9 @@ class TableData(BaseModel):
     page_number: int = Field(default=1)
     title_rows: list[list[str]] = Field(default_factory=list, description="Title rows extracted from PDF (merged cells)")
     header_rows: list[list[str]] = Field(default_factory=list, description="Multi-row headers if present")
-    extraction_method: str = Field(default="pdfplumber", description="Method used for extraction: 'pdfplumber' or 'ocr'")
+    extraction_method: str = Field(default="pdfplumber", description="Method used for extraction: 'pdfplumber', 'azure_di', or 'structured'")
     confidence_score: float = Field(default=1.0, ge=0.0, le=1.0, description="Confidence score for extraction quality (0.0 to 1.0)")
+    merged_cells: list[dict] = Field(default_factory=list, description="Merged cell information from Document AI: [{row, col, row_span, col_span, value, is_header}]")
 
     @property
     def is_empty(self) -> bool:
@@ -298,3 +299,10 @@ class AddBoothNameColumnRequest(BaseModel):
 
     task_id: str = Field(..., description="Task ID of the Excel file")
     source_column: str = Field(..., description="Column name to extract booth names from")
+
+
+class NormalizeColumnRequest(BaseModel):
+    """Request model for normalizing a column."""
+
+    task_id: str = Field(..., description="Task ID of the Excel file")
+    column_name: str = Field(..., description="Column name to normalize")

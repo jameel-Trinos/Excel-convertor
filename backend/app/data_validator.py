@@ -882,6 +882,9 @@ class QualityScorer:
         method_confidence = {
             "pdfplumber": 0.95,
             "ocr": 0.75,
+            "azure_di": 0.90,
+            "azure_di_fallback": 0.90,
+            "constituency_azure_di": 0.90,
             "structured": 0.90,
             "unknown": 0.80,
         }

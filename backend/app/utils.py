@@ -116,6 +116,34 @@ def sanitize_filename(filename: str) -> str:
     return filename
 
 
+def clean_excel_filename(filename: str) -> str:
+    """
+    Clean filename by removing 'xx_' or 'ACxxx_' prefixes and '_modified' suffix.
+    
+    Args:
+        filename: Original filename (stem, without extension)
+
+    Returns:
+        Cleaned filename
+    """
+    if not filename:
+        return "data"
+        
+    import re
+    # Remove _modified suffix if present (case insensitive)
+    filename = re.sub(r'_modified$', '', filename, flags=re.IGNORECASE)
+    
+    # Remove "xx_" or "ACxxx_" prefix if present
+    # Matches starting with alphanumeric (up to 6 chars) followed by underscore or hyphen
+    # e.g., "01_Name" -> "Name", "AC001-Name" -> "Name", "149_Ariyalur" -> "Ariyalur"
+    # We limit prefix length to avoid stripping actual words in multi-word names like "Tiruppur_North"
+    match = re.match(r'^([A-Za-z0-9]{1,6})[-_]\s*(.+)$', filename)
+    if match:
+         return match.group(2)
+         
+    return filename
+
+
 def is_numeric_string(value: str) -> bool:
     """
     Check if a string represents a numeric value.

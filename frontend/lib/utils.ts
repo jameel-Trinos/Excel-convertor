@@ -65,3 +65,30 @@ export function truncateFilename(
 
   return `${truncatedName}.${extension}`;
 }
+
+/**
+ * Clean filename by removing 'xx_' or 'ACxxx_' prefixes and '_modified' suffix.
+ */
+export function cleanFilename(filename: string): string {
+  if (!filename) return "data";
+
+  // Remove extension first
+  const extension = getFileExtension(filename);
+  let name = filename;
+  if (extension) {
+     name = filename.substring(0, filename.lastIndexOf("."));
+  }
+  
+  // Remove _modified suffix if present (case insensitive)
+  name = name.replace(/_modified$/i, "");
+  
+  // Remove "xx_" or "ACxxx_" prefix if present
+  // Matches starting with alphanumeric (up to 6 chars) followed by underscore or hyphen
+  // e.g., "01_Name" -> "Name", "AC001-Name" -> "Name", "149_Ariyalur" -> "Ariyalur"
+  const match = name.match(/^([A-Za-z0-9]{1,6})[-_]\s*(.+)$/);
+  if (match) {
+      name = match[2];
+  }
+  
+  return extension ? `${name}.${extension}` : name;
+}

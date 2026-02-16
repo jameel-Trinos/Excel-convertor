@@ -137,6 +137,10 @@ class ExcelCreator:
 
         data_end_row = data_start_row + len(rows) - 1
 
+        # Apply merged cells if available (from Google Cloud Document AI)
+        if hasattr(table, 'merged_cells') and table.merged_cells:
+            self._apply_merged_cells(worksheet, table.merged_cells, header_row=header_row)
+
         # Format data cells
         self._format_data_cells(
             worksheet,
@@ -318,3 +322,52 @@ class ExcelCreator:
             # Set width with some padding (min 10, max 50)
             adjusted_width = min(max(max_length + 2, 10), 50)
             worksheet.column_dimensions[column_letter].width = adjusted_width
+
+    def _apply_merged_cells(self, worksheet, merged_cells: List[dict], header_row: int = 1):
+        """
+        Apply merged cell formatting from Document AI metadata.
+
+        Args:
+            worksheet: The worksheet to modify
+            merged_cells: List of {row, col, row_span, col_span, value, is_header}
+            header_row: Row number where headers start (default 1)
+        """
+        if not merged_cells:
+            return
+
+        logger.info(f"Applying {len(merged_cells)} merged cell regions...")
+
+        for cell_info in merged_cells:
+            try:
+                # Calculate Excel coordinates (1-indexed)
+                # Document AI rows are 0-indexed, but we need to account for header position
+                if cell_info.get("is_header", False):
+                    # Header merged cell
+                    start_row = header_row
+                else:
+                    # Data merged cell (skip header rows + adjust for 0-index)
+                    start_row = header_row + 1 + cell_info["row"]
+
+                start_col = cell_info["col"] + 1  # Convert from 0-indexed to 1-indexed
+                end_row = start_row + cell_info.get("row_span", 1) - 1
+                end_col = start_col + cell_info.get("col_span", 1) - 1
+
+                # Only merge if span is > 1
+                if end_row > start_row or end_col > start_col:
+                    worksheet.merge_cells(
+                        start_row=start_row,
+                        start_column=start_col,
+                        end_row=end_row,
+                        end_column=end_col
+                    )
+
+                    # Set value in top-left cell
+                    if "value" in cell_info and cell_info["value"]:
+                        worksheet.cell(start_row, start_col).value = cell_info["value"]
+
+                    logger.debug(
+                        f"Merged cells: ({start_row},{start_col}) to ({end_row},{end_col})"
+                    )
+
+            except Exception as e:
+                logger.warning(f"Failed to merge cell region {cell_info}: {e}")

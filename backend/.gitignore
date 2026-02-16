@@ -3,6 +3,10 @@
 .env.local
 .env.*.local
 
+# Google Cloud credentials
+google-cloud-credentials.json
+*-credentials.json
+
 # Virtual environments
 .venv/
 venv/
