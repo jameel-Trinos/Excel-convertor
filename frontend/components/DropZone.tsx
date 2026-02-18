@@ -12,7 +12,7 @@ interface DropZoneProps {
   error?: string | null;
 }
 
-const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50MB
 
 export function DropZone({
   onFileSelect,
@@ -22,13 +22,17 @@ export function DropZone({
 }: DropZoneProps) {
   const onDrop = useCallback(
     (acceptedFiles: File[], rejectedFiles: FileRejection[]) => {
-      if (rejectedFiles.length > 0) {
-        return;
-      }
-
       if (acceptedFiles.length > 0) {
         const file = acceptedFiles[0];
         if (isValidPdfFile(file)) {
+          onFileSelect(file);
+          return;
+        }
+      }
+      // Scanned/OCR PDFs often have MIME type application/octet-stream; still accept by .pdf extension
+      if (rejectedFiles.length > 0) {
+        const file = rejectedFiles[0].file;
+        if (isValidPdfFile(file) && file.size <= MAX_FILE_SIZE) {
           onFileSelect(file);
         }
       }
@@ -39,7 +43,10 @@ export function DropZone({
   const { getRootProps, getInputProps, isDragActive, fileRejections } =
     useDropzone({
       onDrop,
-      accept: { "application/pdf": [".pdf"] },
+      accept: {
+        "application/pdf": [".pdf"],
+        "application/octet-stream": [".pdf"],
+      },
       maxFiles: 1,
       maxSize: MAX_FILE_SIZE,
       disabled: isDisabled,
@@ -48,7 +55,7 @@ export function DropZone({
   const rejectionError =
     fileRejections.length > 0
       ? fileRejections[0].errors[0]?.code === "file-too-large"
-        ? "File is too large. Maximum size is 10MB."
+        ? "File is too large. Maximum size is 50MB."
         : fileRejections[0].errors[0]?.code === "file-invalid-type"
           ? "Only PDF files are accepted."
           : "Invalid file"
@@ -101,7 +108,7 @@ export function DropZone({
                   : "Drag and drop your PDF here"}
               </p>
               <p className="text-sm text-gray-500 mt-1">
-                or click to browse (max 10MB)
+                or click to browse (max 50MB)
               </p>
             </div>
           </div>

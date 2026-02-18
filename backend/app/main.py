@@ -12,7 +12,7 @@ from typing import Dict
 
 import aiofiles
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from sse_starlette.sse import EventSourceResponse
@@ -63,21 +63,15 @@ logger = logging.getLogger(__name__)
 # Configuration
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "./uploads"))
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "./outputs"))
-MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", 10 * 1024 * 1024))  # 10MB default
+MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", 50 * 1024 * 1024))  # 50MB default
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:3001").split(",")
 
 # Ensure directories exist
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# In-memory task storage (use Redis for production)
-tasks: Dict[str, ConversionTask] = {}
-
-# Geocoding task storage
-geocode_tasks: Dict[str, dict] = {}  # {geocode_task_id: {status, results, progress, ...}}
-
-# Translation task storage
-translation_tasks: Dict[str, dict] = {}  # {translate_task_id: {status, progress, ...}}
+# Shared task storage (imported from task_store to allow router access)
+from .task_store import tasks, geocode_tasks, translation_tasks, voter_convert_jobs, update_task_progress
 
 # Booth name extraction helpers
 
@@ -181,26 +175,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-def update_task_progress(task_id: str, progress: int, message: str, step: str = None):
-    """Update task progress in storage."""
-    if task_id in tasks:
-        tasks[task_id].progress = progress
-        tasks[task_id].message = message
+# Include routers
 
 
-async def process_conversion(task_id: str, file_path: Path, use_constituency_processor: bool = False):
+async def process_conversion(
+    task_id: str,
+    file_path: Path,
+    use_constituency_processor: bool = False,
+    force_ocr: bool = False,
+):
     """Simplified background task for PDF to Excel conversion."""
     try:
         tasks[task_id].status = "processing"
         tasks[task_id].message = "Starting conversion..."
 
         update_task_progress(task_id, 10, "Extracting tables from PDF...")
-        logger.info(f"Processing task {task_id} (constituency={use_constituency_processor})")
+        logger.info(
+            f"Processing task {task_id} (constituency={use_constituency_processor}, force_ocr={force_ocr})"
+        )
 
         # Use PDFProcessor for extraction in both cases
-        # The constituency endpoint only differs in Excel formatting, not extraction
-        processor = PDFProcessor(str(file_path))
+        # force_ocr=True: always use OCR path with higher DPI (election / complex image PDFs)
+        processor = PDFProcessor(str(file_path), force_ocr=force_ocr)
 
         def progress_callback(progress: int, message: str):
             # Scale extraction progress to 10-80%
@@ -253,13 +249,31 @@ async def process_conversion(task_id: str, file_path: Path, use_constituency_pro
 
         update_task_progress(task_id, 95, "Finalizing...")
 
-        # Mark as complete
-        tasks[task_id].status = "completed"
-        tasks[task_id].progress = 100
-        tasks[task_id].message = "Conversion completed successfully"
-        tasks[task_id].output_file = str(output_path)
-
-        logger.info(f"Conversion completed for task {task_id}: {output_path}")
+        # Mark as complete or needs_review based on validation (e.g. OCR quality)
+        vr = processor.validation_report
+        if vr and (not vr.passed or (vr.confidence < 0.7)):
+            tasks[task_id].status = "needs_review"
+            tasks[task_id].progress = 100
+            tasks[task_id].message = (
+                "Conversion completed with validation warnings. Please review the data."
+            )
+            tasks[task_id].output_file = str(output_path)
+            tasks[task_id].validation_issues = {
+                "passed": vr.passed,
+                "confidence": round(vr.confidence, 3),
+                "issues": vr.issues[:50],
+                "suggestions": getattr(vr, "suggestions", [])[:10],
+            }
+            logger.info(
+                f"Task {task_id}: needs_review (passed={vr.passed}, confidence={vr.confidence:.2f}, "
+                f"issues={len(vr.issues)})"
+            )
+        else:
+            tasks[task_id].status = "completed"
+            tasks[task_id].progress = 100
+            tasks[task_id].message = "Conversion completed successfully"
+            tasks[task_id].output_file = str(output_path)
+            logger.info(f"Conversion completed for task {task_id}: {output_path}")
 
     except Exception as e:
         logger.error(f"Conversion failed for task {task_id}: {e}", exc_info=True)
@@ -284,11 +298,13 @@ async def health_check():
 async def upload_pdf(
     file: UploadFile = File(...),
     background_tasks: BackgroundTasks = None,
+    force_ocr: bool = Query(False, description="Always use OCR with higher DPI for complex/image election PDFs"),
 ):
     """
     Upload a PDF file for conversion to Excel.
 
-    - **file**: PDF file to convert (max 10MB)
+    - **file**: PDF file to convert (max 50MB)
+    - **force_ocr**: If true, always use OCR extraction with higher DPI (for complex/image election PDFs)
 
     Returns task ID for tracking conversion progress.
     """
@@ -331,8 +347,8 @@ async def upload_pdf(
         message="File uploaded, starting conversion...",
     )
 
-    # Start background conversion
-    background_tasks.add_task(process_conversion, task_id, file_path, False)
+    # Start background conversion (force_ocr for election/complex image PDFs)
+    background_tasks.add_task(process_conversion, task_id, file_path, False, force_ocr)
 
     return UploadResponse(
         task_id=task_id,
@@ -352,7 +368,7 @@ async def upload_booth_pdf(
 
     NOTE: Extraction logic has been cleared. Ready for new implementation.
 
-    - **file**: PDF file to convert (max 10MB)
+    - **file**: PDF file to convert (max 50MB)
 
     Returns task ID for tracking conversion progress.
     """
@@ -403,6 +419,305 @@ async def upload_booth_pdf(
         filename=file.filename,
         size=len(content),
         message="File uploaded successfully. Booth conversion started.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Voters PDF upload & conversion
+# ---------------------------------------------------------------------------
+
+@app.post("/api/voters/upload", response_model=UploadResponse)
+async def upload_voters_pdf(
+    file: UploadFile = File(...),
+    background_tasks: BackgroundTasks = None,
+):
+    """
+    Upload a voter list PDF for extraction to Excel.
+
+    Extracts voter data (Serial No, Name, Father/Husband Name, House No,
+    Age, Gender, Voter ID) with bilingual (Tamil + English) support.
+    """
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are accepted")
+
+    content = await file.read()
+
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=400,
+            detail=f"File too large. Maximum size is {MAX_FILE_SIZE // 1024 // 1024}MB",
+        )
+
+    validation_error = validate_pdf_file(content)
+    if validation_error:
+        raise HTTPException(status_code=400, detail=validation_error)
+
+    task_id = str(uuid.uuid4())
+
+    file_path = UPLOAD_DIR / f"{task_id}.pdf"
+    async with aiofiles.open(file_path, "wb") as f:
+        await f.write(content)
+
+    tasks[task_id] = ConversionTask(
+        task_id=task_id,
+        filename=file.filename,
+        status="pending",
+        progress=0,
+        message="File uploaded, starting voter data extraction...",
+    )
+
+    background_tasks.add_task(process_voters_conversion, task_id, file_path)
+
+    return UploadResponse(
+        task_id=task_id,
+        filename=file.filename,
+        size=len(content),
+        message="File uploaded successfully. Voter extraction started.",
+    )
+
+
+async def process_voters_conversion(task_id: str, file_path: Path):
+    """Background task: extract voter data from PDF and create Excel."""
+    try:
+        tasks[task_id].status = "processing"
+        tasks[task_id].message = "Starting voter data extraction..."
+
+        from .voters_pdf_processor import VotersPDFProcessor
+        from .voters_excel_creator import VotersExcelCreator
+
+        processor = VotersPDFProcessor(str(file_path))
+
+        def progress_cb(progress: int, message: str):
+            scaled = 5 + int(progress * 0.75)
+            update_task_progress(task_id, min(scaled, 85), message)
+
+        result = await asyncio.to_thread(processor.extract, progress_cb)
+
+        update_task_progress(task_id, 88, "Creating Excel file...")
+
+        header_info = result["header_info"]
+        creator = VotersExcelCreator()
+        output_path = OUTPUT_DIR / f"{task_id}.xlsx"
+
+        await asyncio.to_thread(
+            creator.create,
+            headers=result["headers"],
+            rows=result["voters"],
+            output_path=str(output_path),
+            ac_no=header_info.ac_no,
+            part_no=header_info.part_no,
+            address=header_info.address,
+            total_voters=header_info.total_voters,
+            source_filename=tasks[task_id].filename,
+        )
+
+        update_task_progress(task_id, 95, "Finalizing...")
+
+        voter_count = len(result["voters"])
+        if voter_count == 0:
+            tasks[task_id].status = "needs_review"
+            tasks[task_id].progress = 100
+            tasks[task_id].message = "No voter records found. The PDF format may not be recognized."
+            tasks[task_id].output_file = str(output_path)
+            tasks[task_id].validation_issues = {
+                "passed": False,
+                "confidence": 0.0,
+                "issues": ["No voter records extracted from PDF"],
+                "suggestions": [
+                    "Ensure the PDF is an Indian electoral roll (voter list)",
+                    "Try a PDF with clearer text or fewer scanned pages",
+                ],
+            }
+        else:
+            tasks[task_id].status = "completed"
+            tasks[task_id].progress = 100
+            tasks[task_id].message = f"Extraction complete: {voter_count} voters from {result['total_pages']} pages"
+            tasks[task_id].output_file = str(output_path)
+            logger.info(f"Voters extraction done for task {task_id}: {voter_count} voters")
+
+    except Exception as e:
+        logger.error(f"Voters extraction failed for task {task_id}: {e}", exc_info=True)
+        tasks[task_id].status = "failed"
+        tasks[task_id].error = str(e)
+        tasks[task_id].message = f"Extraction failed: {str(e)}"
+
+    finally:
+        await cleanup_file(file_path)
+
+
+@app.post("/api/voters/convert-pdf")
+async def convert_voters_pdf(
+    pdf_file: UploadFile = File(...),
+    background_tasks: BackgroundTasks = None,
+):
+    """
+    Async voter list PDF → Excel conversion with progress tracking.
+
+    Returns a job_id immediately. Poll /api/voters/convert-status/{job_id}
+    for progress. Download via /api/voters/download/{job_id} when completed.
+    """
+    if not pdf_file.filename or not pdf_file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are accepted")
+
+    content = await pdf_file.read()
+
+    max_size = 50 * 1024 * 1024  # 50 MB
+    if len(content) > max_size:
+        raise HTTPException(status_code=400, detail="File too large. Maximum size is 50MB")
+
+    validation_error = validate_pdf_file(content)
+    if validation_error:
+        raise HTTPException(status_code=400, detail=validation_error)
+
+    job_id = str(uuid.uuid4())
+    temp_pdf = UPLOAD_DIR / f"{job_id}.pdf"
+
+    async with aiofiles.open(temp_pdf, "wb") as f:
+        await f.write(content)
+
+    voter_convert_jobs[job_id] = {
+        "status": "processing",
+        "progress": {"current_page": 0, "total_pages": 0},
+        "download_url": None,
+        "output_file": None,
+        "filename": pdf_file.filename,
+        "error": None,
+    }
+
+    background_tasks.add_task(_process_voter_convert_job, job_id, temp_pdf, pdf_file.filename)
+
+    return {"job_id": job_id}
+
+
+async def _process_voter_convert_job(job_id: str, temp_pdf: Path, original_filename: str):
+    """Background task for async voter PDF conversion."""
+    output_xlsx = OUTPUT_DIR / f"{job_id}.xlsx"
+
+    try:
+        from .voters_pdf_processor import VotersPDFProcessor
+        from .voters_excel_creator import VotersExcelCreator
+
+        processor = VotersPDFProcessor(str(temp_pdf))
+
+        def progress_cb(progress: int, message: str):
+            job = voter_convert_jobs.get(job_id)
+            if not job:
+                return
+            # Parse page info from message like "Parsed page 3/20 (...)"
+            import re as _re
+            m = _re.search(r'page\s+(\d+)\s*/\s*(\d+)', message)
+            if m:
+                job["progress"]["current_page"] = int(m.group(1))
+                job["progress"]["total_pages"] = int(m.group(2))
+            elif "Opening" in message or "Starting" in message:
+                job["progress"]["current_page"] = 0
+            # Also try to get total_pages from "Parsing N pages"
+            m2 = _re.search(r'Parsing\s+(\d+)\s+pages', message)
+            if m2:
+                job["progress"]["total_pages"] = int(m2.group(1))
+
+        result = await asyncio.to_thread(processor.extract, progress_cb)
+
+        voter_rows = result["voters"]
+        header_info = result["header_info"]
+
+        if not voter_rows:
+            voter_convert_jobs[job_id]["status"] = "failed"
+            voter_convert_jobs[job_id]["error"] = "No voter records found. Ensure the PDF is an Indian electoral roll."
+            return
+
+        # Update progress for Excel creation phase
+        job = voter_convert_jobs[job_id]
+        job["progress"]["current_page"] = job["progress"]["total_pages"]
+
+        creator = VotersExcelCreator()
+        await asyncio.to_thread(
+            creator.create,
+            headers=result["headers"],
+            rows=voter_rows,
+            output_path=str(output_xlsx),
+            ac_no=header_info.ac_no,
+            part_no=header_info.part_no,
+            address=header_info.address,
+            total_voters=header_info.total_voters,
+            source_filename=original_filename,
+        )
+
+        ac = header_info.ac_no or "unknown"
+        booth = header_info.part_no or "unknown"
+
+        voter_convert_jobs[job_id]["status"] = "completed"
+        voter_convert_jobs[job_id]["output_file"] = str(output_xlsx)
+        voter_convert_jobs[job_id]["download_url"] = f"/api/voters/download/{job_id}"
+
+        logger.info(
+            f"Voter convert job {job_id}: {len(voter_rows)} voters, "
+            f"AC={ac}, Booth={booth}, file={original_filename}"
+        )
+
+    except Exception as e:
+        logger.error(f"Voter convert job {job_id} failed: {e}", exc_info=True)
+        voter_convert_jobs[job_id]["status"] = "failed"
+        voter_convert_jobs[job_id]["error"] = str(e)
+    finally:
+        await cleanup_file(temp_pdf)
+
+
+@app.get("/api/voters/convert-status/{job_id}")
+async def get_voter_convert_status(job_id: str):
+    """
+    Get the status of a voter PDF conversion job.
+
+    Returns status, page-level progress, and download URL when completed.
+    """
+    job = voter_convert_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    response = {
+        "status": job["status"],
+        "progress": job["progress"],
+    }
+
+    if job["status"] == "completed":
+        response["download_url"] = job["download_url"]
+    elif job["status"] == "failed":
+        response["error"] = job["error"]
+
+    return response
+
+
+@app.get("/api/voters/download/{job_id}")
+async def download_voter_convert(job_id: str):
+    """
+    Download the Excel file from a completed voter conversion job.
+
+    Cleans up the output file after download.
+    """
+    job = voter_convert_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if job["status"] != "completed":
+        raise HTTPException(status_code=400, detail="Conversion not yet completed")
+
+    output_path = job.get("output_file")
+    if not output_path or not Path(output_path).exists():
+        raise HTTPException(status_code=404, detail="Output file not found")
+
+    # Build download filename from original
+    original = job.get("filename", "voter_list.pdf")
+    download_name = original.rsplit(".", 1)[0] + ".xlsx"
+
+    bg = BackgroundTasks()
+    bg.add_task(cleanup_file, Path(output_path))
+    bg.add_task(lambda: voter_convert_jobs.pop(job_id, None))
+
+    return FileResponse(
+        path=output_path,
+        filename=download_name,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        background=bg,
     )
 
 

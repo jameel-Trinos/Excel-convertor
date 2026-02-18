@@ -10,86 +10,108 @@ const initialState: UploadState = {
   message: "",
 };
 
-export function useFileUpload() {
+export interface UseFileUploadOptions {
+  /** Always use OCR with higher DPI (e.g. for election results / complex image PDFs) */
+  forceOcr?: boolean;
+}
+
+export function useFileUpload(options?: UseFileUploadOptions) {
+  const { forceOcr = false } = options ?? {};
   const [state, setState] = useState<UploadState>(initialState);
   const unsubscribeRef = useRef<(() => void) | null>(null);
 
-  const uploadFile = useCallback(async (file: File) => {
-    // Cleanup any existing subscription
-    if (unsubscribeRef.current) {
-      unsubscribeRef.current();
-      unsubscribeRef.current = null;
-    }
+  const uploadFile = useCallback(
+    async (file: File) => {
+      // Cleanup any existing subscription
+      if (unsubscribeRef.current) {
+        unsubscribeRef.current();
+        unsubscribeRef.current = null;
+      }
 
-    setState({
-      status: "uploading",
-      progress: 0,
-      message: "Uploading file...",
-      filename: file.name,
-      fileSize: file.size,
-    });
+      setState({
+        status: "uploading",
+        progress: 0,
+        message: "Uploading file...",
+        filename: file.name,
+        fileSize: file.size,
+      });
 
-    try {
-      // Upload the file
-      const { task_id, filename } = await uploadPdf(file);
+      try {
+        // Upload the file (forceOcr for election/complex image PDFs)
+        const result = await uploadPdf(file, { forceOcr });
+        const task_id = result?.task_id;
+        const filename = result?.filename ?? file.name;
 
-      setState((prev) => ({
-        ...prev,
-        status: "processing",
-        progress: 5,
-        message: "Starting conversion...",
-        taskId: task_id,
-        filename,
-      }));
-
-      // Subscribe to progress updates
-      unsubscribeRef.current = subscribeToProgress(
-        task_id,
-        // On progress
-        (event: ProgressEvent) => {
-          setState((prev) => ({
-            ...prev,
-            progress: event.progress,
-            message: event.message,
-            status:
-              event.status === "failed"
-                ? "error"
-                : event.status === "needs_review"
-                  ? "needs_review"
-                  : event.status === "completed"
-                    ? "completed"
-                    : "processing",
-          }));
-        },
-        // On complete
-        () => {
-          setState((prev) => ({
-            ...prev,
-            status: "completed",
-            progress: 100,
-            message: "Conversion completed successfully!",
-          }));
-        },
-        // On error
-        (error: Error) => {
+        if (!task_id) {
           setState((prev) => ({
             ...prev,
             status: "error",
-            error: error.message,
-            message: `Error: ${error.message}`,
+            error: "Invalid server response",
+            message: "Invalid server response. Please try again.",
           }));
+          return;
         }
-      );
-    } catch (error) {
-      setState((prev) => ({
-        ...prev,
-        status: "error",
-        error: error instanceof Error ? error.message : "Upload failed",
-        message:
-          error instanceof Error ? `Error: ${error.message}` : "Upload failed",
-      }));
-    }
-  }, []);
+
+        setState((prev) => ({
+          ...prev,
+          status: "processing",
+          progress: 5,
+          message: "Starting conversion...",
+          taskId: task_id,
+          filename,
+        }));
+
+        // Subscribe to progress updates
+        unsubscribeRef.current = subscribeToProgress(
+          task_id,
+          // On progress
+          (event: ProgressEvent) => {
+            setState((prev) => ({
+              ...prev,
+              progress: event.progress,
+              message: event.message,
+              status:
+                event.status === "failed"
+                  ? "error"
+                  : event.status === "needs_review"
+                    ? "needs_review"
+                    : event.status === "completed"
+                      ? "completed"
+                      : "processing",
+            }));
+          },
+          // On complete
+          () => {
+            setState((prev) => ({
+              ...prev,
+              status: "completed",
+              progress: 100,
+              message: "Conversion completed successfully!",
+            }));
+          },
+          // On error
+          (error: Error) => {
+            setState((prev) => ({
+              ...prev,
+              status: "error",
+              error: error.message,
+              message: `Error: ${error.message}`,
+            }));
+          }
+        );
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : "Upload failed";
+        setState((prev) => ({
+          ...prev,
+          status: "error",
+          error: message,
+          message,
+        }));
+      }
+    },
+    [forceOcr]
+  );
 
   const reset = useCallback(() => {
     // Cleanup subscription

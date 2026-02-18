@@ -33,10 +33,74 @@ function findColumnForParty(
   // Build the label matchPartyLabel would produce, e.g. "DMK Votes"
   const targetLabel = `${abbr} Votes`;
 
+  // First, try exact label matching (most reliable)
   for (const col of columns) {
     const match = matchPartyLabel(col);
     if (match && match.label === targetLabel) {
       return col;
+    }
+  }
+
+  // Fallback: For cases where matchPartyLabel might not match due to confidence thresholds
+  // or unusual column formats, try a more lenient approach
+  // This is especially important for AMMK which might appear as reversed text
+  // like "lakkaM arttennuM magazak ammA" (AMMA MAKKAL MUNNETRA KAZHAGAM reversed)
+  const abbrUpper = abbr.toUpperCase();
+  const abbrNormalized = abbrUpper.replace(/[^A-Z0-9]/g, "");
+  
+  // Only use fallback for abbreviations of 3+ characters to avoid false positives
+  if (abbrNormalized.length >= 3) {
+    for (const col of columns) {
+      // Skip if we already tried this column in the first pass
+      const firstPassMatch = matchPartyLabel(col);
+      if (firstPassMatch && firstPassMatch.label === targetLabel) {
+        continue; // Already handled above
+      }
+      
+      const colUpper = col.toUpperCase();
+      const colNormalized = colUpper.replace(/[^A-Z0-9]/g, "");
+      
+      // Check if abbreviation appears in the normalized column name
+      // This handles full party names like "AMMA MAKKAL MUNNETRA KAZHAGAM"
+      if (colNormalized.includes(abbrNormalized)) {
+        // Verify it's a party column (not an admin column)
+        const colMatch = matchColumnLabel(col);
+        if (colMatch && colMatch.type === "party") {
+          // Try matchPartyLabel one more time - sometimes it works after normalization
+          const partyMatch = matchPartyLabel(col);
+          
+          // If it matches our target label, use it
+          if (partyMatch && partyMatch.label === targetLabel) {
+            return col;
+          }
+          
+          // If it matches a different party label, check if that label's abbreviation matches
+          if (partyMatch && partyMatch.label.endsWith(" Votes")) {
+            const labelAbbr = partyMatch.label.replace(" Votes", "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+            // If the label abbreviation matches our target abbreviation, use it
+            if (labelAbbr === abbrNormalized) {
+              return col;
+            }
+          }
+          
+          // Last resort: if column is a party column and contains the abbreviation,
+          // and matchPartyLabel didn't strongly match another party, use it
+          // This helps with edge cases where confidence is just below threshold (e.g., AMMK)
+          // Only use this if:
+          // 1. No party match at all, OR
+          // 2. Party match confidence is below threshold (suggesting uncertain match)
+          // AND the abbreviation is clearly present in the column name
+          if (!partyMatch || (partyMatch.confidence < 0.90 && partyMatch.label !== targetLabel)) {
+            // Additional safety: verify abbreviation appears as a significant part of the column
+            // (not just a substring that could match accidentally)
+            const abbrIndex = colNormalized.indexOf(abbrNormalized);
+            if (abbrIndex !== -1) {
+              // Column contains abbreviation, is a party column, and no strong conflicting match
+              return col;
+            }
+          }
+        }
+      }
     }
   }
 

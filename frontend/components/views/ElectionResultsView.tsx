@@ -35,7 +35,7 @@ export function ElectionResultsView() {
     filename,
     uploadFile,
     reset,
-  } = useFileUpload();
+  } = useFileUpload({ forceOcr: true });
 
   const handleFileSelect = useCallback(
     (file: File) => {

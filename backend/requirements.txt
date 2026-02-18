@@ -16,12 +16,25 @@ azure-core>=1.30.0
 rich>=13.0.0  # Used by pdf_table_extractor.py
 pypdf>=4.0.0  # PDF rotation fix before Azure DI processing
 
+# OCR Processing (for voter list / grid OCR and complex PDFs)
+pytesseract>=0.3.10
+pdf2image>=1.16.3
+easyocr>=1.7.0  # Fallback OCR engine
+paddlepaddle>=2.6.0  # PaddleOCR deep learning framework
+paddleocr>=2.7.0     # Tamil + English OCR (primary for voter extraction)
+# Note: Tesseract OCR must be installed on the system:
+#   macOS: brew install tesseract
+#   Ubuntu: sudo apt-get install tesseract-ocr
+# Note: Poppler is required for pdf2image:
+#   macOS: brew install poppler
+#   Ubuntu: sudo apt-get install poppler-utils
+
 # Excel Creation
 openpyxl>=3.1.5
 
 # Data Processing
 pandas>=2.1.4
-numpy>=1.26.4
+numpy>=1.26.4,<2  # Pin <2 for torch/paddleocr compatibility
 
 # Utilities
 python-dotenv>=1.0.0

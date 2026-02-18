@@ -48,6 +48,7 @@ export default function Home() {
         {currentView === "booth" && <BoothView />}
         {currentView === "constituency" && <ConstituencyView />}
         {currentView === "voters" && <VotersView />}
+
       </main>
 
       {/* Footer */}

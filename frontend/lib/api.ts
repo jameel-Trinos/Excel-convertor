@@ -20,24 +20,208 @@ import { cleanFilename } from "@/lib/utils";
 const API_BASE_URL =
   process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
+/** Upload request timeout (OCR can make backend slow to respond on first request) */
+const UPLOAD_TIMEOUT_MS = 120_000; // 2 minutes
+/** Extended timeout for voter PDFs (scanned pages need OCR which is slower) */
+const VOTER_UPLOAD_TIMEOUT_MS = 300_000; // 5 minutes
+
+export interface UploadOptions {
+  /** Always use OCR with higher DPI (for complex/image election PDFs) */
+  forceOcr?: boolean;
+}
+
+function getErrorMessage(detail: unknown): string {
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail) && detail.length > 0) {
+    const first = detail[0];
+    if (first && typeof first === "object" && "msg" in first) {
+      return String((first as { msg?: string }).msg) || "Validation failed";
+    }
+  }
+  return "Upload failed";
+}
+
 /**
  * Upload a PDF file for conversion
  */
-export async function uploadPdf(file: File): Promise<UploadResponse> {
+export async function uploadPdf(
+  file: File,
+  options?: UploadOptions
+): Promise<UploadResponse> {
   const formData = new FormData();
   formData.append("file", file);
 
-  const response = await fetch(`${API_BASE_URL}/api/upload`, {
-    method: "POST",
-    body: formData,
-  });
+  const url = new URL(`${API_BASE_URL}/api/upload`);
+  if (options?.forceOcr) {
+    url.searchParams.set("force_ocr", "true");
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), UPLOAD_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(url.toString(), {
+      method: "POST",
+      body: formData,
+      signal: controller.signal,
+    });
+
+    const contentType = response.headers.get("content-type") ?? "";
+    const isJson = contentType.includes("application/json");
+
+    if (!response.ok) {
+      const msg = isJson
+        ? getErrorMessage((await response.json().catch(() => ({}))).detail)
+        : `Server error (${response.status})`;
+      throw new Error(msg);
+    }
+
+    const data = await response.json().catch(() => null);
+    if (!data || typeof data.task_id !== "string") {
+      throw new Error("Invalid server response. Please try again.");
+    }
+    return data as UploadResponse;
+  } catch (err) {
+    if (err instanceof Error && err.name === "AbortError") {
+      throw new Error(
+        "Upload timed out. The file may be large or the server is busy. Try again."
+      );
+    }
+    if (err instanceof TypeError && err.message === "Failed to fetch") {
+      throw new Error(
+        "Cannot reach the server. Make sure the backend is running at " +
+          (API_BASE_URL || "http://localhost:8000")
+      );
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+/**
+ * Upload a PDF file for voters data extraction
+ */
+export async function uploadVotersPdf(file: File): Promise<UploadResponse> {
+  const formData = new FormData();
+  formData.append("file", file);
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), VOTER_UPLOAD_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(`${API_BASE_URL}/api/voters/upload`, {
+      method: "POST",
+      body: formData,
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw new Error(error.detail || "Voters upload failed");
+    }
+
+    return response.json();
+  } catch (err) {
+    if (err instanceof Error && err.name === "AbortError") {
+      throw new Error("Upload timed out. The file may be large or the server is busy. Try again.");
+    }
+    if (err instanceof TypeError && err.message === "Failed to fetch") {
+      throw new Error(
+        "Cannot reach the server. Make sure the backend is running at " +
+          (API_BASE_URL || "http://localhost:8000")
+      );
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+/**
+ * Start an async voter PDF conversion. Returns a job_id for polling.
+ */
+export async function startVoterConvert(file: File): Promise<{ job_id: string }> {
+  const formData = new FormData();
+  formData.append("pdf_file", file);
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), VOTER_UPLOAD_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(`${API_BASE_URL}/api/voters/convert-pdf`, {
+      method: "POST",
+      body: formData,
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw new Error(error.detail || `Upload failed (${response.status})`);
+    }
+
+    return response.json();
+  } catch (err) {
+    if (err instanceof Error && err.name === "AbortError") {
+      throw new Error("Upload timed out. The file may be large or the server is busy. Try again.");
+    }
+    if (err instanceof TypeError && err.message === "Failed to fetch") {
+      throw new Error(
+        "Cannot reach the server. Make sure the backend is running at " +
+          (API_BASE_URL || "http://localhost:8000")
+      );
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+export interface VoterConvertStatus {
+  status: "processing" | "completed" | "failed";
+  progress: { current_page: number; total_pages: number };
+  download_url?: string;
+  error?: string;
+}
+
+/**
+ * Poll the status of a voter PDF conversion job.
+ */
+export async function getVoterConvertStatus(jobId: string): Promise<VoterConvertStatus> {
+  const response = await fetch(`${API_BASE_URL}/api/voters/convert-status/${jobId}`);
 
   if (!response.ok) {
     const error = await response.json().catch(() => ({}));
-    throw new Error(error.detail || "Upload failed");
+    throw new Error(error.detail || "Failed to get conversion status");
   }
 
   return response.json();
+}
+
+/**
+ * Download the Excel file from a completed voter conversion job.
+ */
+export async function downloadVoterConvert(jobId: string, originalFilename: string): Promise<void> {
+  const response = await fetch(`${API_BASE_URL}/api/voters/download/${jobId}`);
+
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}));
+    throw new Error(error.detail || "Download failed");
+  }
+
+  const blob = await response.blob();
+  const disposition = response.headers.get("content-disposition") ?? "";
+  const filenameMatch = disposition.match(/filename="?([^";\n]+)"?/);
+  const filename = filenameMatch?.[1] || originalFilename.replace(".pdf", ".xlsx");
+
+  const url = window.URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  window.URL.revokeObjectURL(url);
+  document.body.removeChild(a);
 }
 
 /**

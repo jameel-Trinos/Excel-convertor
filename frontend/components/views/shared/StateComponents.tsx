@@ -5,19 +5,25 @@ import { useDropzone, FileRejection } from "react-dropzone";
 import { formatFileSize, isValidPdfFile } from "@/lib/utils";
 import type { PreviewData, ValidationIssues } from "@/types";
 
-const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50MB
 
 // Idle State - Drop Zone
 export function IdleState({ onFileSelect }: { onFileSelect: (file: File) => void }) {
   const onDrop = useCallback(
     (acceptedFiles: File[], rejectedFiles: FileRejection[]) => {
-      if (rejectedFiles.length > 0) {
-        return;
-      }
+      // If dropzone rejected (e.g. wrong MIME), still accept .pdf by name (scanned/OCR PDFs often have octet-stream type)
       if (acceptedFiles.length > 0) {
         const file = acceptedFiles[0];
         if (isValidPdfFile(file)) {
           onFileSelect(file);
+          return;
+        }
+      }
+      if (rejectedFiles.length > 0) {
+        const file = rejectedFiles[0].file;
+        if (isValidPdfFile(file) && file.size <= MAX_FILE_SIZE) {
+          onFileSelect(file);
+          return;
         }
       }
     },
@@ -26,7 +32,10 @@ export function IdleState({ onFileSelect }: { onFileSelect: (file: File) => void
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop,
-    accept: { "application/pdf": [".pdf"] },
+    accept: {
+      "application/pdf": [".pdf"],
+      "application/octet-stream": [".pdf"],
+    },
     maxFiles: 1,
     maxSize: MAX_FILE_SIZE,
   });
@@ -57,7 +66,7 @@ export function IdleState({ onFileSelect }: { onFileSelect: (file: File) => void
         <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
         </svg>
-        PDF files up to 10MB
+        PDF files up to 50MB
       </div>
     </div>
   );
