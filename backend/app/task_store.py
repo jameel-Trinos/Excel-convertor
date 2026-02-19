@@ -27,6 +27,24 @@ voter_convert_jobs: Dict[str, dict] = {}
 #   "error": str | None,
 # }
 
+# Bulk voter processing job storage
+bulk_voter_jobs: Dict[str, dict] = {}
+# Each entry: {
+#   "status": "uploading" | "processing" | "completed" | "failed",
+#   "files": [],  # accumulated (index, path, original_name) tuples
+#   "progress": {
+#       "total_pdfs": int,
+#       "completed_pdfs": int,
+#       "current_file": str,
+#       "total_voters_so_far": int,
+#       "failed_count": int,
+#   },
+#   "output_file": str | None,
+#   "download_url": str | None,
+#   "error": str | None,
+#   "summary": dict | None,
+# }
+
 
 def update_task_progress(task_id: str, progress: int, message: str, step: str = None):
     """Update task progress in storage."""

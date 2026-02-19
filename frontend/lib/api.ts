@@ -224,6 +224,144 @@ export async function downloadVoterConvert(jobId: string, originalFilename: stri
   document.body.removeChild(a);
 }
 
+// ============================================================================
+// Bulk Voter Processing API Functions
+// ============================================================================
+
+/**
+ * Initialize a bulk voter upload job. Returns a job_id for subsequent calls.
+ */
+export async function initBulkVoterUpload(): Promise<{ job_id: string }> {
+  const response = await fetch(`${API_BASE_URL}/api/voters/bulk-upload/init`, {
+    method: "POST",
+  });
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}));
+    throw new Error(error.detail || "Failed to initialize bulk upload");
+  }
+  return response.json();
+}
+
+/**
+ * Upload a batch of PDFs to an existing bulk job. Call multiple times for large sets.
+ */
+export async function addBulkVoterFiles(
+  jobId: string,
+  files: File[]
+): Promise<{ added: number; total: number }> {
+  const formData = new FormData();
+  files.forEach((f) => formData.append("files", f));
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), VOTER_UPLOAD_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(
+      `${API_BASE_URL}/api/voters/bulk-upload/add/${jobId}`,
+      { method: "POST", body: formData, signal: controller.signal }
+    );
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw new Error(error.detail || "Failed to upload batch");
+    }
+    return response.json();
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+/**
+ * Start concurrent processing of all uploaded PDFs for a bulk job.
+ */
+export async function startBulkVoterProcessing(
+  jobId: string
+): Promise<{ job_id: string; total_files: number }> {
+  const response = await fetch(
+    `${API_BASE_URL}/api/voters/bulk-upload/start/${jobId}`,
+    { method: "POST" }
+  );
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}));
+    throw new Error(error.detail || "Failed to start bulk processing");
+  }
+  return response.json();
+}
+
+export interface BulkVoterProgress {
+  total_pdfs: number;
+  completed_pdfs: number;
+  current_file: string;
+  total_voters_so_far: number;
+  failed_count: number;
+}
+
+export interface BulkVoterSummary {
+  total_voters: number;
+  successful_pdfs: number;
+  total_pdfs: number;
+  failed_pdfs: { filename: string; error: string }[];
+  booth_groups: {
+    part_no: string;
+    address: string;
+    voter_count: number;
+    filename: string;
+  }[];
+}
+
+export interface BulkVoterStatus {
+  status: "uploading" | "processing" | "completed" | "failed";
+  progress: BulkVoterProgress;
+  download_url?: string;
+  error?: string;
+  summary?: BulkVoterSummary;
+}
+
+/**
+ * Poll the status of a bulk voter processing job.
+ */
+export async function getBulkVoterStatus(
+  jobId: string
+): Promise<BulkVoterStatus> {
+  const response = await fetch(
+    `${API_BASE_URL}/api/voters/bulk-status/${jobId}`
+  );
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}));
+    throw new Error(error.detail || "Failed to get bulk status");
+  }
+  return response.json();
+}
+
+/**
+ * Download the consolidated Excel from a completed bulk voter job.
+ */
+export async function downloadBulkVoters(
+  jobId: string,
+  filename: string = "voters_consolidated.xlsx"
+): Promise<void> {
+  const response = await fetch(
+    `${API_BASE_URL}/api/voters/bulk-download/${jobId}`
+  );
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}));
+    throw new Error(error.detail || "Download failed");
+  }
+
+  const blob = await response.blob();
+  const disposition = response.headers.get("content-disposition") ?? "";
+  const filenameMatch = disposition.match(/filename="?([^";\n]+)"?/);
+  const downloadName = filenameMatch?.[1] || filename;
+
+  const url = window.URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = downloadName;
+  document.body.appendChild(a);
+  a.click();
+  window.URL.revokeObjectURL(url);
+  document.body.removeChild(a);
+}
+
 /**
  * Upload a PDF file for booth-specific conversion
  */

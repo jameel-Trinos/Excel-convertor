@@ -4,6 +4,7 @@ import { useState, useCallback, useEffect } from "react";
 import { SpreadsheetEditor } from "@/components/SpreadsheetEditor";
 import { ColumnFilter } from "@/components/ColumnFilter";
 import { VoterConvertModal } from "@/components/VoterConvertModal";
+import { BulkVoterUploadModal } from "@/components/BulkVoterUploadModal";
 import { useVotersUpload } from "@/hooks/useVotersUpload";
 import { downloadExcel, getPreview, getStatus, getColumns } from "@/lib/api";
 import type { PreviewData, ValidationIssues } from "@/types";
@@ -22,6 +23,7 @@ export function VotersView() {
   const [previewOpen, setPreviewOpen] = useState(false);
   const [columnFilterOpen, setColumnFilterOpen] = useState(false);
   const [convertModalOpen, setConvertModalOpen] = useState(false);
+  const [bulkModalOpen, setBulkModalOpen] = useState(false);
   const [columns, setColumns] = useState<string[]>([]);
   const [validationIssues, setValidationIssues] = useState<ValidationIssues | null>(null);
   const [previewData, setPreviewData] = useState<PreviewData | null>(null);
@@ -111,8 +113,17 @@ export function VotersView() {
 
   return (
     <>
-      {/* Quick Convert Button */}
-      <div className="mb-4 flex justify-end">
+      {/* Action Buttons */}
+      <div className="mb-4 flex justify-end gap-3">
+        <button
+          onClick={() => setBulkModalOpen(true)}
+          className="flex items-center gap-2 px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 font-medium text-sm transition-colors shadow-sm"
+        >
+          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
+          </svg>
+          Bulk Upload (Folder)
+        </button>
         <button
           onClick={() => setConvertModalOpen(true)}
           className="flex items-center gap-2 px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 font-medium text-sm transition-colors shadow-sm"
@@ -198,6 +209,12 @@ export function VotersView() {
       <VoterConvertModal
         isOpen={convertModalOpen}
         onClose={() => setConvertModalOpen(false)}
+      />
+
+      {/* Bulk Voter Upload Modal */}
+      <BulkVoterUploadModal
+        isOpen={bulkModalOpen}
+        onClose={() => setBulkModalOpen(false)}
       />
     </>
   );

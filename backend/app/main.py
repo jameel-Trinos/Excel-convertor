@@ -71,7 +71,7 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Shared task storage (imported from task_store to allow router access)
-from .task_store import tasks, geocode_tasks, translation_tasks, voter_convert_jobs, update_task_progress
+from .task_store import tasks, geocode_tasks, translation_tasks, voter_convert_jobs, bulk_voter_jobs, update_task_progress
 
 # Booth name extraction helpers
 
@@ -712,6 +712,199 @@ async def download_voter_convert(job_id: str):
     bg = BackgroundTasks()
     bg.add_task(cleanup_file, Path(output_path))
     bg.add_task(lambda: voter_convert_jobs.pop(job_id, None))
+
+    return FileResponse(
+        path=output_path,
+        filename=download_name,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        background=bg,
+    )
+
+
+# ── Bulk Voter Processing Endpoints ────────────────────────────────────
+
+
+@app.post("/api/voters/bulk-upload/init")
+async def init_bulk_upload():
+    """Initialize a bulk voter upload job. Returns a job_id for subsequent calls."""
+    job_id = str(uuid.uuid4())
+    bulk_voter_jobs[job_id] = {
+        "status": "uploading",
+        "files": [],
+        "progress": {
+            "total_pdfs": 0,
+            "completed_pdfs": 0,
+            "current_file": "",
+            "total_voters_so_far": 0,
+            "failed_count": 0,
+        },
+        "output_file": None,
+        "download_url": None,
+        "error": None,
+        "summary": None,
+    }
+    return {"job_id": job_id}
+
+
+@app.post("/api/voters/bulk-upload/add/{job_id}")
+async def add_bulk_files(
+    job_id: str,
+    files: list[UploadFile] = File(...),
+):
+    """Upload a batch of PDFs to an existing bulk job. Call multiple times."""
+    job = bulk_voter_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Bulk job not found")
+    if job["status"] != "uploading":
+        raise HTTPException(status_code=400, detail="Job is no longer accepting uploads")
+
+    added = 0
+    for f in files:
+        if not f.filename or not f.filename.lower().endswith(".pdf"):
+            continue
+
+        content = await f.read()
+        idx = len(job["files"])
+        file_path = UPLOAD_DIR / f"{job_id}_bulk_{idx}.pdf"
+        async with aiofiles.open(file_path, "wb") as out:
+            await out.write(content)
+
+        job["files"].append((idx, str(file_path), f.filename))
+        added += 1
+
+    return {"added": added, "total": len(job["files"])}
+
+
+@app.post("/api/voters/bulk-upload/start/{job_id}")
+async def start_bulk_processing(
+    job_id: str,
+    background_tasks: BackgroundTasks = None,
+):
+    """Start concurrent processing of all uploaded PDFs for this bulk job."""
+    job = bulk_voter_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Bulk job not found")
+    if job["status"] != "uploading":
+        raise HTTPException(status_code=400, detail="Job already started or finished")
+    if not job["files"]:
+        raise HTTPException(status_code=400, detail="No PDF files uploaded yet")
+
+    job["status"] = "processing"
+    job["progress"]["total_pdfs"] = len(job["files"])
+
+    background_tasks.add_task(_process_bulk_voter_job, job_id)
+
+    return {"job_id": job_id, "total_files": len(job["files"])}
+
+
+async def _process_bulk_voter_job(job_id: str):
+    """Background task: process all PDFs concurrently and create consolidated Excel."""
+    job = bulk_voter_jobs.get(job_id)
+    if not job:
+        return
+
+    pdf_files = job["files"]
+    uploaded_paths = [Path(p) for _, p, _ in pdf_files]
+
+    try:
+        from .bulk_voters_processor import BulkVotersProcessor
+        from .bulk_voters_excel_creator import BulkVotersExcelCreator
+
+        processor = BulkVotersProcessor(max_workers=8)
+
+        def on_progress(info: dict):
+            j = bulk_voter_jobs.get(job_id)
+            if not j:
+                return
+            j["progress"]["completed_pdfs"] = info["completed"]
+            j["progress"]["current_file"] = info["current_file"]
+            j["progress"]["total_voters_so_far"] += info["voter_count"]
+            if info["had_error"]:
+                j["progress"]["failed_count"] += 1
+
+        result = await asyncio.to_thread(processor.process_all, pdf_files, on_progress)
+
+        # Create consolidated Excel (one sheet per booth)
+        output_path = OUTPUT_DIR / f"{job_id}_bulk.xlsx"
+        creator = BulkVotersExcelCreator()
+        await asyncio.to_thread(
+            creator.create,
+            booth_data=result["booth_data"],
+            booth_groups=result["booth_groups"],
+            output_path=str(output_path),
+            ac_no=result["ac_no"],
+            total_pdfs=result["total_pdfs"],
+            successful_pdfs=result["successful_pdfs"],
+            failed_pdfs=result["failed_pdfs"],
+        )
+
+        job["status"] = "completed"
+        job["output_file"] = str(output_path)
+        job["download_url"] = f"/api/voters/bulk-download/{job_id}"
+        job["summary"] = {
+            "total_voters": result["total_voters"],
+            "successful_pdfs": result["successful_pdfs"],
+            "total_pdfs": result["total_pdfs"],
+            "failed_pdfs": result["failed_pdfs"],
+            "booth_groups": result["booth_groups"],
+        }
+
+        logger.info(
+            f"Bulk voter job {job_id}: {result['total_voters']} voters from "
+            f"{result['successful_pdfs']}/{result['total_pdfs']} PDFs"
+        )
+
+    except Exception as e:
+        logger.error(f"Bulk voter job {job_id} failed: {e}", exc_info=True)
+        job["status"] = "failed"
+        job["error"] = str(e)
+
+    finally:
+        for p in uploaded_paths:
+            await cleanup_file(p)
+
+
+@app.get("/api/voters/bulk-status/{job_id}")
+async def get_bulk_voter_status(job_id: str):
+    """Poll status of a bulk voter processing job."""
+    job = bulk_voter_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Bulk job not found")
+
+    response = {
+        "status": job["status"],
+        "progress": job["progress"],
+    }
+
+    if job["status"] == "completed":
+        response["download_url"] = job["download_url"]
+        response["summary"] = job["summary"]
+    elif job["status"] == "failed":
+        response["error"] = job["error"]
+
+    return response
+
+
+@app.get("/api/voters/bulk-download/{job_id}")
+async def download_bulk_voters(job_id: str):
+    """Download the consolidated Excel from a completed bulk voter job."""
+    job = bulk_voter_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Bulk job not found")
+
+    if job["status"] != "completed":
+        raise HTTPException(status_code=400, detail="Processing not yet completed")
+
+    output_path = job.get("output_file")
+    if not output_path or not Path(output_path).exists():
+        raise HTTPException(status_code=404, detail="Output file not found")
+
+    ac = job.get("summary", {}).get("ac_no", "")
+    download_name = f"voters_consolidated_AC{ac}.xlsx" if ac else "voters_consolidated.xlsx"
+
+    bg = BackgroundTasks()
+    bg.add_task(cleanup_file, Path(output_path))
+    bg.add_task(lambda: bulk_voter_jobs.pop(job_id, None))
 
     return FileResponse(
         path=output_path,
