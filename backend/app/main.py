@@ -810,7 +810,7 @@ async def _process_bulk_voter_job(job_id: str):
         from .bulk_voters_processor import BulkVotersProcessor
         from .bulk_voters_excel_creator import BulkVotersExcelCreator
 
-        processor = BulkVotersProcessor(max_workers=8)
+        processor = BulkVotersProcessor()  # uses smart default based on CPU count + BULK_VOTER_WORKERS env
 
         def on_progress(info: dict):
             j = bulk_voter_jobs.get(job_id)

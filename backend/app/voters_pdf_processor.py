@@ -11,6 +11,7 @@ Also extracts header metadata:
 """
 
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -211,68 +212,91 @@ class VotersPDFProcessor:
         if progress_callback:
             progress_callback(5, "Opening PDF...")
 
-        # Strategy 0: Spatial card extraction (crop each voter card individually)
-        spatial_voters, total_pages, first_page_text = self._extract_via_spatial_cards(
-            path, progress_callback
-        )
-        if spatial_voters:
-            self.voters = spatial_voters
-            if first_page_text:
-                self._parse_header(first_page_text)
-        else:
-            # Strategy 1: Try pdfplumber table extraction
-            table_voters, total_pages, first_page_text = self._extract_via_tables(
+        # Early detection: quick probe of first few pages to determine text vs scanned PDF.
+        # This avoids wasting time on strategies that will fail.
+        # Check up to 3 pages (some PDFs have a text cover page but scanned data pages).
+        is_text_pdf = False
+        try:
+            with pdfplumber.open(str(path)) as probe_pdf:
+                total_pages = len(probe_pdf.pages)
+                total_probe_text = 0
+                pages_to_check = min(3, total_pages)
+                for pi in range(pages_to_check):
+                    probe_text = probe_pdf.pages[pi].extract_text() or ""
+                    total_probe_text += len(probe_text.strip())
+                is_text_pdf = total_probe_text >= 200
+        except Exception:
+            total_pages = 0
+
+        if is_text_pdf:
+            # Fast-track: text-based PDF — try text strategies first
+            spatial_voters, total_pages, first_page_text = self._extract_via_spatial_cards(
                 path, progress_callback
             )
-            if table_voters:
-                self.voters = table_voters
+            if spatial_voters:
+                self.voters = spatial_voters
                 if first_page_text:
                     self._parse_header(first_page_text)
             else:
-                # Strategy 2: Text extraction + parsing
-                text_pages = self._extract_text(path)
-
-                # If very little text, try image-based card OCR first (much more accurate
-                # than whole-page OCR for 3-column voter card layouts)
-                total_text = "".join(text_pages)
-                if len(total_text.strip()) < 100:
-                    logger.info("Minimal text found, trying image-based card OCR...")
-                    self._is_scanned = True
-
-                    # Strategy 2a: Image-based card-by-card OCR
-                    card_ocr_voters, total_pages = self._extract_via_image_card_ocr(
-                        path, progress_callback
-                    )
-                    if card_ocr_voters:
-                        self.voters = card_ocr_voters
-                    else:
-                        # Strategy 2b: Whole-page OCR fallback
-                        logger.info("Card OCR failed, falling back to whole-page OCR")
-                        text_pages = self._ocr_extract(path, progress_callback)
-
-                if not self.voters:
-                    total_pages = len(text_pages)
-
-                    if progress_callback:
-                        progress_callback(30, f"Parsing {total_pages} pages...")
-
-                    # Parse header info from first few pages (cover + first data page)
-                    for hp in text_pages[:5]:
-                        if hp:
-                            self._parse_header(hp)
-                            # Stop once we have both AC and Part numbers
-                            if self.header_info.ac_no and self.header_info.part_no:
-                                break
-
-                    # Parse voter records from all pages
-                    epic_maps = getattr(self, '_page_epic_maps', [])
-                    for i, page_text in enumerate(text_pages):
-                        epic_map = epic_maps[i] if i < len(epic_maps) else {}
-                        page_voters = self._parse_voters_from_text(page_text, epic_map)
-                        self.voters.extend(page_voters)
+                table_voters, total_pages, first_page_text = self._extract_via_tables(
+                    path, progress_callback
+                )
+                if table_voters:
+                    self.voters = table_voters
+                    if first_page_text:
+                        self._parse_header(first_page_text)
+                else:
+                    # Text extraction + parsing (no OCR needed for text PDFs)
+                    text_pages = self._extract_text(path)
+                    if not self.voters:
+                        total_pages = len(text_pages)
                         if progress_callback:
-                            pct = 30 + int((i + 1) / max(total_pages, 1) * 50)
-                            progress_callback(pct, f"Parsed page {i + 1}/{total_pages} ({len(self.voters)} voters found)")
+                            progress_callback(30, f"Parsing {total_pages} pages...")
+                        for hp in text_pages[:5]:
+                            if hp:
+                                self._parse_header(hp)
+                                if self.header_info.ac_no and self.header_info.part_no:
+                                    break
+                        for i, page_text in enumerate(text_pages):
+                            page_voters = self._parse_voters_from_text(page_text)
+                            self.voters.extend(page_voters)
+                            if progress_callback:
+                                pct = 30 + int((i + 1) / max(total_pages, 1) * 50)
+                                progress_callback(pct, f"Parsed page {i + 1}/{total_pages} ({len(self.voters)} voters found)")
+        else:
+            # Scanned/image PDF — go straight to OCR strategies
+            logger.info("Scanned PDF detected, skipping text-based strategies")
+            self._is_scanned = True
+
+            # Strategy 1: Image-based card-by-card OCR (most accurate for grid layouts)
+            card_ocr_voters, total_pages = self._extract_via_image_card_ocr(
+                path, progress_callback
+            )
+            if card_ocr_voters:
+                self.voters = card_ocr_voters
+            else:
+                # Strategy 2: Whole-page OCR fallback
+                logger.info("Card OCR failed, falling back to whole-page OCR")
+                text_pages = self._ocr_extract(path, progress_callback)
+                total_pages = len(text_pages)
+
+                if progress_callback:
+                    progress_callback(30, f"Parsing {total_pages} pages...")
+
+                for hp in text_pages[:5]:
+                    if hp:
+                        self._parse_header(hp)
+                        if self.header_info.ac_no and self.header_info.part_no:
+                            break
+
+                epic_maps = getattr(self, '_page_epic_maps', [])
+                for i, page_text in enumerate(text_pages):
+                    epic_map = epic_maps[i] if i < len(epic_maps) else {}
+                    page_voters = self._parse_voters_from_text(page_text, epic_map)
+                    self.voters.extend(page_voters)
+                    if progress_callback:
+                        pct = 30 + int((i + 1) / max(total_pages, 1) * 50)
+                        progress_callback(pct, f"Parsed page {i + 1}/{total_pages} ({len(self.voters)} voters found)")
 
         # Filter out false-positive voters (header/metadata misidentified as voter)
         pre_filter_count = len(self.voters)
@@ -389,7 +413,7 @@ class VotersPDFProcessor:
                         except Exception:
                             continue
 
-                        if len(card_text.strip()) < 10:
+                        if len(card_text.strip()) < 5:
                             continue
 
                         # Card must contain voter-like field labels to be valid
@@ -719,16 +743,229 @@ class VotersPDFProcessor:
     # Image-based card OCR (OpenCV grid detection + per-card OCR)
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Whole-page EPIC extraction helper
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_epic_ids_from_page(
+        gray: np.ndarray,
+        card_bboxes: list[tuple[int, int, int, int]],
+        expanded_bboxes: list[tuple[int, int, int, int]],
+        margin: int = 15,
+    ) -> dict[int, str]:
+        """Run one whole-page OCR pass (eng, PSM 3) to extract EPIC IDs.
+
+        Maps found EPIC IDs to their nearest card region by position.
+        Returns {card_index: epic_id} for cards where an EPIC was found.
+        """
+        import pytesseract
+
+        try:
+            data = pytesseract.image_to_data(
+                gray, lang="eng",
+                config="--oem 3 --psm 3",
+                output_type=pytesseract.Output.DICT,
+            )
+        except Exception:
+            return {}
+
+        # Collect words with positions
+        words: list[dict] = []
+        for i in range(len(data["text"])):
+            text = data["text"][i].strip()
+            conf = int(data["conf"][i])
+            if text and conf > 0:
+                words.append({
+                    "text": text,
+                    "left": data["left"][i],
+                    "top": data["top"][i],
+                    "width": data["width"][i],
+                    "height": data["height"][i],
+                })
+
+        # Find EPIC IDs in words and map to card regions
+        epic_map: dict[int, str] = {}
+        # First build full text per expanded card region
+        card_texts: dict[int, list[str]] = {i: [] for i in range(len(expanded_bboxes))}
+        for word in words:
+            wcx = word["left"] + word["width"] // 2
+            wcy = word["top"] + word["height"] // 2
+            for ci, (cx, cy, cw, ch) in enumerate(expanded_bboxes):
+                if (cx - margin <= wcx <= cx + cw + margin and
+                        cy - margin <= wcy <= cy + ch + margin):
+                    card_texts[ci].append(word["text"])
+                    break
+
+        for ci, texts in card_texts.items():
+            if not texts:
+                continue
+            combined = " ".join(texts)
+            epic_m = _EPIC_RE.search(combined)
+            if epic_m:
+                epic_map[ci] = epic_m.group(1)
+            else:
+                fuzzy_m = _EPIC_FUZZY_RE.search(combined)
+                if fuzzy_m:
+                    normalized = _normalize_epic(fuzzy_m.group(1))
+                    if normalized:
+                        epic_map[ci] = normalized
+
+        return epic_map
+
+    def _ocr_single_page_cards(
+        self,
+        page_idx: int,
+        gray: np.ndarray,
+        do_header_ocr: bool,
+    ) -> dict[str, Any]:
+        """OCR a single page: detect card grid, OCR each card, return voters.
+
+        Hybrid approach for speed + accuracy:
+        - Per-card OCR (1 call each) preserves card-internal text structure
+        - 1 whole-page EPIC pass recovers voter IDs missed by per-card OCR
+        - Removed expensive fallback strategies 2-4 (saved 2-4 calls/card)
+
+        Total OCR calls: ~N_cards + 1 per page (vs original N_cards * 1-5).
+
+        Returns dict with keys: page_idx, voters, header_text, card_count.
+        """
+        import pytesseract
+        import cv2
+
+        result: dict[str, Any] = {
+            "page_idx": page_idx,
+            "voters": [],
+            "header_text": "",
+            "card_count": 0,
+        }
+
+        # Try to get header text from first few pages
+        if do_header_ocr:
+            try:
+                header_text = pytesseract.image_to_string(
+                    gray, lang="tam+eng", config="--oem 3 --psm 3"
+                )
+                if header_text.strip():
+                    result["header_text"] = header_text
+            except Exception:
+                pass
+
+        # Detect card grid using OpenCV
+        card_bboxes = self._detect_card_grid_from_image(gray)
+        if not card_bboxes:
+            # Try full-page OCR fallback for pages without grid
+            try:
+                page_text = pytesseract.image_to_string(
+                    gray, lang="tam+eng", config="--oem 3 --psm 3"
+                )
+                if page_text and _EPIC_RE.search(page_text):
+                    fallback_voters = self._parse_voters_from_text(page_text)
+                    result["voters"] = [v for v in fallback_voters if v.is_valid]
+                    if result["voters"]:
+                        logger.info(
+                            f"[IMG-CARD-OCR] Page {page_idx+1}: no grid, "
+                            f"recovered {len(result['voters'])} voters via full-page OCR"
+                        )
+            except Exception:
+                pass
+            return result
+
+        result["card_count"] = len(card_bboxes)
+        logger.info(f"[IMG-CARD-OCR] Page {page_idx+1}: {len(card_bboxes)} cards detected")
+
+        row_tops = sorted(set(c[1] for c in card_bboxes))
+
+        # Build expanded bboxes for EPIC mapping (extend upward into gap area)
+        expanded_bboxes: list[tuple[int, int, int, int]] = []
+        for x, y, w, h in card_bboxes:
+            row_idx = row_tops.index(y) if y in row_tops else 0
+            if row_idx == 0:
+                header_extend = min(55, y - 5)
+            else:
+                prev_row_y = row_tops[row_idx - 1]
+                prev_row_h = h
+                for cx, cy, cw, ch in card_bboxes:
+                    if cy == prev_row_y:
+                        prev_row_h = ch
+                        break
+                gap = y - (prev_row_y + prev_row_h)
+                header_extend = min(int(gap * 0.9), y - 5) if gap > 10 else 55
+            y_start = max(0, y - header_extend)
+            expanded_bboxes.append((x, y_start, w, h + (y - y_start)))
+
+        # Reusable CLAHE enhancer
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+
+        # --- Per-card OCR: 1 call each (preserves card text structure) ---
+        page_voters: list[VoterRecord] = []
+        card_to_voter: dict[int, int] = {}  # card_index -> voter_index
+        has_missing_epic = False
+
+        for ci, (x, y, w, h) in enumerate(card_bboxes):
+            inset = 4
+            y_start = expanded_bboxes[ci][1]
+            card_img = gray[y_start:y + h - inset, x + inset:x + w - inset]
+
+            if card_img.size == 0:
+                continue
+
+            card_enhanced = clahe.apply(card_img)
+
+            try:
+                card_text = pytesseract.image_to_string(
+                    card_enhanced, lang="tam+eng",
+                    config="--oem 3 --psm 6",
+                )
+            except Exception:
+                continue
+
+            if len(card_text.strip()) < 5:
+                continue
+
+            voter = self._extract_voter_from_segment(card_text)
+
+            if voter.is_valid:
+                voter_idx = len(page_voters)
+                card_to_voter[ci] = voter_idx
+                if not voter.voter_id:
+                    has_missing_epic = True
+                page_voters.append(voter)
+
+        # --- Whole-page EPIC pass: 1 call to recover missing voter IDs ---
+        if has_missing_epic:
+            epic_map = self._extract_epic_ids_from_page(
+                gray, card_bboxes, expanded_bboxes
+            )
+            for ci, epic_id in epic_map.items():
+                vi = card_to_voter.get(ci)
+                if vi is not None and not page_voters[vi].voter_id:
+                    page_voters[vi].voter_id = epic_id
+
+        logger.info(
+            f"[IMG-CARD-OCR] Page {page_idx+1}: {len(page_voters)} voters "
+            f"from {len(card_bboxes)} cards"
+        )
+
+        result["voters"] = page_voters
+        return result
+
     def _extract_via_image_card_ocr(
         self,
         path: Path,
         progress_callback: Optional[Callable[[int, str], None]] = None,
     ) -> tuple[list["VoterRecord"], int]:
-        """Extract voter data by detecting card grids in page images and OCR-ing each card.
+        """Extract voter data by detecting card grids and OCR-ing each card.
 
         For scanned/image-based PDFs where pdfplumber can't extract text.
-        Uses OpenCV to detect the bordered rectangles of voter cards,
-        crops each card image, and runs OCR on individual cards.
+        Uses OpenCV to detect card grids, OCRs each card individually (1 call
+        per card for accurate text), plus 1 whole-page EPIC pass for recovery.
+
+        Optimizations over original approach:
+        - Removed expensive EPIC fallback strategies 2-4 (was 2-4 extra calls/card)
+        - 1 whole-page EPIC pass replaces per-card EPIC retries
+        - Page batching: converts 8 pages at a time to limit memory
+        - Adaptive DPI: starts at 200, falls back to 300 if quality is low
 
         Returns (voters, total_pages) or ([], 0) on failure.
         """
@@ -742,241 +979,185 @@ class VotersPDFProcessor:
         if progress_callback:
             progress_callback(10, "Converting PDF to images for card detection...")
 
+        # Get total page count without converting all pages
         try:
-            images = convert_from_path(str(path), dpi=300)
+            with pdfplumber.open(str(path)) as pdf:
+                total_pages = len(pdf.pages)
         except Exception as e:
-            logger.warning(f"pdf2image conversion failed: {e}")
+            logger.warning(f"Failed to open PDF for page count: {e}")
             return [], 0
 
-        total_pages = len(images)
+        if total_pages == 0:
+            return [], 0
+
+        # Adaptive DPI: start at 200 for speed, fall back to 300 if quality is poor
+        INITIAL_DPI = int(os.environ.get("VOTER_OCR_DPI", "200"))
+        FALLBACK_DPI = 300
+        current_dpi = INITIAL_DPI
+        dpi_upgraded = False
+
+        # Configurable page batch size and thread count
+        BATCH_SIZE = int(os.environ.get("VOTER_PAGE_BATCH", "8"))
+        PAGE_THREADS = int(os.environ.get("VOTER_PAGE_THREADS",
+                                          str(min(os.cpu_count() or 4, 8))))
+
+        if progress_callback:
+            progress_callback(15, f"OCR-ing {total_pages} pages ({current_dpi} DPI)...")
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        page_results: list[dict | None] = [None] * total_pages
+        completed_count = 0
+
+        # Process pages in batches to limit memory usage
+        for batch_start in range(0, total_pages, BATCH_SIZE):
+            batch_end = min(batch_start + BATCH_SIZE, total_pages)
+
+            # Convert this batch of pages to images (1-indexed for pdf2image)
+            try:
+                batch_images = convert_from_path(
+                    str(path), dpi=current_dpi,
+                    first_page=batch_start + 1,
+                    last_page=batch_end,
+                )
+            except Exception as e:
+                logger.warning(f"pdf2image batch {batch_start+1}-{batch_end} failed: {e}")
+                continue
+
+            # Convert to grayscale numpy arrays
+            gray_batch: list[np.ndarray] = []
+            for pil_img in batch_images:
+                img = np.array(pil_img)
+                if len(img.shape) == 3:
+                    gray_batch.append(cv2.cvtColor(img, cv2.COLOR_RGB2GRAY))
+                else:
+                    gray_batch.append(img)
+            del batch_images  # Free PIL images immediately
+
+            # Process batch in parallel
+            batch_threads = min(PAGE_THREADS, len(gray_batch))
+            with ThreadPoolExecutor(max_workers=batch_threads) as executor:
+                futures = {}
+                for i, gray in enumerate(gray_batch):
+                    page_idx = batch_start + i
+                    do_header = page_idx < 2  # Only first 2 pages for header
+                    future = executor.submit(
+                        self._ocr_single_page_cards, page_idx, gray, do_header
+                    )
+                    futures[future] = page_idx
+
+                for future in as_completed(futures):
+                    page_idx = futures[future]
+                    try:
+                        page_results[page_idx] = future.result(timeout=120)
+                    except Exception as e:
+                        logger.warning(f"[IMG-CARD-OCR] Page {page_idx+1} failed: {e}")
+                        page_results[page_idx] = {
+                            "page_idx": page_idx, "voters": [],
+                            "header_text": "", "card_count": 0,
+                        }
+                    completed_count += 1
+                    if progress_callback:
+                        pct = 15 + int(completed_count / max(total_pages, 1) * 65)
+                        progress_callback(
+                            pct,
+                            f"Card OCR: {completed_count}/{total_pages} pages done"
+                        )
+
+            del gray_batch  # Free numpy arrays
+
+            # After first batch: check quality and upgrade DPI if needed
+            if (batch_start == 0 and current_dpi < FALLBACK_DPI
+                    and not dpi_upgraded):
+                batch_voters = []
+                for pr in page_results[:batch_end]:
+                    if pr and pr.get("voters"):
+                        batch_voters.extend(pr["voters"])
+                if len(batch_voters) >= 5:
+                    voters_with_epic = sum(
+                        1 for v in batch_voters if v.voter_id
+                    )
+                    epic_rate = voters_with_epic / len(batch_voters)
+                    if epic_rate < 0.5:
+                        logger.info(
+                            f"[IMG-CARD-OCR] EPIC rate {epic_rate:.0%} at "
+                            f"{current_dpi} DPI — upgrading to {FALLBACK_DPI} DPI"
+                        )
+                        current_dpi = FALLBACK_DPI
+                        dpi_upgraded = True
+                        # Re-process first batch at higher DPI
+                        page_results[:batch_end] = [None] * batch_end
+                        completed_count = 0
+                        try:
+                            retry_images = convert_from_path(
+                                str(path), dpi=FALLBACK_DPI,
+                                first_page=1, last_page=batch_end,
+                            )
+                            retry_gray: list[np.ndarray] = []
+                            for pil_img in retry_images:
+                                img = np.array(pil_img)
+                                if len(img.shape) == 3:
+                                    retry_gray.append(
+                                        cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+                                    )
+                                else:
+                                    retry_gray.append(img)
+                            del retry_images
+
+                            with ThreadPoolExecutor(
+                                max_workers=batch_threads
+                            ) as executor:
+                                futures = {}
+                                for i, gray in enumerate(retry_gray):
+                                    do_hdr = i < 2
+                                    future = executor.submit(
+                                        self._ocr_single_page_cards,
+                                        i, gray, do_hdr,
+                                    )
+                                    futures[future] = i
+                                for future in as_completed(futures):
+                                    pidx = futures[future]
+                                    try:
+                                        page_results[pidx] = future.result(
+                                            timeout=120
+                                        )
+                                    except Exception:
+                                        page_results[pidx] = {
+                                            "page_idx": pidx, "voters": [],
+                                            "header_text": "", "card_count": 0,
+                                        }
+                                    completed_count += 1
+                            del retry_gray
+                        except Exception as e:
+                            logger.warning(
+                                f"[IMG-CARD-OCR] DPI upgrade retry failed: {e}"
+                            )
+
+        # Collect results in page order
         voters: list[VoterRecord] = []
         header_ocr_done = False
 
-        for page_idx, pil_img in enumerate(images):
-            if progress_callback:
-                pct = 10 + int((page_idx + 1) / max(total_pages, 1) * 70)
-                progress_callback(pct, f"Card OCR page {page_idx + 1}/{total_pages} ({len(voters)} voters)...")
-
-            img = np.array(pil_img)
-            if len(img.shape) == 3:
-                gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-            else:
-                gray = img
-
-            # Try to parse header from first few pages
-            if not header_ocr_done and page_idx < 4:
-                try:
-                    header_text = pytesseract.image_to_string(
-                        gray, lang="tam+eng", config="--oem 3 --psm 3"
-                    )
-                    if header_text.strip():
-                        self._parse_header(header_text)
-                        if self.header_info.ac_no and self.header_info.part_no:
-                            header_ocr_done = True
-                except Exception:
-                    pass
-
-            # Detect card grid using OpenCV
-            card_bboxes = self._detect_card_grid_from_image(gray)
-            if not card_bboxes:
-                # Pages with very few cards (1-2) may not have enough grid lines.
-                # Try full-page OCR for these pages if we've already found voters
-                # on previous pages (so we know this is a voter list PDF).
-                if voters:
-                    try:
-                        page_text = pytesseract.image_to_string(
-                            gray, lang="tam+eng", config="--oem 3 --psm 3"
-                        )
-                        if page_text and _EPIC_RE.search(page_text):
-                            fallback_voters = self._parse_voters_from_text(page_text)
-                            for v in fallback_voters:
-                                if v.is_valid:
-                                    serial_counter = len(voters) + 1
-                                    v.serial_no = str(serial_counter)
-                                    voters.append(v)
-                            if fallback_voters:
-                                logger.info(
-                                    f"[IMG-CARD-OCR] Page {page_idx+1}: no grid, "
-                                    f"recovered {len(fallback_voters)} voters via full-page OCR"
-                                )
-                    except Exception:
-                        pass
+        for pr in page_results:
+            if pr is None:
                 continue
 
-            logger.info(f"[IMG-CARD-OCR] Page {page_idx+1}: {len(card_bboxes)} cards detected")
+            # Parse header from early pages (sequentially to avoid races)
+            if not header_ocr_done and pr["header_text"]:
+                self._parse_header(pr["header_text"])
+                if self.header_info.ac_no and self.header_info.part_no:
+                    header_ocr_done = True
 
-            # Determine the header row height above each card row.
-            # Tamil voter cards have a header row with serial number + EPIC ID
-            # above the card body. We need to include this area in the crop.
-            # Estimate: first row of cards starts at some y; the header row is above.
-            row_tops = sorted(set(c[1] for c in card_bboxes))
-
-            # OCR each card individually
-            page_voters: list[VoterRecord] = []
-            for x, y, w, h in card_bboxes:
-                # Expand crop upward to include the serial/EPIC header row
-                # The header row is typically between the previous card's bottom
-                # and this card's top. Estimate ~40-60px at 300 DPI.
-                row_idx = row_tops.index(y) if y in row_tops else 0
-                if row_idx == 0:
-                    # First row: header extends from top of page or ~55px above
-                    header_extend = min(55, y - 5)
-                else:
-                    # Non-first row: header extends up to the previous row's bottom
-                    prev_row_y = row_tops[row_idx - 1]
-                    prev_row_h = h  # approximate
-                    # Find actual previous card's height
-                    for cx, cy, cw, ch in card_bboxes:
-                        if cy == prev_row_y:
-                            prev_row_h = ch
-                            break
-                    gap = y - (prev_row_y + prev_row_h)
-                    header_extend = min(int(gap * 0.9), y - 5) if gap > 10 else 55
-
-                # Crop including header area above card
-                inset = 4
-                y_start = max(0, y - header_extend)
-                card_img = gray[y_start:y + h - inset, x + inset:x + w - inset]
-
-                if card_img.size == 0:
-                    continue
-
-                # Enhance card image for OCR
-                clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
-                card_enhanced = clahe.apply(card_img)
-
-                try:
-                    card_text = pytesseract.image_to_string(
-                        card_enhanced, lang="tam+eng",
-                        config="--oem 3 --psm 6",
-                    )
-                except Exception:
-                    continue
-
-                if len(card_text.strip()) < 10:
-                    continue
-
-                voter = self._extract_voter_from_segment(card_text)
-
-                # If EPIC not found via PSM 6, try dedicated header strip OCR.
-                # The EPIC/serial row is in the narrow strip above the card body.
-                if not voter.voter_id:
-                    # Strategy 1: Crop just the header strip (above card body)
-                    # and run PSM 7 (single line) for EPIC detection.
-                    header_strip_h = y - y_start  # height of the extended area
-                    if header_strip_h > 15:
-                        header_strip = gray[y_start:y, x + inset:x + w - inset]
-                        if header_strip.size > 0:
-                            header_enhanced = clahe.apply(header_strip)
-                            try:
-                                header_text = pytesseract.image_to_string(
-                                    header_enhanced, lang="eng",
-                                    config="--oem 3 --psm 7",
-                                )
-                                epic_m = _EPIC_RE.search(header_text)
-                                if epic_m:
-                                    voter.voter_id = epic_m.group(1)
-                                else:
-                                    fuzzy_m = _EPIC_FUZZY_RE.search(header_text)
-                                    if fuzzy_m:
-                                        normalized = _normalize_epic(fuzzy_m.group(1))
-                                        if normalized:
-                                            voter.voter_id = normalized
-                            except Exception:
-                                pass
-
-                    # Strategy 2: Run PSM 3 (auto segmentation) on full extended crop
-                    if not voter.voter_id:
-                        try:
-                            psm3_text = pytesseract.image_to_string(
-                                card_enhanced, lang="tam+eng",
-                                config="--oem 3 --psm 3",
-                            )
-                            epic_m = _EPIC_RE.search(psm3_text)
-                            if epic_m:
-                                voter.voter_id = epic_m.group(1)
-                            else:
-                                fuzzy_m = _EPIC_FUZZY_RE.search(psm3_text)
-                                if fuzzy_m:
-                                    normalized = _normalize_epic(fuzzy_m.group(1))
-                                    if normalized:
-                                        voter.voter_id = normalized
-                        except Exception:
-                            pass
-
-                    # Strategy 3: Crop top ~25% of the card body (where serial/EPIC line is)
-                    # and OCR with eng-only PSM 7 (single line) for EPIC detection.
-                    if not voter.voter_id:
-                        top_slice_h = max(int(h * 0.25), 40)
-                        card_top = gray[y:y + top_slice_h, x + inset:x + w - inset]
-                        if card_top.size > 0:
-                            top_enhanced = clahe.apply(card_top)
-                            for _psm in ("--psm 7", "--psm 6"):
-                                if voter.voter_id:
-                                    break
-                                try:
-                                    top_text = pytesseract.image_to_string(
-                                        top_enhanced, lang="eng",
-                                        config=f"--oem 3 {_psm}",
-                                    )
-                                    epic_m = _EPIC_RE.search(top_text)
-                                    if epic_m:
-                                        voter.voter_id = epic_m.group(1)
-                                    else:
-                                        fuzzy_m = _EPIC_FUZZY_RE.search(top_text)
-                                        if fuzzy_m:
-                                            normalized = _normalize_epic(fuzzy_m.group(1))
-                                            if normalized:
-                                                voter.voter_id = normalized
-                                except Exception:
-                                    pass
-
-                    # Strategy 4: OCR the header extension strip alone (gap between rows).
-                    # When the EPIC is in a separate strip above the card body,
-                    # OCR on the isolated strip works better than on the full card.
-                    if not voter.voter_id and header_strip_h > 20:
-                        gap_strip = gray[y_start:y, x + inset:x + w - inset]
-                        if gap_strip.size > 0:
-                            gap_enhanced = clahe.apply(gap_strip)
-                            for _psm in ("--psm 6", "--psm 7", "--psm 3"):
-                                if voter.voter_id:
-                                    break
-                                try:
-                                    gap_text = pytesseract.image_to_string(
-                                        gap_enhanced, lang="eng",
-                                        config=f"--oem 3 {_psm}",
-                                    )
-                                    epic_m = _EPIC_RE.search(gap_text)
-                                    if epic_m:
-                                        voter.voter_id = epic_m.group(1)
-                                    else:
-                                        fuzzy_m = _EPIC_FUZZY_RE.search(gap_text)
-                                        if fuzzy_m:
-                                            normalized = _normalize_epic(fuzzy_m.group(1))
-                                            if normalized:
-                                                voter.voter_id = normalized
-                                except Exception:
-                                    pass
-
-                if voter.is_valid:
-                    page_voters.append(voter)
-
-            # Assign serial numbers
-            serial_counter = len(voters)
-            for voter in page_voters:
-                if voter.serial_no:
-                    try:
-                        serial_counter = int(voter.serial_no)
-                    except ValueError:
-                        serial_counter += 1
-                else:
-                    serial_counter += 1
-                    voter.serial_no = str(serial_counter)
-
-            voters.extend(page_voters)
+            # Assign serial numbers and collect voters
+            for voter in pr["voters"]:
+                serial_counter = len(voters) + 1
+                voter.serial_no = str(serial_counter)
+                voters.append(voter)
 
         if voters:
-            logger.info(f"[IMG-CARD-OCR] Total: {len(voters)} voters from {total_pages} pages")
+            logger.info(
+                f"[IMG-CARD-OCR] Total: {len(voters)} voters from "
+                f"{total_pages} pages at {current_dpi} DPI"
+            )
 
         return voters, total_pages
 
@@ -1118,6 +1299,52 @@ class VotersPDFProcessor:
 
         return denoised
 
+    def _ocr_single_page_text(self, page_idx: int, pil_img) -> dict[str, Any]:
+        """OCR a single page with dual-pass strategy. Runs in ThreadPoolExecutor.
+
+        Pass 1 (PSM 6): Card text (names, ages, etc.)
+        Pass 2 (PSM 3): EPIC voter IDs (same 300 DPI image, no duplicate conversion).
+
+        Returns dict with page_idx, text, epic_map, failed.
+        """
+        import pytesseract
+
+        page_num = page_idx + 1
+        result: dict[str, Any] = {
+            "page_idx": page_idx,
+            "text": "",
+            "epic_map": {},
+            "failed": False,
+        }
+
+        # Pass 1: PSM 6 for card text
+        try:
+            processed = self._preprocess_image(pil_img)
+            result["text"] = pytesseract.image_to_string(
+                processed, lang="tam+eng",
+                config="--oem 3 --psm 6",
+            )
+        except Exception as e:
+            logger.warning("Page %d: OCR pass 1 failed — %s", page_num, e)
+            result["failed"] = True
+
+        # Pass 2: PSM 3 for EPIC voter IDs (reuse same image — no 400 DPI needed)
+        try:
+            text_psm3 = pytesseract.image_to_string(
+                pil_img, lang="tam+eng",
+                config="--oem 3 --psm 3",
+            )
+            result["epic_map"] = self._extract_name_epic_map(text_psm3)
+            if result["epic_map"]:
+                logger.info(
+                    "Page %d: found %d name→EPIC mappings via PSM 3",
+                    page_num, len(result["epic_map"]),
+                )
+        except Exception as e:
+            logger.warning("Page %d: EPIC extraction failed — %s", page_num, e)
+
+        return result
+
     def _ocr_extract(
         self,
         path: Path,
@@ -1125,13 +1352,12 @@ class VotersPDFProcessor:
     ) -> list[str]:
         """Extract text via OCR for scanned PDFs.
 
-        Dual-pass OCR strategy:
-          Pass 1 (PSM 6, 300 DPI): Extracts 3-column card text reliably for
-                  names, father names, house numbers, ages, genders.
-          Pass 2 (PSM 3, 400 DPI): Extracts EPIC voter IDs which PSM 6 misses
-                  because they're inside photo/card boxes.
+        Dual-pass OCR strategy per page (both at 300 DPI — single conversion):
+          Pass 1 (PSM 6): Card text (names, father names, house numbers, ages, genders)
+          Pass 2 (PSM 3): EPIC voter IDs
 
-        EPIC IDs are stored in self._page_epics for later assignment.
+        Pages are processed in parallel using ThreadPoolExecutor.
+        EPIC IDs are stored in self._page_epic_maps for later assignment.
         """
         try:
             import pytesseract
@@ -1145,57 +1371,56 @@ class VotersPDFProcessor:
             progress_callback(10, "Converting PDF to images...")
 
         try:
-            images_300 = convert_from_path(str(path), dpi=300)
+            images = convert_from_path(str(path), dpi=300)
         except Exception as e:
             raise RuntimeError(f"pdf2image conversion failed: {e}. Ensure poppler is installed.")
 
+        total = len(images)
+
+        if progress_callback:
+            progress_callback(15, f"OCR-ing {total} pages in parallel...")
+
+        # Process pages in parallel — pytesseract spawns subprocesses so GIL is not a bottleneck
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        page_results: list[dict] = [None] * total  # type: ignore[list-item]
+        completed_count = 0
+
+        page_threads = int(os.environ.get("VOTER_PAGE_THREADS",
+                                              str(min(os.cpu_count() or 4, 8))))
+        with ThreadPoolExecutor(max_workers=page_threads) as page_executor:
+            futures = {
+                page_executor.submit(self._ocr_single_page_text, i, img): i
+                for i, img in enumerate(images)
+            }
+            for future in as_completed(futures):
+                page_idx = futures[future]
+                try:
+                    page_results[page_idx] = future.result(timeout=120)
+                except Exception as e:
+                    logger.warning("Page %d: OCR timed out or failed — %s", page_idx + 1, e)
+                    page_results[page_idx] = {
+                        "page_idx": page_idx, "text": "", "epic_map": {}, "failed": True,
+                    }
+                completed_count += 1
+                if progress_callback:
+                    pct = 15 + int(completed_count / max(total, 1) * 15)
+                    progress_callback(pct, f"OCR: {completed_count}/{total} pages done")
+
+        # Collect results in page order
         pages_text: list[str] = []
         self._page_epic_maps: list[dict[str, str]] = []
-        total = len(images_300)
         failed_pages: list[int] = []
 
-        # Also convert at 400 DPI for EPIC extraction (PSM 3)
-        try:
-            images_400 = convert_from_path(str(path), dpi=400)
-        except Exception:
-            images_400 = images_300  # Fallback: reuse 300 DPI
-
-        for i, pil_img in enumerate(images_300):
-            page_num = i + 1
-            if progress_callback:
-                pct = 10 + int(page_num / max(total, 1) * 20)
-                progress_callback(pct, f"OCR page {page_num}/{total}...")
-
-            # Pass 1: PSM 6 for card text (names, ages, etc.)
-            try:
-                processed = self._preprocess_image(pil_img)
-                text = pytesseract.image_to_string(
-                    processed, lang="tam+eng",
-                    config="--oem 3 --psm 6",
-                )
-                pages_text.append(text)
-            except Exception as e:
-                logger.warning("Page %d: OCR pass 1 failed — %s", page_num, e)
-                failed_pages.append(page_num)
+        for pr in page_results:
+            if pr is None:
                 pages_text.append("")
-
-            # Pass 2: PSM 3 for EPIC voter IDs — extract name→EPIC mapping
-            page_epic_map: dict[str, str] = {}
-            try:
-                pil_400 = images_400[i] if i < len(images_400) else pil_img
-                text_psm3 = pytesseract.image_to_string(
-                    pil_400, lang="tam+eng",
-                    config="--oem 3 --psm 3",
-                )
-                page_epic_map = self._extract_name_epic_map(text_psm3)
-                if page_epic_map:
-                    logger.info(
-                        "Page %d: found %d name→EPIC mappings via PSM 3",
-                        page_num, len(page_epic_map),
-                    )
-            except Exception as e:
-                logger.warning("Page %d: EPIC extraction failed — %s", page_num, e)
-            self._page_epic_maps.append(page_epic_map)
+                self._page_epic_maps.append({})
+                continue
+            pages_text.append(pr["text"])
+            self._page_epic_maps.append(pr["epic_map"])
+            if pr["failed"]:
+                failed_pages.append(pr["page_idx"] + 1)
 
         if failed_pages:
             logger.warning(
@@ -1276,9 +1501,33 @@ class VotersPDFProcessor:
             'பாகம்', 'கையொப்பம்', 'google', 'map', 'nazri', 'naksha',
             'நூலக', 'கட்டிடம்', 'புதுக்குப்பம்', 'வடக்கு',
             'ஆண்/பெண்', 'பகுதி', 'நகரம்', 'frade', 'bape',
+            # Common OCR fragments from page headers/footers
+            'மாற்றம்', 'என் மற்றும்', 'திருத்த', 'குறிப்பு',
+            'முகவரி', 'சேர்த்தல்', 'நீக்கம்', 'அட்டவணை',
+            'amendment', 'supplement', 'revision', 'deletion',
+        )
+        # Tamil Nadu city/district names that appear in page headers
+        _city_district_kw = (
+            'கடலூர்', 'சென்னை', 'கோயம்புத்தூர்', 'மதுரை', 'திருச்சி',
+            'சேலம்', 'திருநெல்வேலி', 'ஈரோடு', 'தூத்துக்குடி',
+            'விழுப்புரம்', 'வேலூர்', 'திருவண்ணாமலை', 'தஞ்சாவூர்',
+            'நாகப்பட்டினம்', 'கன்னியாகுமரி', 'தருமபுரி', 'திண்டுக்கல்',
+            'கரூர்', 'நாமக்கல்', 'பெரம்பலூர்', 'அரியலூர்',
+            'கிருஷ்ணகிரி', 'சிவகங்கை', 'விருதுநகர்', 'ராமநாதபுரம்',
+            'புதுக்கோட்டை', 'நீலகிரி', 'திருப்பூர்', 'திருவாரூர்',
+            'காஞ்சிபுரம்', 'திருவள்ளூர்', 'ராணிப்பேட்டை', 'தென்காசி',
+            'செங்கல்பட்டு', 'கள்ளக்குறிச்சி', 'மயிலாடுதுறை',
         )
         name_lower = name.lower()
         if any(kw in name_lower for kw in metadata_kw):
+            return True
+        # Detect city/district names in the "name" field (header leakage)
+        if any(kw in name for kw in _city_district_kw):
+            return True
+        # Pattern: "digit-CityName" or "(மா)" (municipality) — page header metadata
+        if re.search(r'^\d+\s*[-–]\s*\S', name):
+            return True
+        if '(மா)' in name or '(ந)' in name or '(பே)' in name:
             return True
         # Names with only punctuation/symbols
         if not re.search(r'[\w\u0B80-\u0BFF]', name):
@@ -1408,6 +1657,24 @@ class VotersPDFProcessor:
         name = name.strip().rstrip(' -.:;')
         return name
 
+    # Tamil letter → English letter mapping for house number sub-units
+    _TAMIL_HOUSE_LETTER_MAP: dict[str, str] = {
+        'அ': 'A', 'ஆ': 'A', 'ஏ': 'A',
+        'பி': 'B', 'பீ': 'B',
+        'சி': 'C', 'சீ': 'C',
+        'டி': 'D', 'டீ': 'D',
+        'இ': 'E',
+        'எஃப்': 'F',
+        'ஜி': 'G',
+        'எச்': 'H',
+        'ஐ': 'I',
+        'ஜே': 'J', 'ஜெ': 'J',
+        'கே': 'K', 'கெ': 'K',
+        'எல்': 'L',
+        'எம்': 'M',
+        'என்': 'N',
+    }
+
     @staticmethod
     def _clean_house_no(h: str) -> str:
         """Clean OCR artifacts from a house number value.
@@ -1416,9 +1683,10 @@ class VotersPDFProcessor:
         - Trailing/leading dashes and underscores: "15 _- -" → "15"
         - "Photo" text leakage: "15 - Photo 6" → "15"
         - Tamil "எண்" prefix: "எண் 08/191" → "08/191"
-        - Stray Tamil chars (single garbled chars): "43 ர" → "43"
+        - Tamil letter sub-units: "15 அ" → "15A", "3 சி" → "3C"
+        - Stray OCR-garbled Tamil chars (not letter sub-units): "43 ர" → "43"
         - "&" OCR misread of "A" or "/": "36&" → "36A"
-        - Trailing dots and noise: "3/14& . -" → "3/14A"
+        - Alphanumeric house numbers preserved: "1A", "1/8", "56J/11"
         """
         if not h:
             return h
@@ -1429,9 +1697,14 @@ class VotersPDFProcessor:
         h = re.sub(r'^எண்\s*\.?\s*', '', h).strip()
         # Replace "&" with "A" (common OCR misread)
         h = h.replace('&', 'A')
-        # Remove stray single Tamil characters (garbled OCR)
-        # Keep Tamil if it's a meaningful sub-unit label (like "அ" = A)
-        # Remove if it's a random single Tamil char after a space
+        # Convert Tamil letter sub-units to English equivalents
+        # e.g. "15 அ" → "15A", "3/சி" → "3/C", "56ஜே" → "56J"
+        for tamil_ch, eng_ch in VotersPDFProcessor._TAMIL_HOUSE_LETTER_MAP.items():
+            if tamil_ch in h:
+                # Replace Tamil letter (with optional preceding space/slash)
+                h = re.sub(r'[\s/]*' + re.escape(tamil_ch), eng_ch, h)
+        # Remove remaining stray single Tamil chars that are NOT known sub-units
+        # (garbled OCR noise like isolated "ர", "ண", etc.)
         h = re.sub(r'\s+[\u0B80-\u0BFF](?:\s|$)', '', h).strip()
         # Remove trailing OCR noise: sequences of _ - . spaces
         h = re.sub(r'[\s_\-\.]+$', '', h).strip()
@@ -2243,10 +2516,24 @@ class VotersPDFProcessor:
             h = house_match.group(1).strip().rstrip(' .,;:')
             # Treat standalone dash as empty
             if h and h != '-':
-                # Strip leading zeros from purely numeric house numbers (07 → 7)
+                # Strip leading zeros only from purely numeric house numbers (07 → 7)
+                # Keep alphanumeric intact: "01A" stays "01A", "0123" → "123"
                 if re.fullmatch(r'0+\d+', h):
                     h = h.lstrip('0') or '0'
                 voter.house_no = VotersPDFProcessor._clean_house_no(h)
+        else:
+            # Fallback: try to find house number without Tamil label
+            # (OCR may garble the label entirely)
+            # Look for patterns like "HNo: 1A" or standalone number-letter combos
+            # near the end of a line, after age/gender context
+            house_fb = re.search(
+                r'(?:H\.?\s*No|HNo)\s*:?\s*(\S+)',
+                segment, re.IGNORECASE,
+            )
+            if house_fb:
+                h = house_fb.group(1).strip().rstrip(' .,;:')
+                if h and h != '-':
+                    voter.house_no = VotersPDFProcessor._clean_house_no(h)
 
         # --- Age ---
         age_match = re.search(
