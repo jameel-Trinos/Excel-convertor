@@ -52,8 +52,8 @@ def _normalize_epic(raw: str) -> str:
 _AGE_RE = re.compile(r'\b(\d{1,3})\b')
 
 # Gender patterns (English + Tamil)
-_GENDER_MALE = re.compile(r'\b(Male|ஆண்|M)\b', re.IGNORECASE)
-_GENDER_FEMALE = re.compile(r'\b(Female|பெண்|F)\b', re.IGNORECASE)
+_GENDER_MALE = re.compile(r'(?<![a-zA-Z\u0B80-\u0BFF])(Male|ஆண்|M)(?![a-zA-Z\u0B80-\u0BFF])', re.IGNORECASE)
+_GENDER_FEMALE = re.compile(r'(?<![a-zA-Z\u0B80-\u0BFF])(Female|பெண்|F)(?![a-zA-Z\u0B80-\u0BFF])', re.IGNORECASE)
 
 # Serial number at start of a voter entry
 _SERIAL_RE = re.compile(r'^\s*(\d{1,4})\s')
@@ -311,6 +311,21 @@ class VotersPDFProcessor:
             v for v in self.voters
             if not self._is_false_positive_voter(v)
         ]
+        # Clean OCR artifacts from names of kept voters (stray |, }, {, [ chars)
+        for v in self.voters:
+            if v.name:
+                v.name = re.sub(r'[{}\[\]|]', '', v.name).strip().rstrip(' -.:;')
+                # Strip header metadata that leaked into voter names
+                # (e.g., "1-அரியலூர் (0" → strip the "1-அரியலூர் (0" prefix)
+                v.name = re.sub(r'^\d+\s*[-–]\s*[\u0B80-\u0BFF]+.*?\)\s*', '', v.name).strip()
+                v.name = re.sub(r'^\d+\s*[-–]\s*[\u0B80-\u0BFF]+\s*\(.*$', '', v.name).strip()
+                # Clear garbage OCR names: pure short lowercase ASCII or single chars
+                if re.fullmatch(r'[a-z]{1,5}', v.name) or len(v.name) <= 1:
+                    v.name = ""
+            if v.father_husband_name:
+                v.father_husband_name = re.sub(r'[{}\[\]|]', '', v.father_husband_name).strip().rstrip(' -.:;')
+        # Remove voters whose name became empty after cleaning
+        self.voters = [v for v in self.voters if v.name and v.name.strip()]
         logger.info(f"[FILTER STATS] Before={pre_filter_count}, After={len(self.voters)}, Dropped={pre_filter_count - len(self.voters)}")
 
         # Re-number serial numbers sequentially
@@ -399,14 +414,40 @@ class VotersPDFProcessor:
                             "avg_card_height": sum(heights) / len(heights),
                         }
 
+                    # Build row-top lookup to compute header extension per card.
+                    # The EPIC voter ID and serial number are printed ABOVE each
+                    # card box, in the strip between the previous row's bottom
+                    # and the current card's top. We must extend the crop upward
+                    # to capture the EPIC.
+                    row_tops_sorted = sorted(set(round(b[1], 0) for b in card_bboxes))
+                    row_bottoms: dict[float, float] = {}
+                    for b in card_bboxes:
+                        rt = round(b[1], 0)
+                        row_bottoms[rt] = max(row_bottoms.get(rt, 0), b[3])
+
+                    def _header_extend(card_top: float) -> float:
+                        """Compute how far above card_top to extend for EPIC strip."""
+                        rt = round(card_top, 0)
+                        ri = row_tops_sorted.index(rt) if rt in row_tops_sorted else -1
+                        if ri <= 0:
+                            # First row: extend up to 40pt (EPIC strip above first row)
+                            return min(40.0, card_top - 2)
+                        prev_bottom = row_bottoms.get(row_tops_sorted[ri - 1], card_top)
+                        gap = card_top - prev_bottom
+                        # Extend by 90% of the gap between rows (captures EPIC strip)
+                        return max(0.0, gap * 0.9)
+
                     # Extract text from each card
                     page_voters: list[VoterRecord] = []
                     skipped_cards: list[str] = []  # track skipped card texts for retry
                     for x0, top, x1, bottom in card_bboxes:
                         try:
-                            # Inset by 2pt to avoid picking up border/adjacent text
+                            # Extend crop UPWARD to capture EPIC voter ID printed
+                            # above the card box, then inset sides by 2pt
+                            extend_up = _header_extend(top)
+                            crop_top = max(0, top - extend_up)
                             cropped = page.crop(
-                                (x0 + 2, top + 2, x1 - 2, bottom - 2),
+                                (x0 + 2, crop_top, x1 - 2, bottom - 2),
                                 strict=False,
                             )
                             card_text = cropped.extract_text() or ""
@@ -453,6 +494,37 @@ class VotersPDFProcessor:
                             logger.info(f"[SPATIAL RETRY] Recovered voter: {voter.name}")
                             page_voters.append(voter)
 
+                    # --- EPIC recovery: assign EPICs to voters that don't have one ---
+                    # The EPIC may be in the header strip above the card. If the
+                    # extended crop didn't capture it, fall back to matching EPICs
+                    # from full page text to card positions.
+                    voters_missing_epic = [
+                        (i, v) for i, v in enumerate(page_voters) if not v.voter_id
+                    ]
+                    if voters_missing_epic:
+                        # Collect all EPICs from the full page text with their positions
+                        all_page_epics: list[str] = _EPIC_RE.findall(page_text)
+                        # Already-used EPICs
+                        used_epics = set(v.voter_id for v in page_voters if v.voter_id)
+                        available_epics = [e for e in all_page_epics if e not in used_epics]
+
+                        if available_epics:
+                            # Positional assignment: cards and EPICs are both in
+                            # reading order (top-to-bottom, left-to-right), so
+                            # assign available EPICs to missing-EPIC voters in order
+                            epic_idx = 0
+                            for vi, voter in voters_missing_epic:
+                                if epic_idx < len(available_epics):
+                                    candidate = available_epics[epic_idx]
+                                    if candidate not in used_epics:
+                                        voter.voter_id = candidate
+                                        used_epics.add(candidate)
+                                    epic_idx += 1
+                            logger.info(
+                                f"[SPATIAL EPIC-RECOVERY] Page {page_idx+1}: "
+                                f"assigned {epic_idx} EPICs to voters missing IDs"
+                            )
+
                     logger.info(
                         f"[SPATIAL] Page {page_idx+1}: {len(card_bboxes)} cards detected, "
                         f"{len(page_voters)} voters extracted, {len(skipped_cards)} skipped"
@@ -469,6 +541,9 @@ class VotersPDFProcessor:
                         else:
                             serial_counter += 1
                             voter.serial_no = str(serial_counter)
+
+                    # Fix house numbers with OCR digit↔letter confusion using page context
+                    self._fix_house_numbers_contextual(page_voters)
 
                     voters.extend(page_voters)
 
@@ -744,74 +819,153 @@ class VotersPDFProcessor:
     # ------------------------------------------------------------------
 
     # ------------------------------------------------------------------
-    # Whole-page EPIC extraction helper
+    # Batch card OCR: stitch cards into one image, OCR once, split text
     # ------------------------------------------------------------------
 
+    _CARD_SEPARATOR = "═" * 40  # Unique separator between cards in stitched image
+
     @staticmethod
-    def _extract_epic_ids_from_page(
+    def _stitch_cards_for_batch_ocr(
         gray: np.ndarray,
-        card_bboxes: list[tuple[int, int, int, int]],
-        expanded_bboxes: list[tuple[int, int, int, int]],
-        margin: int = 15,
-    ) -> dict[int, str]:
-        """Run one whole-page OCR pass (eng, PSM 3) to extract EPIC IDs.
+        card_crops: list[tuple[int, np.ndarray]],
+    ) -> tuple[np.ndarray, list[int]]:
+        """Stitch multiple card images into one vertical strip with separators.
 
-        Maps found EPIC IDs to their nearest card region by position.
-        Returns {card_index: epic_id} for cards where an EPIC was found.
+        Inserts a thick white gap (20px) between cards so tesseract sees them
+        as separate blocks. Returns (stitched_image, y_offsets_per_card).
         """
-        import pytesseract
+        import cv2
 
-        try:
-            data = pytesseract.image_to_data(
-                gray, lang="eng",
-                config="--oem 3 --psm 3",
-                output_type=pytesseract.Output.DICT,
-            )
-        except Exception:
-            return {}
+        GAP_H = 20  # White gap between cards
+        max_w = max(c.shape[1] for _, c in card_crops) if card_crops else 100
+        parts: list[np.ndarray] = []
+        y_offsets: list[int] = []
+        current_y = 0
 
-        # Collect words with positions
-        words: list[dict] = []
-        for i in range(len(data["text"])):
-            text = data["text"][i].strip()
-            conf = int(data["conf"][i])
-            if text and conf > 0:
-                words.append({
-                    "text": text,
-                    "left": data["left"][i],
-                    "top": data["top"][i],
-                    "width": data["width"][i],
-                    "height": data["height"][i],
-                })
+        for ci, card_img in card_crops:
+            # Pad card to max_w if narrower
+            h_c, w_c = card_img.shape[:2]
+            if w_c < max_w:
+                pad = np.full((h_c, max_w - w_c), 255, dtype=np.uint8)
+                card_img = np.hstack([card_img, pad])
 
-        # Find EPIC IDs in words and map to card regions
-        epic_map: dict[int, str] = {}
-        # First build full text per expanded card region
-        card_texts: dict[int, list[str]] = {i: [] for i in range(len(expanded_bboxes))}
-        for word in words:
-            wcx = word["left"] + word["width"] // 2
-            wcy = word["top"] + word["height"] // 2
-            for ci, (cx, cy, cw, ch) in enumerate(expanded_bboxes):
-                if (cx - margin <= wcx <= cx + cw + margin and
-                        cy - margin <= wcy <= cy + ch + margin):
-                    card_texts[ci].append(word["text"])
-                    break
+            y_offsets.append(current_y)
+            parts.append(card_img)
+            current_y += h_c
 
-        for ci, texts in card_texts.items():
-            if not texts:
-                continue
-            combined = " ".join(texts)
-            epic_m = _EPIC_RE.search(combined)
-            if epic_m:
-                epic_map[ci] = epic_m.group(1)
-            else:
-                fuzzy_m = _EPIC_FUZZY_RE.search(combined)
-                if fuzzy_m:
-                    normalized = _normalize_epic(fuzzy_m.group(1))
-                    if normalized:
-                        epic_map[ci] = normalized
+            # Add white gap separator
+            gap = np.full((GAP_H, max_w), 255, dtype=np.uint8)
+            parts.append(gap)
+            current_y += GAP_H
 
-        return epic_map
+        if not parts:
+            return np.full((10, 100), 255, dtype=np.uint8), []
+
+        return np.vstack(parts), y_offsets
+
+    @staticmethod
+    def _split_batch_ocr_text(
+        text: str, num_cards: int
+    ) -> list[str]:
+        """Split the OCR text from a stitched image into per-card segments.
+
+        The stitched image has white gaps between cards which tesseract renders
+        as blank lines / page breaks. We split on runs of 2+ blank lines.
+        Falls back to field-label-based splitting before even distribution.
+        """
+        # Split on multiple blank lines (the white gap between cards)
+        segments = re.split(r'\n\s*\n\s*\n', text)
+
+        # If we got fewer segments than cards, try splitting on double-newline
+        if len(segments) < num_cards:
+            segments = re.split(r'\n\s*\n', text)
+
+        # If still fewer, try field-label-based splitting (each card starts with "பெயர் :")
+        if len(segments) < num_cards * 0.7:
+            label_segments = re.split(r'(?=(?:^|\n)\s*(?:\d+\s+)?பெயர்\s*:)', text)
+            label_segments = [s for s in label_segments if s.strip()]
+            if len(label_segments) >= num_cards * 0.7:
+                segments = label_segments
+
+        # Last resort: distribute text evenly (least reliable)
+        if len(segments) < num_cards * 0.7:
+            all_lines = text.split('\n')
+            lines_per_card = max(1, len(all_lines) // max(num_cards, 1))
+            segments = []
+            for i in range(0, len(all_lines), lines_per_card):
+                segments.append('\n'.join(all_lines[i:i + lines_per_card]))
+
+        # Pad with empty strings if we still have fewer
+        while len(segments) < num_cards:
+            segments.append("")
+
+        return segments[:num_cards]
+
+    @staticmethod
+    def _is_header_card_text(text: str) -> bool:
+        """Check if card text is a page header cell, not a voter card.
+
+        The first row of the voter card grid often contains booth metadata:
+        AC name, part number, address, "voter list" title etc.
+        These should be skipped, not parsed as voter records.
+        """
+        text_stripped = text.strip()
+        if not text_stripped:
+            return False
+
+        # Common header indicators
+        _header_indicators = (
+            # Tamil labels found in page headers
+            'சட்டமன்ற', 'தொகுதி', 'பாகம்', 'பகுதி எண்',
+            'வாக்காளர்', 'பட்டியல்', 'ஊராட்சி',
+            # Cover page / summary keywords
+            'முக்கிய', 'கிராமம்', 'நகரம்', 'மற்றும்',
+            'வருவாய்', 'மாவட்ட', 'சுருக்கம்', 'விவரம்',
+            # Municipality / town abbreviations in brackets
+            '(மா)', '(ந)', '(பே)', '(மா.நிர்)',
+            # English equivalents
+            'constituency', 'polling', 'part no', 'electoral',
+            'assembly', 'voter list', 'supplement',
+        )
+        text_lower = text_stripped.lower()
+        indicator_count = sum(1 for kw in _header_indicators if kw in text_lower)
+        if indicator_count >= 2:
+            return True
+        if indicator_count == 1:
+            # Single indicator: only flag as header if no voter field labels present
+            has_voter_label = bool(re.search(
+                r'பெயர்|Name|வயது|Age|பாலினம்|Gender|வீட்டு|House|[A-Z]{3}\d{7}',
+                text_stripped, re.IGNORECASE,
+            ))
+            if not has_voter_label:
+                return True
+
+        # Pattern: starts with "digit-" or "digit." followed by text (e.g. "1-கடலூர் (மா), 6")
+        if re.match(r'^\d+\s*[-–.]\s*[^\d]', text_stripped):
+            # But "1-A" or "1-12" could be house numbers in a voter card
+            # Only flag if followed by Tamil text or city-like content
+            after_digit = re.sub(r'^\d+\s*[-–.]\s*', '', text_stripped)
+            tamil_chars = len(re.findall(r'[\u0B80-\u0BFF]', after_digit))
+            if tamil_chars >= 3:
+                return True
+
+        # If text has NO voter-like labels (no Name/Age/Gender/EPIC patterns)
+        # and has address-like content, it's probably a header
+        has_voter_label = bool(re.search(
+            r'பெயர்|Name|வயது|Age|பாலினம்|Gender|வீட்டு|House|[A-Z]{3}\d{7}',
+            text_stripped, re.IGNORECASE,
+        ))
+        if not has_voter_label and len(text_stripped) > 5:
+            # Check if it looks like an address/location (lots of commas, numbers)
+            comma_count = text_stripped.count(',')
+            if comma_count >= 2:
+                return True
+            # Short text with Tamil content but no voter fields — likely header cell
+            tamil_chars = len(re.findall(r'[\u0B80-\u0BFF]', text_stripped))
+            if tamil_chars >= 2 and len(text_stripped) <= 40:
+                return True
+
+        return False
 
     def _ocr_single_page_cards(
         self,
@@ -819,14 +973,11 @@ class VotersPDFProcessor:
         gray: np.ndarray,
         do_header_ocr: bool,
     ) -> dict[str, Any]:
-        """OCR a single page: detect card grid, OCR each card, return voters.
+        """OCR a single page: detect card grid, per-card OCR, return voters.
 
-        Hybrid approach for speed + accuracy:
-        - Per-card OCR (1 call each) preserves card-internal text structure
-        - 1 whole-page EPIC pass recovers voter IDs missed by per-card OCR
-        - Removed expensive fallback strategies 2-4 (saved 2-4 calls/card)
-
-        Total OCR calls: ~N_cards + 1 per page (vs original N_cards * 1-5).
+        Uses per-card OCR for accurate text extraction (one pytesseract call
+        per card) plus a dedicated EPIC strip OCR per card for voter ID
+        recovery. Falls back to whole-page EPIC pass for remaining gaps.
 
         Returns dict with keys: page_idx, voters, header_text, card_count.
         """
@@ -876,38 +1027,42 @@ class VotersPDFProcessor:
 
         row_tops = sorted(set(c[1] for c in card_bboxes))
 
-        # Build expanded bboxes for EPIC mapping (extend upward into gap area)
-        expanded_bboxes: list[tuple[int, int, int, int]] = []
-        for x, y, w, h in card_bboxes:
-            row_idx = row_tops.index(y) if y in row_tops else 0
-            if row_idx == 0:
-                header_extend = min(55, y - 5)
+        # Build mapping: row_top -> bottom_y of cards in the previous row
+        # Used to locate the EPIC strip between rows
+        row_prev_bottom: dict[int, int | None] = {}
+        for rt_idx, rt in enumerate(row_tops):
+            if rt_idx == 0:
+                row_prev_bottom[rt] = None
             else:
-                prev_row_y = row_tops[row_idx - 1]
-                prev_row_h = h
-                for cx, cy, cw, ch in card_bboxes:
-                    if cy == prev_row_y:
-                        prev_row_h = ch
-                        break
-                gap = y - (prev_row_y + prev_row_h)
-                header_extend = min(int(gap * 0.9), y - 5) if gap > 10 else 55
-            y_start = max(0, y - header_extend)
-            expanded_bboxes.append((x, y_start, w, h + (y - y_start)))
+                prev_rt = row_tops[rt_idx - 1]
+                # Find height of a card in the previous row
+                prev_h = next(
+                    ch for cx, cy, cw, ch in card_bboxes if cy == prev_rt
+                )
+                row_prev_bottom[rt] = prev_rt + prev_h
 
         # Reusable CLAHE enhancer
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
 
-        # --- Per-card OCR: 1 call each (preserves card text structure) ---
+        # --- Per-card OCR + dedicated EPIC strip OCR ---
         page_voters: list[VoterRecord] = []
-        card_to_voter: dict[int, int] = {}  # card_index -> voter_index
+        card_to_voter: dict[int, int] = {}
+        # Store expanded bboxes for whole-page EPIC fallback
+        expanded_bboxes: list[tuple[int, int, int, int]] = []
         has_missing_epic = False
+        skipped_header_cards = 0
+        used_epics: set[str] = set()
 
         for ci, (x, y, w, h) in enumerate(card_bboxes):
+            row_idx = row_tops.index(y) if y in row_tops else 0
             inset = 4
-            y_start = expanded_bboxes[ci][1]
-            card_img = gray[y_start:y + h - inset, x + inset:x + w - inset]
 
+            # --- Step A: OCR card body (NO header extension) ---
+            # Crop only the card interior to avoid header metadata pollution
+            card_img = gray[y + inset:y + h - inset, x + inset:x + w - inset]
             if card_img.size == 0:
+                # Store a dummy expanded bbox
+                expanded_bboxes.append((x, y, w, h))
                 continue
 
             card_enhanced = clahe.apply(card_img)
@@ -918,34 +1073,163 @@ class VotersPDFProcessor:
                     config="--oem 3 --psm 6",
                 )
             except Exception:
+                expanded_bboxes.append((x, y, w, h))
                 continue
 
-            if len(card_text.strip()) < 5:
+            # Strip header metadata lines that may leak into first-row cards
+            card_text = re.sub(
+                r'^.*?(?:சட்டமன்ற|தொகுதி|பிரிவு எண்|பகுதி எண்|பாகம் எண்).*?\n',
+                '', card_text, count=2,
+            )
+
+            # Store expanded bbox for whole-page EPIC fallback
+            if row_idx == 0:
+                expanded_bboxes.append((x, y, w, h))
+            else:
+                prev_bottom = row_prev_bottom.get(y)
+                epic_y = prev_bottom if prev_bottom is not None else max(0, y - 50)
+                expanded_bboxes.append((x, epic_y, w, h + (y - epic_y)))
+
+            if self._is_header_card_text(card_text):
+                skipped_header_cards += 1
+                continue
+
+            if len(card_text.strip()) < 3:
                 continue
 
             voter = self._extract_voter_from_segment(card_text)
 
+            # --- Step B: Dedicated EPIC strip OCR ---
+            # The EPIC (voter ID) is in a strip near the card:
+            #   Row 0: EPIC may be just ABOVE the card or at the top INSIDE
+            #          the card (varies by page layout)
+            #   Row 1+: EPIC is in the gap BETWEEN previous row bottom
+            #           and current row top
+            if not voter.voter_id:
+                epic_strips: list[np.ndarray] = []
+                if row_idx == 0:
+                    # Try strip above card first (most pages)
+                    above_strip = gray[max(0, y - 50):y, x:x + w]
+                    if above_strip.size > 0:
+                        epic_strips.append(above_strip)
+                    # Also try top of card (some pages have EPIC inside)
+                    inside_strip = gray[y:y + 35, x:x + w]
+                    if inside_strip.size > 0:
+                        epic_strips.append(inside_strip)
+                else:
+                    prev_bottom = row_prev_bottom.get(y)
+                    if prev_bottom is not None:
+                        epic_strips.append(gray[prev_bottom:y, x:x + w])
+                    else:
+                        epic_strips.append(gray[max(0, y - 50):y, x:x + w])
+
+                for epic_strip in epic_strips:
+                    if epic_strip.size == 0:
+                        continue
+                    try:
+                        epic_text = pytesseract.image_to_string(
+                            epic_strip, lang="eng",
+                            config="--oem 3 --psm 3",
+                        )
+                        epic_m = _EPIC_RE.search(epic_text)
+                        if epic_m and epic_m.group(1) not in used_epics:
+                            voter.voter_id = epic_m.group(1)
+                            break
+                        elif not epic_m:
+                            fuzzy_m = _EPIC_FUZZY_RE.search(epic_text)
+                            if fuzzy_m:
+                                normalized = _normalize_epic(
+                                    fuzzy_m.group(1)
+                                )
+                                if normalized and normalized not in used_epics:
+                                    voter.voter_id = normalized
+                                    break
+                    except Exception:
+                        pass
+
             if voter.is_valid:
                 voter_idx = len(page_voters)
                 card_to_voter[ci] = voter_idx
-                if not voter.voter_id:
+                if voter.voter_id:
+                    used_epics.add(voter.voter_id)
+                else:
                     has_missing_epic = True
                 page_voters.append(voter)
 
-        # --- Whole-page EPIC pass: 1 call to recover missing voter IDs ---
+        # --- Whole-page EPIC pass: fallback for voters still missing IDs ---
         if has_missing_epic:
-            epic_map = self._extract_epic_ids_from_page(
-                gray, card_bboxes, expanded_bboxes
-            )
-            for ci, epic_id in epic_map.items():
-                vi = card_to_voter.get(ci)
-                if vi is not None and not page_voters[vi].voter_id:
-                    page_voters[vi].voter_id = epic_id
+            try:
+                epic_data = pytesseract.image_to_data(
+                    gray, lang="eng",
+                    config="--oem 3 --psm 3",
+                    output_type=pytesseract.Output.DICT,
+                )
+                # Collect words with positions
+                epic_words: list[dict] = []
+                for i in range(len(epic_data["text"])):
+                    text = epic_data["text"][i].strip()
+                    conf = int(epic_data["conf"][i])
+                    if text and conf > 0:
+                        epic_words.append({
+                            "text": text,
+                            "left": epic_data["left"][i],
+                            "top": epic_data["top"][i],
+                            "width": epic_data["width"][i],
+                            "height": epic_data["height"][i],
+                        })
 
+                # Build text per expanded card region
+                margin = 15
+                for ci_target, vi in card_to_voter.items():
+                    if page_voters[vi].voter_id:
+                        continue
+                    ex, ey, ew, eh = expanded_bboxes[ci_target]
+                    card_word_texts = []
+                    for w in epic_words:
+                        wcx = w["left"] + w["width"] // 2
+                        wcy = w["top"] + w["height"] // 2
+                        if (ex - margin <= wcx <= ex + ew + margin and
+                                ey - margin <= wcy <= ey + eh + margin):
+                            card_word_texts.append(w["text"])
+                    combined = " ".join(card_word_texts)
+                    epic_m = _EPIC_RE.search(combined)
+                    if epic_m and epic_m.group(1) not in used_epics:
+                        page_voters[vi].voter_id = epic_m.group(1)
+                        used_epics.add(epic_m.group(1))
+                    elif not epic_m or epic_m.group(1) in used_epics:
+                        fuzzy_m = _EPIC_FUZZY_RE.search(combined)
+                        if fuzzy_m:
+                            normalized = _normalize_epic(fuzzy_m.group(1))
+                            if normalized and normalized not in used_epics:
+                                page_voters[vi].voter_id = normalized
+                                used_epics.add(normalized)
+            except Exception:
+                pass
+
+        # Quality check: if no voter has any evidence (EPIC, age, gender),
+        # this page is likely a cover/summary page — discard all voters
+        voters_with_evidence = sum(
+            1 for v in page_voters
+            if v.voter_id or v.age or v.gender
+        )
+        if page_voters and voters_with_evidence == 0:
+            logger.info(
+                f"[IMG-CARD-OCR] Page {page_idx+1}: discarding {len(page_voters)} "
+                f"voters — no EPIC/age/gender evidence (likely cover page)"
+            )
+            page_voters.clear()
+
+        if skipped_header_cards:
+            logger.info(
+                f"[IMG-CARD-OCR] Page {page_idx+1}: skipped {skipped_header_cards} header cards"
+            )
         logger.info(
             f"[IMG-CARD-OCR] Page {page_idx+1}: {len(page_voters)} voters "
             f"from {len(card_bboxes)} cards"
         )
+
+        # Fix house numbers with OCR digit↔letter confusion using page context
+        VotersPDFProcessor._fix_house_numbers_contextual(page_voters)
 
         result["voters"] = page_voters
         return result
@@ -1489,18 +1773,42 @@ class VotersPDFProcessor:
 
     @staticmethod
     def _is_false_positive_voter(voter: "VoterRecord") -> bool:
-        """Check if a voter record is actually metadata/header text misidentified."""
+        """Check if a voter record is actually metadata/header text misidentified.
+
+        IMPORTANT: Never drop a record that has strong secondary evidence
+        (father name, age, gender, voter_id, house_no). Real voters whose
+        names got garbled by OCR or merged with header text must be kept.
+        """
         name = voter.name.strip()
         if not name:
             return True
+
+        # Count how many secondary fields this record has
+        evidence_count = sum([
+            bool(voter.father_husband_name and len(voter.father_husband_name.strip()) > 2),
+            bool(voter.age),
+            bool(voter.gender),
+            bool(voter.voter_id),
+            bool(voter.house_no and voter.house_no.strip()),
+        ])
+
+        # Strong evidence: 2+ secondary fields means this is almost certainly
+        # a real voter, even if the name looks garbled or contains metadata text.
+        # OCR often prepends/appends header text to the first voter's name.
+        if evidence_count >= 2:
+            return False
+
         # Header keywords that indicate this is metadata, not a voter
         metadata_kw = (
             'சாவடி', 'தொகுதி', 'பட்டியல்', 'வாக்காளர்',
             'ஊராட்சி', 'சட்டமன்ற', 'நாடாளுமன்ற', 'பிரிவு',
             'electoral', 'constituency', 'polling', 'station',
             'பாகம்', 'கையொப்பம்', 'google', 'map', 'nazri', 'naksha',
-            'நூலக', 'கட்டிடம்', 'புதுக்குப்பம்', 'வடக்கு',
-            'ஆண்/பெண்', 'பகுதி', 'நகரம்', 'frade', 'bape',
+            'நூலக', 'கட்டிடம்',
+            'ஆண்/பெண்', 'நகரம்', 'frade', 'bape',
+            # Cover page / summary keywords
+            'முக்கிய', 'கிராமம்', 'மற்றும்', 'வருவாய்', 'மாவட்ட',
+            'சுருக்கம்', 'விவரம்',
             # Common OCR fragments from page headers/footers
             'மாற்றம்', 'என் மற்றும்', 'திருத்த', 'குறிப்பு',
             'முகவரி', 'சேர்த்தல்', 'நீக்கம்', 'அட்டவணை',
@@ -1519,9 +1827,42 @@ class VotersPDFProcessor:
             'செங்கல்பட்டு', 'கள்ளக்குறிச்சி', 'மயிலாடுதுறை',
         )
         name_lower = name.lower()
+
+        # With 1 evidence field, only drop on very strong metadata signals
+        if evidence_count == 1:
+            # Only drop if name is PURELY metadata (no Tamil name chars at all)
+            tamil_chars = len(re.findall(r'[\u0B80-\u0BFF]', name))
+            metadata_hit = any(kw in name_lower for kw in metadata_kw)
+            city_hit = any(kw in name for kw in _city_district_kw)
+            if metadata_hit or city_hit:
+                # Check: does the name have real Tamil name content BEYOND the keyword?
+                # Strip all metadata/city keywords and see what's left
+                cleaned = name
+                for kw in list(metadata_kw) + list(_city_district_kw):
+                    cleaned = cleaned.replace(kw, '')
+                cleaned = re.sub(r'[\d\s\-–.,;:()\[\]{}|/]', '', cleaned)
+                tamil_remaining = len(re.findall(r'[\u0B80-\u0BFF]', cleaned))
+                if tamil_remaining >= 3:
+                    # Real Tamil name mixed with metadata — keep it
+                    return False
+                # Pure metadata with 1 evidence field — drop
+                return True
+            # Not metadata keyword match — keep
+            return False
+
+        # No evidence fields: apply full metadata checks
+        tamil_chars = len(re.findall(r'[\u0B80-\u0BFF]', name))
+
+        # Early rejection: garbage names that are too short or pure ASCII noise
+        if len(name) <= 1:
+            return True
+        if len(name) <= 2 and tamil_chars <= 1:
+            return True
+        if re.fullmatch(r'[a-z]{1,5}', name):
+            return True
+
         if any(kw in name_lower for kw in metadata_kw):
             return True
-        # Detect city/district names in the "name" field (header leakage)
         if any(kw in name for kw in _city_district_kw):
             return True
         # Pattern: "digit-CityName" or "(மா)" (municipality) — page header metadata
@@ -1536,40 +1877,27 @@ class VotersPDFProcessor:
         if len(name) > 80:
             return True
         # Names that are mostly ASCII/Latin (OCR noise) with very few Tamil chars
-        tamil_chars = len(re.findall(r'[\u0B80-\u0BFF]', name))
         ascii_chars = len(re.findall(r'[a-zA-Z]', name))
         if ascii_chars > 10 and tamil_chars < 3:
             return True
-        # Names containing special chars that indicate OCR garbage
+        # Names containing special chars — only drop if no other voter fields
         if re.search(r'[{}\[\]|]', name):
-            return True
+            # Clean the special chars from name rather than dropping
+            # (OCR often inserts stray | or } chars in real names)
+            return False
         # Very short names with mostly non-Tamil chars are likely noise
-        # But keep if the voter has strong secondary evidence (multiple fields present)
         if tamil_chars < 2 and len(name) > 3:
-            evidence_count = sum([
-                bool(voter.father_husband_name and len(voter.father_husband_name.strip()) > 2),
-                bool(voter.age),
-                bool(voter.gender),
-                bool(voter.voter_id),
-                bool(voter.house_no),
-            ])
-            if evidence_count < 2:
-                return True
+            return True
         # A real voter should have at least name + (age or gender or voter_id)
-        # But if the name looks like a real Tamil name AND has a father/husband name,
-        # keep it even without secondary attrs (OCR may have missed age/gender).
         has_secondary = bool(voter.age or voter.gender or voter.voter_id)
         if not has_secondary:
             has_father = bool(voter.father_husband_name and voter.father_husband_name.strip())
             has_house = bool(voter.house_no and voter.house_no.strip())
             if has_father and tamil_chars >= 4:
-                # Looks like a real voter whose age/gender was not parsed
                 return False
             if has_house and tamil_chars >= 3:
-                # Has house number + Tamil name — likely a real voter
                 return False
             if tamil_chars >= 6:
-                # Strong Tamil name even without other fields — likely real
                 return False
             return True
         return False
@@ -1690,6 +2018,8 @@ class VotersPDFProcessor:
         """
         if not h:
             return h
+        # Strip leading special characters (OCR noise)
+        h = h.lstrip(';:!@#$%^*+=')
         # Remove "Photo is ..." leakage
         h = re.sub(r'\s*Photo\s+is.*$', '', h, flags=re.IGNORECASE).strip()
         h = re.sub(r'\s*Photo\s*\d*\s*$', '', h, flags=re.IGNORECASE).strip()
@@ -1706,14 +2036,92 @@ class VotersPDFProcessor:
         # Remove remaining stray single Tamil chars that are NOT known sub-units
         # (garbled OCR noise like isolated "ர", "ண", etc.)
         h = re.sub(r'\s+[\u0B80-\u0BFF](?:\s|$)', '', h).strip()
-        # Remove trailing OCR noise: sequences of _ - . spaces
-        h = re.sub(r'[\s_\-\.]+$', '', h).strip()
-        # Remove leading/trailing underscores, dashes, dots
-        h = h.strip(' _-.')
+        # Remove trailing OCR noise: sequences of _ . ; spaces (preserve internal hyphens)
+        h = re.sub(r'[\s_\.;]+$', '', h).strip()
+        # Remove only trailing hyphens/underscores/dots/semicolons (preserve internal hyphens like "1-21B")
+        h = h.rstrip(' _.;')
+        # Strip leading underscores/dots only
+        h = h.lstrip(' _.')
+        # Only strip leading/trailing hyphens if they are not part of the house number
+        if h.startswith('-') and not re.match(r'-\d', h):
+            h = h.lstrip('-')
+        if h.endswith('-'):
+            h = h.rstrip('-')
         # If result is empty or just dashes, return empty
         if not h or re.fullmatch(r'[\s_\-\.]+', h):
             return ""
+        # Reject house numbers with no digits (pure text like "SEAS", Tamil-only)
+        if not re.search(r'\d', h):
+            return ""
+        # Strip trailing English words (e.g., "4671 STREET" → "4671")
+        h = re.sub(r'\s+[A-Za-z]{3,}.*$', '', h).strip()
+        # Strip trailing text after comma (e.g., "16J,SWETHAN" → "16J", "121,சண்முகா" → "121")
+        h = re.sub(r',[A-Za-z]{3,}.*$', '', h).strip()
+        h = re.sub(r',[\u0B80-\u0BFF]{2,}.*$', '', h).strip()
+        # Reject excessively long values (real house numbers are short)
+        if len(h) > 20:
+            return ""
+        if not h or not re.search(r'\d', h):
+            return ""
         return h
+
+    @staticmethod
+    def _fix_house_numbers_contextual(voters: list["VoterRecord"]) -> None:
+        """Fix OCR digit↔letter confusion in house numbers using page context.
+
+        If most house numbers on a page have letter suffixes (e.g., "1-21A",
+        "1-22C"), then "1-218" is likely "1-21B" (OCR confused B→8).
+
+        Common OCR confusions: B→8, C→0, D→0, A→4, G→6
+        """
+        if not voters:
+            return
+
+        # Analyze house number patterns
+        with_letter_suffix = 0
+        with_digit_only_suffix = 0
+        # Pattern: something followed by a letter at the end
+        _letter_suffix_re = re.compile(r'[-/]\d*[A-Za-z]$|^\d+[A-Za-z]$')
+        # Pattern: ends with digits after separator, last digit could be OCR'd letter
+        _digit_suffix_re = re.compile(r'[-/]\d+$')
+
+        for v in voters:
+            h = v.house_no
+            if not h:
+                continue
+            if _letter_suffix_re.search(h):
+                with_letter_suffix += 1
+            elif _digit_suffix_re.search(h):
+                with_digit_only_suffix += 1
+
+        # If majority have letter suffixes, fix suspicious digit-only endings
+        if with_letter_suffix < 3 or with_letter_suffix <= with_digit_only_suffix:
+            return
+
+        # Reverse OCR confusion map: digit → most likely letter
+        _DIGIT_TO_LETTER = {'8': 'B', '0': 'C', '4': 'A', '6': 'G'}
+
+        fixed_count = 0
+        for v in voters:
+            h = v.house_no
+            if not h:
+                continue
+            # Match house numbers ending with a suspicious digit after separator
+            # e.g., "1-218" → could be "1-21B", "1-80" → could be "1-8C"
+            m = re.match(r'^(.+[-/]\d*)(\d)$', h)
+            if m and m.group(2) in _DIGIT_TO_LETTER:
+                # Also check: standalone like "128" where "12B" is expected
+                v.house_no = m.group(1) + _DIGIT_TO_LETTER[m.group(2)]
+                fixed_count += 1
+            elif not _letter_suffix_re.search(h):
+                # Standalone numbers like "128" → "12B" when pattern says letter suffix
+                m2 = re.match(r'^(\d+)(\d)$', h)
+                if m2 and m2.group(2) in _DIGIT_TO_LETTER and len(h) >= 2:
+                    v.house_no = m2.group(1) + _DIGIT_TO_LETTER[m2.group(2)]
+                    fixed_count += 1
+
+        if fixed_count:
+            logger.info(f"[HOUSE-FIX] Contextual fix applied to {fixed_count} house numbers")
 
     @staticmethod
     def _extract_house_numbers(line: str) -> list[str]:
@@ -1725,10 +2133,10 @@ class VotersPDFProcessor:
         This method handles both correct Tamil and garbled variants.
         """
         # Primary: correct Tamil patterns (வீட்டு எண், ட்டு எண், ட்டுஎண்)
-        # Capture alphanumeric house numbers: digits optionally followed by
-        # letters, slashes, hyphens, ampersand (e.g. "1A", "1/A", "12B", "1&")
+        # Capture full alphanumeric house numbers including hyphens, slashes,
+        # and letter suffixes (e.g. "1A", "1/A", "12B", "1-21B", "1-8C", "1&")
         houses = re.findall(
-            r'(?:வீட்டு|ட்டு|ட்டுஎ)\s*எண்\s*:?\s*(\d+(?:[A-Za-z/\-&]\w*)?)',
+            r'(?:வீட்டு|ட்டு|ட்டுஎ)\s*எண்\s*:?\s*(\d[\w/\-&.]*)',
             line,
         )
         # Clean up: "&" is OCR misread of "A", remove trailing punctuation
@@ -1737,7 +2145,7 @@ class VotersPDFProcessor:
         # Secondary: garbled OCR patterns that replace Tamil with Latin chars
         # These look like "GLO) crevor: 32" or "ALG) crovor: 13"
         garbled = re.findall(
-            r'[A-Z]{2,4}\)\s*[a-z]*(?:evor|revor|rovor)\s*:?\s*(\d+(?:[A-Za-z/\-&]\w*)?)',
+            r'[A-Z]{2,4}\)\s*[a-z]*(?:evor|revor|rovor)\s*:?\s*(\d[\w/\-&.]*)',
             line,
         )
         if garbled:
@@ -1868,8 +2276,23 @@ class VotersPDFProcessor:
                 father = VotersPDFProcessor._clean_name(father)
 
                 # Skip header-like false positives (constituency metadata, not voter names)
-                if 'தொகுதி' in name or 'மற்றும்' in name:
-                    logger.info(f"[CARD-ROW FILTER] Dropped metadata: name='{name}'")
+                _HEADER_LEAK_KW = (
+                    'தொகுதி', 'மற்றும்', 'சட்டமன்ற', 'பாகம்', 'பகுதி',
+                    'வாக்காளர்', 'பட்டியல்', 'ஊராட்சி', 'சாவடி',
+                    'constituency', 'polling', 'electoral', 'supplement',
+                    'amendment', 'revision', 'வெளியிடப்பட்ட', 'மொத்த',
+                )
+                name_lower = name.lower()
+                if any(kw in name_lower for kw in _HEADER_LEAK_KW):
+                    # Don't drop if the row has strong secondary evidence
+                    _has_evidence = bool(father) and bool(age or gender)
+                    if not _has_evidence:
+                        logger.info(f"[CARD-ROW FILTER] Dropped metadata: name='{name}'")
+                        continue
+                # Drop names that are entirely non-Tamil (pure ASCII/digit noise)
+                tamil_in_name = len(re.findall(r'[\u0B80-\u0BFF]', name))
+                if tamil_in_name == 0 and not re.search(r'[a-zA-Z]{2,}', name):
+                    logger.info(f"[CARD-ROW FILTER] Dropped non-Tamil noise: name='{name}'")
                     continue
                 # If name has 2+ consecutive digits, try to strip them (OCR artifact)
                 # rather than dropping the record entirely
@@ -1888,7 +2311,7 @@ class VotersPDFProcessor:
                 voter = VoterRecord(
                     name=name,
                     father_husband_name=father,
-                    house_no=house,
+                    house_no=VotersPDFProcessor._clean_house_no(house) if house else "",
                     age=age,
                     gender=gender,
                 )
@@ -2002,9 +2425,12 @@ class VotersPDFProcessor:
         # Flush the last batch
         _flush()
 
-        # Assign EPIC voter IDs by matching names from PSM 3 extraction
+        # Assign EPIC voter IDs by positional order from PSM 3 extraction
         if page_epic_map:
-            self._assign_epics_by_name(voters, page_epic_map)
+            self._assign_epics_by_position(voters, page_epic_map)
+
+        # Fix house numbers with OCR digit↔letter confusion using page context
+        self._fix_house_numbers_contextual(voters)
 
         # Assign serial numbers
         for i, voter in enumerate(voters, 1):
@@ -2079,16 +2505,18 @@ class VotersPDFProcessor:
         return {'pairs': pairs, 'orphan_epics': orphans}
 
     @staticmethod
-    def _assign_epics_by_name(
+    def _assign_epics_by_position(
         voters: list["VoterRecord"],
         epic_data: dict,
     ) -> None:
-        """Assign EPIC IDs to voters by name matching.
+        """Assign EPIC IDs to voters by positional order matching.
 
-        Uses three strategies:
-        1. Exact name match from PSM 3 pairs
-        2. Substring/fuzzy match for OCR variations
-        3. Remaining unmatched EPICs assigned by position order
+        PSM 3 and PSM 6 both read cards in the same reading order
+        (top-to-bottom, left-to-right), so position N in PSM 3 pairs
+        corresponds to voter N from card-row parsing.
+
+        This replaces the previous name-based matching which caused
+        widespread EPIC mismatches due to OCR variations in Tamil names.
         """
         if not epic_data:
             return
@@ -2096,58 +2524,40 @@ class VotersPDFProcessor:
         pairs = epic_data.get('pairs', [])
         orphan_epics = list(epic_data.get('orphan_epics', []))
 
-        # Build name→EPIC lookup (handle duplicate names by keeping all)
-        name_to_epics: dict[str, list[str]] = {}
-        for name, epic in pairs:
+        # Collect all EPICs in reading order: paired first, then orphans
+        all_epics_ordered: list[str] = []
+        for _, epic in pairs:
             if epic:
-                name_to_epics.setdefault(name, []).append(epic)
+                all_epics_ordered.append(epic)
+        all_epics_ordered.extend(orphan_epics)
 
-        used_epics: set[str] = set()
+        if not all_epics_ordered:
+            return
 
-        # Pass 1: Exact name match
+        # Deduplicate while preserving order
+        seen: set[str] = set()
+        unique_epics: list[str] = []
+        for epic in all_epics_ordered:
+            if epic not in seen:
+                seen.add(epic)
+                unique_epics.append(epic)
+
+        # Collect EPICs already assigned to voters (from card text extraction)
+        already_assigned = set(v.voter_id for v in voters if v.voter_id)
+
+        # Assign by position: voter[i] gets epic[i], skipping already-used EPICs
+        epic_idx = 0
         for voter in voters:
             if voter.voter_id:
+                # Already has EPIC from card text extraction — skip
                 continue
-            name = voter.name.strip()
-            if name in name_to_epics:
-                for epic in name_to_epics[name]:
-                    if epic not in used_epics:
-                        voter.voter_id = epic
-                        used_epics.add(epic)
-                        break
-
-        # Pass 2: Substring/fuzzy match
-        for voter in voters:
-            if voter.voter_id:
-                continue
-            name = voter.name.strip()
-            if not name or len(name) < 3:
-                continue
-
-            best_epic = ""
-            best_len = 0
-            for psm3_name, epics in name_to_epics.items():
-                for epic in epics:
-                    if epic in used_epics:
-                        continue
-                    if psm3_name in name or name in psm3_name:
-                        match_len = min(len(psm3_name), len(name))
-                        if match_len > best_len:
-                            best_len = match_len
-                            best_epic = epic
-
-            if best_epic and best_len >= 4:
-                voter.voter_id = best_epic
-                used_epics.add(best_epic)
-
-        # Pass 3: Assign orphan EPICs to remaining unmatched voters by order
-        unmatched_voters = [v for v in voters if not v.voter_id]
-        all_remaining = orphan_epics + [
-            e for name_epics in name_to_epics.values()
-            for e in name_epics if e not in used_epics
-        ]
-        for voter, epic in zip(unmatched_voters, all_remaining):
-            voter.voter_id = epic
+            # Skip EPICs that are already used by other voters
+            while epic_idx < len(unique_epics) and unique_epics[epic_idx] in already_assigned:
+                epic_idx += 1
+            if epic_idx < len(unique_epics):
+                voter.voter_id = unique_epics[epic_idx]
+                already_assigned.add(unique_epics[epic_idx])
+                epic_idx += 1
 
     def _parse_as_table(self, lines: list[str]) -> list[VoterRecord]:
         """Try to parse lines as a structured table with columns."""
@@ -2193,7 +2603,7 @@ class VotersPDFProcessor:
                     age_match = _AGE_RE.search(part)
                     if age_match:
                         age_val = int(age_match.group(1))
-                        if 18 <= age_val <= 120:
+                        if 18 <= age_val <= 100:
                             voter.age = str(age_val)
 
             # Assign remaining text parts as name fields
@@ -2213,7 +2623,7 @@ class VotersPDFProcessor:
             if len(text_parts) >= 2:
                 voter.father_husband_name = text_parts[1]
             if len(text_parts) >= 3:
-                voter.house_no = text_parts[2]
+                voter.house_no = VotersPDFProcessor._clean_house_no(text_parts[2])
 
             if voter.is_valid:
                 voters.append(voter)
@@ -2295,14 +2705,14 @@ class VotersPDFProcessor:
         # Extract age
         for age_match in _AGE_RE.finditer(full_text):
             age_val = int(age_match.group(1))
-            if 18 <= age_val <= 120:
+            if 18 <= age_val <= 100:
                 voter.age = str(age_val)
                 break
 
         # Extract house number
         house_match = re.search(r'(?:House\s*No|வீட்டு\s*எண்|H\.?No)[:\s]*([^\s,]+)', full_text, re.IGNORECASE)
         if house_match:
-            voter.house_no = house_match.group(1)
+            voter.house_no = VotersPDFProcessor._clean_house_no(house_match.group(1))
 
         # Extract father/husband name
         rel_match = re.search(
@@ -2543,13 +2953,13 @@ class VotersPDFProcessor:
         )
         if age_match:
             age_val = int(age_match.group(1))
-            if 18 <= age_val <= 120:
+            if 18 <= age_val <= 100:
                 voter.age = str(age_val)
         else:
             # Fallback: look for age near gender
             for m in _AGE_RE.finditer(segment):
                 val = int(m.group(1))
-                if 18 <= val <= 120:
+                if 18 <= val <= 100:
                     voter.age = str(val)
                     break
 
@@ -2570,6 +2980,12 @@ class VotersPDFProcessor:
                 voter.gender = "Female"
             elif _GENDER_MALE.search(segment):
                 voter.gender = "Male"
+            else:
+                # Tertiary fallback: plain Tamil gender words without boundaries
+                if re.search(r'பெண்', segment):
+                    voter.gender = "Female"
+                elif re.search(r'ஆண்', segment):
+                    voter.gender = "Male"
 
         # --- Serial Number ---
         # Only match a leading number that is NOT already captured as house/age
