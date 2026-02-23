@@ -12,6 +12,7 @@ import time
 import tkinter as tk
 from tkinter import filedialog
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from dotenv import load_dotenv
 
@@ -72,11 +73,68 @@ def analyze_pdf(client, pdf_path):
     return poller.result()
 
 
-def tables_to_rows(result):
-    """Convert Azure DI tables into a single list of rows, deduplicating headers.
+def get_blob_service_client():
+    """Get Azure Blob Storage client. Returns None if not configured."""
+    conn_str = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
+    if not conn_str:
+        return None
+    from azure.storage.blob import BlobServiceClient
+    return BlobServiceClient.from_connection_string(conn_str)
 
-    First 2 rows of each table are headers. Only kept from the first table,
-    skipped on subsequent tables to avoid duplicates.
+
+def analyze_pdf_via_blob(client, pdf_path, container_name="pdf-documents"):
+    """Upload PDF to Azure Blob Storage, then analyze via SAS URL.
+
+    This avoids local network timeouts for large files — Azure DI fetches the
+    file directly from Blob Storage (Azure-to-Azure transfer).
+
+    Returns (result, blob_client) so caller can clean up the blob after use.
+    """
+    from azure.storage.blob import generate_blob_sas, BlobSasPermissions
+
+    blob_service_client = get_blob_service_client()
+    if blob_service_client is None:
+        raise RuntimeError("AZURE_STORAGE_CONNECTION_STRING not set")
+
+    blob_name = f"di-upload-{int(time.time())}-{os.path.basename(pdf_path)}"
+    blob_client = blob_service_client.get_blob_client(
+        container=container_name, blob=blob_name
+    )
+
+    # Upload to Blob Storage
+    with open(pdf_path, "rb") as data:
+        blob_client.upload_blob(data, overwrite=True)
+
+    # Generate SAS URL (read-only, 1 hour expiry)
+    sas_token = generate_blob_sas(
+        account_name=blob_service_client.account_name,
+        container_name=container_name,
+        blob_name=blob_name,
+        account_key=blob_service_client.credential.account_key,
+        permission=BlobSasPermissions(read=True),
+        expiry=datetime.now(timezone.utc) + timedelta(hours=1),
+    )
+    blob_url = f"{blob_client.url}?{sas_token}"
+
+    # Analyze via URL (Azure-to-Azure, no local network bottleneck)
+    poller = client.begin_analyze_document(
+        "prebuilt-layout",
+        {"urlSource": blob_url},
+    )
+    result = poller.result()
+
+    return result, blob_client
+
+
+def tables_to_rows(result):
+    """Convert Azure DI tables into header rows + data rows.
+
+    Uses Azure DI's cell.kind to identify header rows (columnHeader) vs data rows.
+    Header rows are only kept from the first table; subsequent tables' headers
+    are skipped to avoid duplicates.
+
+    Handles row_span and column_span: fills all cells covered by a span with
+    the cell's content so that column alignment is preserved.
     """
     if not result.tables:
         return [], []
@@ -86,16 +144,39 @@ def tables_to_rows(result):
 
     for table_idx, table in enumerate(result.tables):
         col_count = table.column_count
+        row_count = table.row_count
         grid = {}
-        for cell in table.cells:
-            grid[(cell.row_index, cell.column_index)] = cell.content
+        header_row_indices = set()
 
-        max_row = table.row_count
-        for r in range(max_row):
+        for cell in table.cells:
+            content = cell.content
+            r_span = getattr(cell, 'row_span', 1) or 1
+            c_span = getattr(cell, 'column_span', 1) or 1
+
+            # Track which rows contain header cells
+            kind = str(getattr(cell, 'kind', '') or '')
+            if 'Header' in kind or 'header' in kind:
+                header_row_indices.add(cell.row_index)
+
+            # Fill all cells covered by this span
+            for dr in range(r_span):
+                for dc in range(c_span):
+                    r = cell.row_index + dr
+                    c = cell.column_index + dc
+                    if r < row_count and c < col_count:
+                        if (r, c) not in grid:
+                            grid[(r, c)] = content
+
+        # Fallback: if no cells had kind info, use HEADER_ROWS
+        if not header_row_indices:
+            header_row_indices = set(range(min(HEADER_ROWS, row_count)))
+
+        for r in range(row_count):
             row = [grid.get((r, c), "") for c in range(col_count)]
-            if r < HEADER_ROWS:
+            if r in header_row_indices:
                 if table_idx == 0:
                     header_rows.append(row)
+                # Skip header rows from subsequent tables (duplicates)
             else:
                 data_rows.append(row)
 

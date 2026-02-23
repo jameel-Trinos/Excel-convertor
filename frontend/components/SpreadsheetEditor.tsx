@@ -15,6 +15,8 @@ import {
   Edit,
   Users,
   RotateCcw,
+  Search,
+  Replace,
 } from "lucide-react";
 import { AllianceModal } from "@/components/AllianceModal";
 import { ALLIANCE_CONFIG, ASSEMBLY_ALLIANCE_CONFIG } from "@/lib/allianceConfig";
@@ -110,6 +112,22 @@ export function SpreadsheetEditor({
     col: number;
   } | null>(null);
   const contextMenuRef = useRef<HTMLDivElement>(null);
+
+  // Header editing state (double-click to rename)
+  const [editingHeaderIdx, setEditingHeaderIdx] = useState<number | null>(null);
+  const [editingHeaderValue, setEditingHeaderValue] = useState("");
+  const headerInputRef = useRef<HTMLInputElement>(null);
+
+  // Delete row range state
+  const [showDeleteRange, setShowDeleteRange] = useState(false);
+  const [deleteFrom, setDeleteFrom] = useState("");
+  const [deleteTo, setDeleteTo] = useState("");
+
+  // Find & Replace state
+  const [showFindReplace, setShowFindReplace] = useState(false);
+  const [findText, setFindText] = useState("");
+  const [replaceText, setReplaceText] = useState("");
+  const findInputRef = useRef<HTMLInputElement>(null);
 
   // Utility: convert cell value to number safely
   const safeNumber = (val: CellValue): number => {
@@ -329,6 +347,93 @@ export function SpreadsheetEditor({
     setEditedData({ ...editedData, rows: newRows });
     setContextMenu(null);
   }, [contextMenu, editedData]);
+
+  // Delete column
+  const handleDeleteColumn = useCallback(() => {
+    if (!contextMenu || !editedData) return;
+    const colIdx = contextMenu.col;
+    const newHeaders = editedData.headers.filter((_, idx) => idx !== colIdx);
+    const newRows = editedData.rows.map(row => row.filter((_, idx) => idx !== colIdx));
+    setEditedData({ headers: newHeaders, rows: newRows });
+    setContextMenu(null);
+  }, [contextMenu, editedData]);
+
+  // Insert column left
+  const handleInsertColumnLeft = useCallback(() => {
+    if (!contextMenu || !editedData) return;
+    const colIdx = contextMenu.col;
+    const newHeaders = [...editedData.headers.slice(0, colIdx), "New Column", ...editedData.headers.slice(colIdx)];
+    const newRows = editedData.rows.map(row => [...row.slice(0, colIdx), null, ...row.slice(colIdx)]);
+    setEditedData({ headers: newHeaders, rows: newRows });
+    setContextMenu(null);
+  }, [contextMenu, editedData]);
+
+  // Insert column right
+  const handleInsertColumnRight = useCallback(() => {
+    if (!contextMenu || !editedData) return;
+    const colIdx = contextMenu.col;
+    const newHeaders = [...editedData.headers.slice(0, colIdx + 1), "New Column", ...editedData.headers.slice(colIdx + 1)];
+    const newRows = editedData.rows.map(row => [...row.slice(0, colIdx + 1), null, ...row.slice(colIdx + 1)]);
+    setEditedData({ headers: newHeaders, rows: newRows });
+    setContextMenu(null);
+  }, [contextMenu, editedData]);
+
+  // Header rename (double-click)
+  const handleHeaderDoubleClick = useCallback((idx: number) => {
+    if (!editedData) return;
+    setEditingHeaderIdx(idx);
+    setEditingHeaderValue(editedData.headers[idx] || "");
+    setTimeout(() => headerInputRef.current?.focus(), 0);
+  }, [editedData]);
+
+  const handleHeaderRenameConfirm = useCallback(() => {
+    if (editingHeaderIdx === null || !editedData) return;
+    const newHeaders = [...editedData.headers];
+    newHeaders[editingHeaderIdx] = editingHeaderValue;
+    setEditedData({ ...editedData, headers: newHeaders });
+    setEditingHeaderIdx(null);
+  }, [editingHeaderIdx, editingHeaderValue, editedData]);
+
+  // Delete row range
+  const handleDeleteRowRange = useCallback(() => {
+    if (!editedData) return;
+    const from = parseInt(deleteFrom) - 1;
+    const to = parseInt(deleteTo) - 1;
+    if (isNaN(from) || isNaN(to) || from < 0 || to < 0 || from > to || to >= editedData.rows.length) return;
+    const newRows = editedData.rows.filter((_, idx) => idx < from || idx > to);
+    setEditedData({ ...editedData, rows: newRows });
+    setShowDeleteRange(false);
+    setDeleteFrom("");
+    setDeleteTo("");
+  }, [editedData, deleteFrom, deleteTo]);
+
+  // Find & Replace: match count
+  const matchCount = (() => {
+    if (!findText || !editedData) return 0;
+    const lower = findText.toLowerCase();
+    let count = 0;
+    for (const row of editedData.rows) {
+      for (const cell of row) {
+        if (cell !== null && cell !== undefined && String(cell).toLowerCase().includes(lower)) count++;
+      }
+    }
+    return count;
+  })();
+
+  // Find & Replace: replace all
+  const handleReplaceAll = useCallback(() => {
+    if (!findText || !editedData) return;
+    const escaped = findText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const regex = new RegExp(escaped, "gi");
+    const newRows = editedData.rows.map(row =>
+      row.map(cell => {
+        if (cell === null || cell === undefined) return cell;
+        const str = String(cell);
+        return str.replace(regex, replaceText);
+      })
+    );
+    setEditedData({ ...editedData, rows: newRows });
+  }, [findText, replaceText, editedData]);
 
   // Alliance: apply alliance vote sums
   // allianceMap: { mainPartyColumnHeader: [allyColumnHeader, ...] }
@@ -859,9 +964,24 @@ export function SpreadsheetEditor({
         e.preventDefault();
         handleDownload();
       }
-      // Escape to close
+      // Ctrl/Cmd + H to toggle find/replace
+      if ((e.ctrlKey || e.metaKey) && e.key === 'h') {
+        e.preventDefault();
+        setShowFindReplace(prev => {
+          const next = !prev;
+          if (next) setTimeout(() => findInputRef.current?.focus(), 0);
+          return next;
+        });
+      }
+      // Escape to close find/replace first, then close modal
       if (e.key === 'Escape') {
-        onClose();
+        if (showFindReplace) {
+          setShowFindReplace(false);
+          setFindText("");
+          setReplaceText("");
+        } else {
+          onClose();
+        }
       }
     };
 
@@ -869,7 +989,7 @@ export function SpreadsheetEditor({
       window.addEventListener('keydown', handleKeyDown);
       return () => window.removeEventListener('keydown', handleKeyDown);
     }
-  }, [isOpen, handleDownload, onClose]);
+  }, [isOpen, handleDownload, onClose, showFindReplace]);
 
   const outputFilename = filename.replace(".pdf", ".xlsx");
 
@@ -1031,6 +1151,28 @@ export function SpreadsheetEditor({
                     Geocode Addresses
                   </button>
 
+                  {/* Find & Replace Toggle */}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowFindReplace(prev => {
+                        const next = !prev;
+                        if (next) setTimeout(() => findInputRef.current?.focus(), 0);
+                        return next;
+                      });
+                    }}
+                    disabled={loading || !!error || !editedData}
+                    className={`flex items-center gap-2 px-3 py-2 border rounded-lg font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
+                      showFindReplace
+                        ? 'bg-blue-50 border-blue-300 text-blue-700'
+                        : 'bg-white border-gray-300 text-gray-700 hover:bg-gray-50'
+                    }`}
+                    title="Find & Replace (Ctrl+H)"
+                  >
+                    <Search className="w-4 h-4" />
+                    Find & Replace
+                  </button>
+
                   {/* Language Dropdown */}
                   <div className="relative" ref={languageDropdownRef}>
                     <button
@@ -1093,6 +1235,48 @@ export function SpreadsheetEditor({
               </div>
             </header>
 
+            {/* Find & Replace Panel */}
+            {showFindReplace && !loading && !error && editedData && (
+              <div className="bg-gray-50 border-b border-gray-200 px-6 py-3 flex items-center gap-3 shrink-0">
+                <Search className="w-4 h-4 text-gray-400 shrink-0" />
+                <input
+                  ref={findInputRef}
+                  type="text"
+                  placeholder="Find..."
+                  value={findText}
+                  onChange={(e) => setFindText(e.target.value)}
+                  className="px-3 py-1.5 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none w-48"
+                />
+                <Replace className="w-4 h-4 text-gray-400 shrink-0" />
+                <input
+                  type="text"
+                  placeholder="Replace with..."
+                  value={replaceText}
+                  onChange={(e) => setReplaceText(e.target.value)}
+                  className="px-3 py-1.5 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none w-48"
+                />
+                <button
+                  onClick={handleReplaceAll}
+                  disabled={!findText || matchCount === 0}
+                  className="px-3 py-1.5 text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  Replace All
+                </button>
+                {findText && (
+                  <span className="text-sm text-gray-500">
+                    {matchCount} match{matchCount !== 1 ? 'es' : ''}
+                  </span>
+                )}
+                <button
+                  onClick={() => { setShowFindReplace(false); setFindText(""); setReplaceText(""); }}
+                  className="ml-auto p-1 text-gray-400 hover:text-gray-600 hover:bg-gray-200 rounded transition-colors"
+                  title="Close (Esc)"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            )}
+
             {/* Loading State */}
             {loading && (
               <div className="flex items-center justify-center h-[calc(100vh-64px)]">
@@ -1134,9 +1318,28 @@ export function SpreadsheetEditor({
                       {editedData.headers.map((header, idx) => (
                         <th
                           key={idx}
-                          className="bg-[#366092] text-white font-semibold p-3 text-center border border-[#2d5078] sticky top-0 z-10 text-[11px] whitespace-nowrap min-w-[80px]"
+                          className="bg-[#366092] text-white font-semibold p-3 text-center border border-[#2d5078] sticky top-0 z-10 text-[11px] whitespace-nowrap min-w-[80px] cursor-pointer select-none"
+                          onDoubleClick={() => handleHeaderDoubleClick(idx)}
+                          onContextMenu={(e) => { e.preventDefault(); setContextMenu({ x: e.clientX, y: e.clientY, row: -1, col: idx }); }}
+                          title="Double-click to rename"
                         >
-                          {header}
+                          {editingHeaderIdx === idx ? (
+                            <input
+                              ref={headerInputRef}
+                              type="text"
+                              value={editingHeaderValue}
+                              onChange={(e) => setEditingHeaderValue(e.target.value)}
+                              onBlur={handleHeaderRenameConfirm}
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter") handleHeaderRenameConfirm();
+                                if (e.key === "Escape") setEditingHeaderIdx(null);
+                              }}
+                              className="bg-white text-gray-900 text-[11px] px-1 py-0.5 rounded w-full min-w-[60px] text-center outline-none"
+                              onClick={(e) => e.stopPropagation()}
+                            />
+                          ) : (
+                            header
+                          )}
                         </th>
                       ))}
                     </tr>
@@ -1150,7 +1353,11 @@ export function SpreadsheetEditor({
                         {row.map((cell, colIndex) => (
                           <td
                             key={colIndex}
-                            className="p-2 border border-gray-300 text-center bg-white min-w-[80px] focus:outline focus:outline-2 focus:outline-blue-500 focus:outline-offset-[-1px]"
+                            className={`p-2 border border-gray-300 text-center min-w-[80px] focus:outline focus:outline-2 focus:outline-blue-500 focus:outline-offset-[-1px] ${
+                              findText && cell !== null && cell !== undefined && String(cell).toLowerCase().includes(findText.toLowerCase())
+                                ? 'bg-yellow-100'
+                                : 'bg-white'
+                            }`}
                             contentEditable
                             suppressContentEditableWarning
                             onBlur={(e) => handleCellEdit(rowIndex, colIndex, e.currentTarget.textContent || "")}
@@ -1176,46 +1383,85 @@ export function SpreadsheetEditor({
             {contextMenu && (
               <div
                 ref={contextMenuRef}
-                className="fixed bg-white border border-gray-200 shadow-lg rounded-lg py-1 z-[60] min-w-[180px]"
+                className="fixed bg-white border border-gray-200 shadow-lg rounded-lg py-1 z-[60] min-w-[200px]"
                 style={{ left: contextMenu.x, top: contextMenu.y }}
               >
-                <button
-                  onClick={handleCopyCell}
-                  className="w-full px-4 py-2 text-left text-sm text-gray-700 hover:bg-gray-100 flex items-center gap-2"
-                >
-                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2m0 0h2a2 2 0 012 2v3m2 4H10m0 0l3-3m-3 3l3 3" />
-                  </svg>
-                  Copy
-                </button>
-                <div className="border-t border-gray-200 my-1"></div>
-                <button
-                  onClick={handleInsertRowAbove}
-                  className="w-full px-4 py-2 text-left text-sm text-gray-700 hover:bg-gray-100 flex items-center gap-2"
-                >
-                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
-                  </svg>
-                  Insert Row Above
-                </button>
-                <button
-                  onClick={handleInsertRowBelow}
-                  className="w-full px-4 py-2 text-left text-sm text-gray-700 hover:bg-gray-100 flex items-center gap-2"
-                >
-                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
-                  </svg>
-                  Insert Row Below
-                </button>
-                <button
-                  onClick={handleDeleteRow}
-                  className="w-full px-4 py-2 text-left text-sm text-red-600 hover:bg-red-50 flex items-center gap-2"
-                >
-                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                  </svg>
-                  Delete Row
-                </button>
+                {contextMenu.row === -1 ? (
+                  /* Header context menu */
+                  <>
+                    <button onClick={() => { handleHeaderDoubleClick(contextMenu.col); setContextMenu(null); }} className="w-full px-4 py-2 text-left text-sm text-gray-700 hover:bg-gray-100 flex items-center gap-2">
+                      <Edit className="w-4 h-4" /> Rename Column
+                    </button>
+                    <div className="border-t border-gray-200 my-1" />
+                    <button onClick={handleInsertColumnLeft} className="w-full px-4 py-2 text-left text-sm text-gray-700 hover:bg-gray-100 flex items-center gap-2">
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6v6m0 0v6m0-6h6m-6 0H6" /></svg> Insert Column Left
+                    </button>
+                    <button onClick={handleInsertColumnRight} className="w-full px-4 py-2 text-left text-sm text-gray-700 hover:bg-gray-100 flex items-center gap-2">
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6v6m0 0v6m0-6h6m-6 0H6" /></svg> Insert Column Right
+                    </button>
+                    <button onClick={handleDeleteColumn} className="w-full px-4 py-2 text-left text-sm text-red-600 hover:bg-red-50 flex items-center gap-2">
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg> Delete Column
+                    </button>
+                  </>
+                ) : (
+                  /* Cell context menu */
+                  <>
+                    <button onClick={handleCopyCell} className="w-full px-4 py-2 text-left text-sm text-gray-700 hover:bg-gray-100 flex items-center gap-2">
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2m0 0h2a2 2 0 012 2v3m2 4H10m0 0l3-3m-3 3l3 3" /></svg> Copy Cell
+                    </button>
+                    <div className="border-t border-gray-200 my-1" />
+                    <button onClick={handleInsertRowAbove} className="w-full px-4 py-2 text-left text-sm text-gray-700 hover:bg-gray-100 flex items-center gap-2">
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6v6m0 0v6m0-6h6m-6 0H6" /></svg> Insert Row Above
+                    </button>
+                    <button onClick={handleInsertRowBelow} className="w-full px-4 py-2 text-left text-sm text-gray-700 hover:bg-gray-100 flex items-center gap-2">
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6v6m0 0v6m0-6h6m-6 0H6" /></svg> Insert Row Below
+                    </button>
+                    <button onClick={handleDeleteRow} className="w-full px-4 py-2 text-left text-sm text-red-600 hover:bg-red-50 flex items-center gap-2">
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg> Delete Row
+                    </button>
+                    <button onClick={() => { setShowDeleteRange(true); setDeleteFrom(String(contextMenu.row + 1)); setDeleteTo(String(contextMenu.row + 1)); setContextMenu(null); }} className="w-full px-4 py-2 text-left text-sm text-red-600 hover:bg-red-50 flex items-center gap-2">
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" /></svg> Delete Row Range...
+                    </button>
+                    <div className="border-t border-gray-200 my-1" />
+                    <button onClick={handleInsertColumnLeft} className="w-full px-4 py-2 text-left text-sm text-gray-700 hover:bg-gray-100 flex items-center gap-2">
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6v6m0 0v6m0-6h6m-6 0H6" /></svg> Insert Column Left
+                    </button>
+                    <button onClick={handleInsertColumnRight} className="w-full px-4 py-2 text-left text-sm text-gray-700 hover:bg-gray-100 flex items-center gap-2">
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6v6m0 0v6m0-6h6m-6 0H6" /></svg> Insert Column Right
+                    </button>
+                    <button onClick={handleDeleteColumn} className="w-full px-4 py-2 text-left text-sm text-red-600 hover:bg-red-50 flex items-center gap-2">
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg> Delete Column
+                    </button>
+                  </>
+                )}
+              </div>
+            )}
+
+            {/* Delete Row Range Dialog */}
+            {showDeleteRange && (
+              <div className="fixed inset-0 z-[70] flex items-center justify-center">
+                <div className="absolute inset-0 bg-black/30" onClick={() => setShowDeleteRange(false)} />
+                <div className="relative bg-white rounded-xl shadow-2xl w-full max-w-sm mx-4 p-6">
+                  <h3 className="text-lg font-semibold text-gray-900 mb-4">Delete Row Range</h3>
+                  <div className="flex items-center gap-3 mb-4">
+                    <div>
+                      <label className="text-sm text-gray-600 block mb-1">From row</label>
+                      <input type="number" min="1" max={editedData?.rows.length || 1} value={deleteFrom} onChange={(e) => setDeleteFrom(e.target.value)} className="w-24 px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500" />
+                    </div>
+                    <span className="text-gray-400 mt-6">to</span>
+                    <div>
+                      <label className="text-sm text-gray-600 block mb-1">To row</label>
+                      <input type="number" min="1" max={editedData?.rows.length || 1} value={deleteTo} onChange={(e) => setDeleteTo(e.target.value)} className="w-24 px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500" />
+                    </div>
+                  </div>
+                  {deleteFrom && deleteTo && parseInt(deleteTo) >= parseInt(deleteFrom) && (
+                    <p className="text-sm text-gray-500 mb-4">Will delete {parseInt(deleteTo) - parseInt(deleteFrom) + 1} row(s)</p>
+                  )}
+                  <div className="flex justify-end gap-2">
+                    <button onClick={() => setShowDeleteRange(false)} className="px-4 py-2 text-sm text-gray-700 bg-gray-100 hover:bg-gray-200 rounded-lg">Cancel</button>
+                    <button onClick={handleDeleteRowRange} className="px-4 py-2 text-sm text-white bg-red-600 hover:bg-red-700 rounded-lg">Delete</button>
+                  </div>
+                </div>
               </div>
             )}
 

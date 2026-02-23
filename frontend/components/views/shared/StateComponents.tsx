@@ -5,7 +5,7 @@ import { useDropzone, FileRejection } from "react-dropzone";
 import { formatFileSize, isValidPdfFile } from "@/lib/utils";
 import type { PreviewData, ValidationIssues } from "@/types";
 
-const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+const MAX_FILE_SIZE = 55 * 1024 * 1024; // 55MB
 
 // Idle State - Drop Zone
 export function IdleState({ onFileSelect }: { onFileSelect: (file: File) => void }) {

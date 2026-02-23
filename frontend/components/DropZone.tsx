@@ -12,7 +12,7 @@ interface DropZoneProps {
   error?: string | null;
 }
 
-const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+const MAX_FILE_SIZE = 55 * 1024 * 1024; // 55MB
 
 export function DropZone({
   onFileSelect,
@@ -48,7 +48,7 @@ export function DropZone({
   const rejectionError =
     fileRejections.length > 0
       ? fileRejections[0].errors[0]?.code === "file-too-large"
-        ? "File is too large. Maximum size is 10MB."
+        ? "File is too large. Maximum size is 55MB."
         : fileRejections[0].errors[0]?.code === "file-invalid-type"
           ? "Only PDF files are accepted."
           : "Invalid file"

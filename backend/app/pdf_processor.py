@@ -196,7 +196,7 @@ class PDFProcessor:
         Returns:
             ExtractionResult from Azure DI extraction
         """
-        from .pdf_table_extractor import get_client, analyze_pdf, tables_to_rows
+        from .pdf_table_extractor import get_client, analyze_pdf, analyze_pdf_via_blob, get_blob_service_client, tables_to_rows
 
         def update_progress(progress: int, message: str):
             if progress_callback:
@@ -204,10 +204,24 @@ class PDFProcessor:
                 progress_callback(adjusted, message)
 
         logger.info("Starting Azure Document Intelligence extraction...")
-        update_progress(5, "Sending PDF to Azure Document Intelligence...")
 
         client = get_client()
-        result = await asyncio.to_thread(analyze_pdf, client, str(self.file_path))
+
+        # Use Blob Storage URL for large files (>20MB) to avoid network timeouts
+        # Falls back to direct byte upload for smaller files
+        file_size_mb = os.path.getsize(str(self.file_path)) / (1024 * 1024)
+        blob_client_ref = None
+
+        if file_size_mb > 20 and get_blob_service_client() is not None:
+            logger.info(f"Large file ({file_size_mb:.1f}MB) — using Blob Storage URL for Azure DI")
+            update_progress(5, f"Uploading {file_size_mb:.0f}MB PDF to Azure Blob Storage...")
+
+            result, blob_client_ref = await asyncio.to_thread(
+                analyze_pdf_via_blob, client, str(self.file_path)
+            )
+        else:
+            update_progress(5, "Sending PDF to Azure Document Intelligence...")
+            result = await asyncio.to_thread(analyze_pdf, client, str(self.file_path))
 
         page_count = len(result.pages) if result.pages else 0
         table_count = len(result.tables) if result.tables else 0
@@ -218,21 +232,37 @@ class PDFProcessor:
             raise ExtractionError("Azure DI found no tables in the PDF")
 
         # Convert Azure DI tables to header rows + data rows
+        # Uses cell.kind to identify headers and handles row/column spans
         update_progress(70, "Processing extracted tables...")
         header_rows, data_rows = tables_to_rows(result)
 
         if not header_rows:
             raise ExtractionError("Azure DI could not extract headers from the PDF")
 
-        # Use first header row as column names
-        headers = header_rows[0]
+        # Pick the best header row: the one with the most unique non-empty text cells.
+        # In election PDFs, early header rows are sparse (spanning labels like
+        # "NO. OF VALID VOTES CAST IN FAVOUR OF") while the candidate names row
+        # has the most distinct values.
+        best_idx = 0
+        best_score = 0
+        for idx, row in enumerate(header_rows):
+            non_empty = [c.strip() for c in row if c and c.strip()]
+            unique_texts = set(non_empty)
+            score = len(unique_texts)
+            if score > best_score:
+                best_score = score
+                best_idx = idx
+
+        headers = header_rows[best_idx]
+        logger.info(f"Azure DI: Using header row {best_idx + 1}/{len(header_rows)} ({best_score} unique values)")
 
         # Normalize data row lengths to match headers
+        num_cols = len(headers)
         for i, row in enumerate(data_rows):
-            if len(row) < len(headers):
-                data_rows[i] = row + [""] * (len(headers) - len(row))
-            elif len(row) > len(headers):
-                data_rows[i] = row[:len(headers)]
+            if len(row) < num_cols:
+                data_rows[i] = row + [""] * (num_cols - len(row))
+            elif len(row) > num_cols:
+                data_rows[i] = row[:num_cols]
 
         table_data = TableData(
             headers=headers,
@@ -253,6 +283,14 @@ class PDFProcessor:
                     for word in page.words:
                         page_text_parts.append(word.content)
                 page_texts.append(" ".join(page_text_parts) if page_text_parts else "")
+
+        # Clean up the temporary blob if we used Blob Storage
+        if blob_client_ref is not None:
+            try:
+                await asyncio.to_thread(blob_client_ref.delete_blob)
+                logger.info("Cleaned up temporary blob from Azure Storage")
+            except Exception as e:
+                logger.warning(f"Failed to clean up blob: {e}")
 
         update_progress(95, "Azure DI extraction complete")
         logger.info(f"Azure DI: {len(headers)} headers, {len(data_rows)} data rows")

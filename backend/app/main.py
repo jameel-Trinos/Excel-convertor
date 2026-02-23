@@ -63,7 +63,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "./uploads"))
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "./outputs"))
-MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", 10 * 1024 * 1024))  # 10MB default
+MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", 55 * 1024 * 1024))  # 55MB default
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:3001").split(",")
 
 # Ensure directories exist
