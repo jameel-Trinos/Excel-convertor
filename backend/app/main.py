@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import tempfile
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -912,6 +913,78 @@ async def download_bulk_voters(job_id: str):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         background=bg,
     )
+
+
+# ── Excel Merge ──────────────────────────────────────────────────────────
+
+
+@app.post("/api/excel-merge")
+async def merge_excel_files(files: list[UploadFile] = File(...)):
+    """Merge multiple voter Excel files into a single flat Excel."""
+    from .excel_merger import ExcelMerger
+
+    if len(files) < 1:
+        raise HTTPException(status_code=400, detail="At least one file is required")
+
+    # Validate all files are .xlsx
+    for f in files:
+        if not f.filename or not f.filename.lower().endswith(".xlsx"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid file type: {f.filename}. Only .xlsx files are accepted.",
+            )
+
+    # Save uploaded files to temp directory
+    temp_dir = tempfile.mkdtemp(prefix="excel_merge_")
+    saved_paths: list[str] = []
+
+    try:
+        for f in files:
+            safe_name = re.sub(r"[^\w\-. ]", "_", f.filename or "upload.xlsx")
+            file_path = os.path.join(temp_dir, safe_name)
+            async with aiofiles.open(file_path, "wb") as out:
+                content = await f.read()
+                await out.write(content)
+            saved_paths.append(file_path)
+
+        # Merge
+        output_path = os.path.join(OUTPUT_DIR, f"merged_voters_{uuid.uuid4().hex[:8]}.xlsx")
+        merger = ExcelMerger()
+        result = merger.merge(saved_paths, output_path)
+
+        # Return the merged file
+        download_name = "merged_voters.xlsx"
+
+        bg = BackgroundTasks()
+        # Clean up temp uploads
+        for p in saved_paths:
+            bg.add_task(cleanup_file, Path(p))
+        bg.add_task(cleanup_file, Path(temp_dir))
+
+        return FileResponse(
+            path=output_path,
+            filename=download_name,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            background=bg,
+            headers={
+                "X-Total-Rows": str(result["total_rows"]),
+                "X-Total-Files": str(result["total_files"]),
+                "X-Total-Sheets": str(result["total_sheets"]),
+            },
+        )
+    except Exception as e:
+        # Clean up on error
+        for p in saved_paths:
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+        try:
+            os.rmdir(temp_dir)
+        except OSError:
+            pass
+        logger.exception("Excel merge failed")
+        raise HTTPException(status_code=500, detail=f"Merge failed: {str(e)}")
 
 
 @app.post("/api/booth/add-booth-name-column", response_model=FullPreviewData)

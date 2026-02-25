@@ -79,6 +79,18 @@ _PART_NO_RE = re.compile(
 )
 _TOTAL_VOTERS_RE = re.compile(r'(?:Total\s*(?:Electors|Voters)|மொத்த\s*வாக்காளர்கள்)[:\s]*(\d+)', re.IGNORECASE)
 
+# Address label pattern — matches "வாக்குச் சாவடியின் முகவரி" and English variants
+# The address text follows the label after a colon (same line or next line)
+_ADDRESS_LABEL_RE = re.compile(
+    r'(?:'
+    r'வாக்குச்\s*சாவடியின்\s*முகவரி'
+    r'|Polling\s*Station\s*Address'
+    r'|Address\s*of\s*(?:the\s*)?Polling\s*Station'
+    r'|சாவடி\s*முகவரி'
+    r')\s*[:：]?\s*(.*)',
+    re.IGNORECASE,
+)
+
 # Tamil field label patterns for splitting concatenated voter text
 _NAME_LABEL_RE = re.compile(
     r'(?:பெயர்\s*:|Name\s*:|Elector\s*Name\s*:)', re.IGNORECASE
@@ -1740,10 +1752,51 @@ class VotersPDFProcessor:
             if m:
                 self.header_info.total_voters = m.group(1)
 
-        # Try to extract address: look for lines after "Part No" and before voter data
+        # Try to extract address from the "வாக்குச் சாவடியின் முகவரி" field
         if self.header_info.address:
             return
+
         lines = page_text.split("\n")
+
+        # Strategy 1: Look for the explicit address label
+        # (வாக்குச் சாவடியின் முகவரி / Polling Station Address)
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            m = _ADDRESS_LABEL_RE.search(stripped)
+            if m:
+                # Address may be on the same line after the label
+                addr_text = m.group(1).strip()
+                addr_parts = []
+                if addr_text:
+                    addr_parts.append(addr_text)
+                # Also collect continuation lines (next 1-3 lines until we hit
+                # another known field or voter data)
+                for j in range(i + 1, min(i + 4, len(lines))):
+                    next_line = lines[j].strip()
+                    if not next_line:
+                        continue
+                    # Stop if we hit voter data, another field label, or known patterns
+                    if _SERIAL_RE.match(next_line):
+                        break
+                    if _AC_NO_RE.search(next_line):
+                        break
+                    if _PART_NO_RE.search(next_line):
+                        break
+                    if _TOTAL_VOTERS_RE.search(next_line):
+                        break
+                    if _ADDRESS_LABEL_RE.search(next_line):
+                        break
+                    if any(kw in next_line.lower() for kw in [
+                        "electoral roll", "voter list", "வாக்காளர்", "பட்டியல்",
+                        "section", "பிரிவு", "main town", "municipality",
+                    ]):
+                        break
+                    addr_parts.append(next_line)
+                if addr_parts:
+                    self.header_info.address = ", ".join(addr_parts)
+                    return
+
+        # Strategy 2 (fallback): collect lines after Part No and before voter data
         address_lines = []
         in_header = True
         for line in lines:
@@ -1765,7 +1818,7 @@ class VotersPDFProcessor:
                     address_lines.append(stripped)
 
         if address_lines:
-            self.header_info.address = ", ".join(address_lines[-2:])  # Take last 2 lines as address
+            self.header_info.address = ", ".join(address_lines[-2:])
 
     # ------------------------------------------------------------------
     # Voter record parsing

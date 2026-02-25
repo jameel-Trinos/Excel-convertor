@@ -806,3 +806,31 @@ export async function normalizeHeaders(
 
   return response.json();
 }
+
+// ── Excel Merge ───────────────────────────────────────────────────────
+
+export async function mergeExcelFiles(
+  files: File[]
+): Promise<{ blob: Blob; totalRows: number; totalFiles: number; totalSheets: number }> {
+  const formData = new FormData();
+  for (const file of files) {
+    formData.append("files", file);
+  }
+
+  const response = await fetch(`${API_BASE_URL}/api/excel-merge`, {
+    method: "POST",
+    body: formData,
+  });
+
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}));
+    throw new Error(error.detail || "Failed to merge Excel files");
+  }
+
+  const totalRows = parseInt(response.headers.get("X-Total-Rows") || "0", 10);
+  const totalFiles = parseInt(response.headers.get("X-Total-Files") || "0", 10);
+  const totalSheets = parseInt(response.headers.get("X-Total-Sheets") || "0", 10);
+  const blob = await response.blob();
+
+  return { blob, totalRows, totalFiles, totalSheets };
+}

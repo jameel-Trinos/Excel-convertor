@@ -7,6 +7,7 @@ import {
   BoothView,
   ConstituencyView,
   VotersView,
+  ExcelMergeView,
 } from "@/components/views";
 
 export default function Home() {
@@ -19,6 +20,7 @@ export default function Home() {
       "booth": "Booth",
       "constituency": "Constituency",
       "voters": "Voters",
+      "excel-merge": "Excel Merge",
     };
     return labels[view];
   };
@@ -48,6 +50,7 @@ export default function Home() {
         {currentView === "booth" && <BoothView />}
         {currentView === "constituency" && <ConstituencyView />}
         {currentView === "voters" && <VotersView />}
+        {currentView === "excel-merge" && <ExcelMergeView />}
 
       </main>
 
