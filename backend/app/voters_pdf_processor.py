@@ -27,13 +27,14 @@ logger = logging.getLogger(__name__)
 # Regex patterns for voter data extraction
 # ---------------------------------------------------------------------------
 
-# EPIC (voter ID) pattern: 3 letters followed by 7 digits
-_EPIC_RE = re.compile(r'\b([A-Z]{3}\d{7})\b')
+# EPIC (voter ID) pattern: 3 uppercase letters followed by 7 digits
+# Use lookaround instead of \b to handle Tamil characters adjacent to EPIC
+_EPIC_RE = re.compile(r'(?<![A-Z])([A-Z]{3}\d{7})(?!\d)')
 
 # Fuzzy EPIC pattern: OCR often reads digits as letters in the digit portion.
 # Common OCR confusions: 0↔O, 1↔I/l, 4↔A, 5↔S, 6↔G, 8↔B
 # Matches 3 uppercase letters followed by 7 alphanumeric chars (mostly digits)
-_EPIC_FUZZY_RE = re.compile(r'\b([A-Z]{3}[0-9A-Za-z]{7})\b')
+_EPIC_FUZZY_RE = re.compile(r'(?<![A-Z])([A-Z]{3}[0-9A-Za-z]{7})(?![0-9A-Za-z])')
 
 
 def _normalize_epic(raw: str) -> str:
@@ -77,7 +78,14 @@ _PART_NO_RE = re.compile(
     r')',
     re.IGNORECASE,
 )
-_TOTAL_VOTERS_RE = re.compile(r'(?:Total\s*(?:Electors|Voters)|மொத்த\s*வாக்காளர்கள்)[:\s]*(\d+)', re.IGNORECASE)
+_TOTAL_VOTERS_RE = re.compile(
+    r'(?:'
+    r'Total\s*(?:Electors|Voters)'
+    r'|மொத்த\s*வாக்காளர்கள்'
+    r'|மொத்தம்'
+    r')[:\s]*(\d+)',
+    re.IGNORECASE,
+)
 
 # Address label pattern — matches "வாக்குச் சாவடியின் முகவரி" and English variants
 # The address text follows the label after a colon (same line or next line)
@@ -160,6 +168,32 @@ def _cluster_positions(positions: list[float], tolerance: float = 5.0) -> list[f
     return clusters
 
 
+def _words_to_text(words: list[dict], line_tolerance: float = 3.0) -> str:
+    """Reconstruct text from pdfplumber word dicts, grouped into lines.
+
+    Words with similar ``top`` values (within *line_tolerance* pt) are placed
+    on the same line, sorted left-to-right and joined with spaces.  Lines are
+    joined with newlines.
+    """
+    if not words:
+        return ""
+    sorted_words = sorted(words, key=lambda w: (w["top"], w["x0"]))
+    lines: list[list[dict]] = []
+    current_line: list[dict] = [sorted_words[0]]
+    for w in sorted_words[1:]:
+        if abs(w["top"] - current_line[0]["top"]) <= line_tolerance:
+            current_line.append(w)
+        else:
+            lines.append(current_line)
+            current_line = [w]
+    lines.append(current_line)
+    text_lines: list[str] = []
+    for line in lines:
+        line.sort(key=lambda w: w["x0"])
+        text_lines.append(" ".join(w["text"] for w in line))
+    return "\n".join(text_lines)
+
+
 class VoterRecord:
     """A single voter entry."""
 
@@ -219,6 +253,7 @@ class VotersPDFProcessor:
         self.header_info = VoterHeaderInfo()
         self.voters: list[VoterRecord] = []
         self._is_scanned = False
+        self._learned_img_grid: list[tuple[int, int, int, int]] = []
 
     def extract(
         self,
@@ -359,8 +394,13 @@ class VotersPDFProcessor:
                     v.name = ""
             if v.father_husband_name:
                 v.father_husband_name = re.sub(r'[{}\[\]|]', '', v.father_husband_name).strip().rstrip(' -.:;')
-        # Remove voters whose name became empty after cleaning
-        self.voters = [v for v in self.voters if v.name and v.name.strip()]
+        # For voters whose name became empty after cleaning but have EPIC, use EPIC as name
+        for v in self.voters:
+            if (not v.name or not v.name.strip()) and v.voter_id:
+                v.name = v.voter_id
+                logger.info(f"[NAME-RECOVERY] Voter with empty name but EPIC {v.voter_id} — using EPIC as name")
+        # Only remove voters that have BOTH empty name AND empty voter_id
+        self.voters = [v for v in self.voters if (v.name and v.name.strip()) or v.voter_id]
         logger.info(f"[FILTER STATS] Before={pre_filter_count}, After={len(self.voters)}, Dropped={pre_filter_count - len(self.voters)}")
 
         # Re-number serial numbers sequentially
@@ -377,9 +417,30 @@ class VotersPDFProcessor:
             elif g:
                 voter.gender = "O"
 
+        # Store expected total from header before overwriting
+        expected_total = self.header_info.total_voters
+        extracted_total = str(len(self.voters))
+
         # Update total voters from actual count if header didn't have it
         if not self.header_info.total_voters and self.voters:
-            self.header_info.total_voters = str(len(self.voters))
+            self.header_info.total_voters = extracted_total
+
+        # Reconciliation: compare expected vs extracted
+        if expected_total and expected_total.isdigit() and self.voters:
+            expected_int = int(expected_total)
+            extracted_int = len(self.voters)
+            epic_count = sum(1 for v in self.voters if v.voter_id)
+            if expected_int != extracted_int:
+                logger.warning(
+                    f"[RECONCILIATION] Expected {expected_int} voters (from header), "
+                    f"extracted {extracted_int} — {expected_int - extracted_int} missing! "
+                    f"EPIC fill rate: {epic_count}/{extracted_int}"
+                )
+            else:
+                logger.info(
+                    f"[RECONCILIATION] All {expected_int} voters extracted successfully. "
+                    f"EPIC fill rate: {epic_count}/{extracted_int}"
+                )
 
         if progress_callback:
             progress_callback(85, f"Extraction complete: {len(self.voters)} voters")
@@ -395,6 +456,8 @@ class VotersPDFProcessor:
             "voters": [v.to_row() for v in self.voters],
             "headers": headers,
             "total_pages": total_pages,
+            "expected_total": expected_total,
+            "extracted_total": extracted_total,
         }
 
     # ------------------------------------------------------------------
@@ -479,59 +542,219 @@ class VotersPDFProcessor:
                         rt = round(card_top, 0)
                         ri = row_tops_sorted.index(rt) if rt in row_tops_sorted else -1
                         if ri <= 0:
-                            # First row: extend up to 40pt (EPIC strip above first row)
-                            return min(40.0, card_top - 2)
+                            # First row: extend up to 60pt (EPIC strip above first row)
+                            return min(60.0, card_top - 2)
                         prev_bottom = row_bottoms.get(row_tops_sorted[ri - 1], card_top)
                         gap = card_top - prev_bottom
-                        # Extend by 90% of the gap between rows (captures EPIC strip)
-                        return max(0.0, gap * 0.9)
+                        # Extend by full gap between rows (captures EPIC strip)
+                        return max(0.0, gap)
 
-                    # Extract text from each card
+                    # --- Extract all words from the page once for accurate text
+                    #     reconstruction and EPIC position matching ---
+                    try:
+                        raw_words = page.extract_words(
+                            keep_blank_chars=False,
+                        )
+                        # Pre-convert to float once for fast filtering
+                        page_words = []
+                        for pw in raw_words:
+                            page_words.append({
+                                "text": pw.get("text", ""),
+                                "x0": float(pw["x0"]),
+                                "x1": float(pw["x1"]),
+                                "top": float(pw["top"]),
+                                "bottom": float(pw["bottom"]),
+                            })
+                    except Exception:
+                        page_words = []
+
+                    # --- Collect ALL EPICs from the full page text ---
+                    # Using full page text is more reliable than word-level
+                    # matching because EPICs may be concatenated with serial
+                    # numbers or split across word boundaries.
+                    all_page_epics_ordered: list[str] = []
+                    if page_text:
+                        # Extract EPICs from the full page text (preserves reading order)
+                        for m in _EPIC_RE.finditer(page_text):
+                            epic_val = m.group(1)
+                            if epic_val not in all_page_epics_ordered:
+                                all_page_epics_ordered.append(epic_val)
+                        # Also try fuzzy matching for OCR-garbled EPICs
+                        for fm in _EPIC_FUZZY_RE.finditer(page_text):
+                            raw = fm.group(1)
+                            if _EPIC_RE.match(raw):
+                                continue  # Already captured by strict pattern
+                            norm = _normalize_epic(raw)
+                            if norm and norm not in all_page_epics_ordered:
+                                all_page_epics_ordered.append(norm)
+
+                    # Also build word-level EPIC list for positional matching
+                    page_epic_words: list[dict] = []
+                    for pw in page_words:
+                        pw_text = pw["text"]
+                        m = _EPIC_RE.search(pw_text)
+                        if m:
+                            page_epic_words.append({
+                                "epic": m.group(1),
+                                "x0": pw["x0"],
+                                "x1": pw["x1"],
+                                "top": pw["top"],
+                            })
+                        else:
+                            fm = _EPIC_FUZZY_RE.search(pw_text)
+                            if fm:
+                                norm = _normalize_epic(fm.group(1))
+                                if norm:
+                                    page_epic_words.append({
+                                        "epic": norm,
+                                        "x0": pw["x0"],
+                                        "x1": pw["x1"],
+                                        "top": pw["top"],
+                                    })
+
+                    # --- Build serial-number → EPIC mapping ---
+                    # In voter rolls, serial number and EPIC appear together
+                    # in the strip above each card: "7 SSL1183771" or nearby.
+                    # Use word positions to pair serial numbers with EPICs.
+                    serial_to_epic: dict[int, str] = {}
+                    if page_epic_words:
+                        # Find serial number words (1-4 digit numbers)
+                        serial_words = [
+                            pw for pw in page_words
+                            if re.fullmatch(r'\d{1,4}', pw["text"])
+                            and 1 <= int(pw["text"]) <= 2000
+                        ]
+                        for sw in serial_words:
+                            serial_num = int(sw["text"])
+                            # Find closest EPIC word on the same horizontal line
+                            # (within 5pt vertical tolerance)
+                            for ew in page_epic_words:
+                                if abs(ew["top"] - sw["top"]) < 8:
+                                    serial_to_epic[serial_num] = ew["epic"]
+                                    break
+
+                    logger.info(
+                        f"[SPATIAL] Page {page_idx+1}: found {len(all_page_epics_ordered)} EPICs "
+                        f"in full text, {len(page_epic_words)} with word positions, "
+                        f"{len(serial_to_epic)} serial-to-EPIC pairs"
+                    )
+
+                    # Extract text from each card using word-level reconstruction
                     page_voters: list[VoterRecord] = []
+                    card_positions: list[tuple[float, float, float, float]] = []
                     skipped_cards: list[str] = []  # track skipped card texts for retry
+                    used_epics: set[str] = set()
+
                     for x0, top, x1, bottom in card_bboxes:
-                        try:
-                            # Extend crop UPWARD to capture EPIC voter ID printed
-                            # above the card box, then inset sides by 2pt
-                            extend_up = _header_extend(top)
-                            crop_top = max(0, top - extend_up)
-                            cropped = page.crop(
-                                (x0 + 2, crop_top, x1 - 2, bottom - 2),
-                                strict=False,
-                            )
-                            card_text = cropped.extract_text() or ""
-                        except Exception:
-                            continue
+                        # Extend crop UPWARD to capture EPIC voter ID printed
+                        # above the card box
+                        extend_up = _header_extend(top)
+                        crop_top = max(0, top - extend_up)
+
+                        # --- Word-based text reconstruction ---
+                        # Use page_words to build card text instead of
+                        # page.crop().extract_text() which can split words
+                        # at crop boundaries and garble Tamil names.
+                        x0_lo = x0 - 2
+                        x1_hi = x1 + 2
+                        bot_hi = bottom + 2
+                        card_words = [
+                            w for w in page_words
+                            if w["x0"] >= x0_lo
+                            and w["x1"] <= x1_hi
+                            and w["top"] >= crop_top
+                            and w["bottom"] <= bot_hi
+                        ]
+                        card_text = _words_to_text(card_words)
+
+                        # If word-based extraction gives too little text,
+                        # fall back to crop-based extraction
+                        if len(card_text.strip()) < 5:
+                            try:
+                                cropped = page.crop(
+                                    (x0 + 2, crop_top, x1 - 2, bottom - 2),
+                                    strict=False,
+                                )
+                                card_text = cropped.extract_text() or ""
+                            except Exception:
+                                continue
 
                         if len(card_text.strip()) < 5:
                             continue
 
-                        # Card must contain voter-like field labels to be valid
+                        # Card must contain voter-like content to be valid
                         has_name_field = bool(
                             re.search(r'பெயர்\s*:?|Name\s*:', card_text, re.IGNORECASE)
                         )
                         has_age_gender = bool(
                             re.search(r'வயது\s*:?|Age\s*:?|பாலினம்\s*:?|Gender\s*:?', card_text, re.IGNORECASE)
                         )
-                        # Also check for EPIC ID as a strong voter card indicator
                         has_epic = bool(_EPIC_RE.search(card_text))
+                        tamil_chars = len(re.findall(r'[\u0B80-\u0BFF]', card_text))
 
-                        # Accept card if it has name+age/gender OR name+EPIC OR EPIC+age/gender
+                        # Accept card if it has any voter-like content:
+                        # name+age/gender, name+EPIC, EPIC+age, or just name label with Tamil text
                         has_voter_fields = (has_name_field and has_age_gender) or \
                                            (has_name_field and has_epic) or \
-                                           (has_epic and has_age_gender)
+                                           (has_epic and has_age_gender) or \
+                                           (has_name_field and tamil_chars >= 3)
 
                         if not has_voter_fields:
-                            # Still try to extract — some cards have data without standard labels
-                            # Check for Tamil text content (real voter data has Tamil chars)
-                            tamil_chars = len(re.findall(r'[\u0B80-\u0BFF]', card_text))
                             if has_epic or has_name_field or tamil_chars >= 5:
                                 skipped_cards.append(card_text)
-                                logger.info(f"[SPATIAL] Card without full labels on page {page_idx+1}, will retry: name={has_name_field} age/gender={has_age_gender} epic={has_epic} tamil={tamil_chars}")
                             continue
 
                         voter = self._extract_voter_from_segment(card_text)
+
+                        # --- Multi-strategy EPIC extraction ---
+                        # Strategy A: Serial-to-EPIC mapping (most reliable)
+                        if not voter.voter_id and voter.serial_no:
+                            try:
+                                sn = int(voter.serial_no)
+                                if sn in serial_to_epic:
+                                    epic_candidate = serial_to_epic[sn]
+                                    if epic_candidate not in used_epics:
+                                        voter.voter_id = epic_candidate
+                            except ValueError:
+                                pass
+
+                        # Strategy B: Word-level positional matching
+                        if not voter.voter_id:
+                            for ew in page_epic_words:
+                                if ew["epic"] in used_epics:
+                                    continue
+                                # Horizontal: EPIC word must overlap the card column
+                                if ew["x0"] >= x0 - 5 and ew["x1"] <= x1 + 5:
+                                    # Vertical: EPIC is in the strip above the card
+                                    # or at the very top of the card
+                                    if ew["top"] >= crop_top - 10 and ew["top"] <= top + 20:
+                                        voter.voter_id = ew["epic"]
+                                        break
+
+                        # Strategy C: Try crop-based text for EPIC only
+                        if not voter.voter_id:
+                            try:
+                                cropped = page.crop(
+                                    (x0 - 5, crop_top, x1 + 5, top + 15),
+                                    strict=False,
+                                )
+                                strip_text = cropped.extract_text() or ""
+                                epic_m = _EPIC_RE.search(strip_text)
+                                if epic_m and epic_m.group(1) not in used_epics:
+                                    voter.voter_id = epic_m.group(1)
+                                elif not epic_m:
+                                    fuzzy_m = _EPIC_FUZZY_RE.search(strip_text)
+                                    if fuzzy_m:
+                                        norm = _normalize_epic(fuzzy_m.group(1))
+                                        if norm and norm not in used_epics:
+                                            voter.voter_id = norm
+                            except Exception:
+                                pass
+
                         if voter.is_valid:
+                            if voter.voter_id:
+                                used_epics.add(voter.voter_id)
+                            card_positions.append((x0, top, x1, bottom))
                             page_voters.append(voter)
                         else:
                             logger.warning(f"[SPATIAL] Card extracted but invalid on page {page_idx+1}: text={card_text[:100]!r}")
@@ -543,36 +766,112 @@ class VotersPDFProcessor:
                             logger.info(f"[SPATIAL RETRY] Recovered voter: {voter.name}")
                             page_voters.append(voter)
 
-                    # --- EPIC recovery: assign EPICs to voters that don't have one ---
-                    # The EPIC may be in the header strip above the card. If the
-                    # extended crop didn't capture it, fall back to matching EPICs
-                    # from full page text to card positions.
+                    # --- EPIC recovery: comprehensive multi-strategy ---
+                    # Strategy 1: Position-based matching from word-level EPICs
                     voters_missing_epic = [
                         (i, v) for i, v in enumerate(page_voters) if not v.voter_id
                     ]
-                    if voters_missing_epic:
-                        # Collect all EPICs from the full page text with their positions
-                        all_page_epics: list[str] = _EPIC_RE.findall(page_text)
-                        # Already-used EPICs
-                        used_epics = set(v.voter_id for v in page_voters if v.voter_id)
-                        available_epics = [e for e in all_page_epics if e not in used_epics]
-
-                        if available_epics:
-                            # Positional assignment: cards and EPICs are both in
-                            # reading order (top-to-bottom, left-to-right), so
-                            # assign available EPICs to missing-EPIC voters in order
-                            epic_idx = 0
-                            for vi, voter in voters_missing_epic:
-                                if epic_idx < len(available_epics):
-                                    candidate = available_epics[epic_idx]
-                                    if candidate not in used_epics:
-                                        voter.voter_id = candidate
-                                        used_epics.add(candidate)
-                                    epic_idx += 1
+                    if voters_missing_epic and page_epic_words:
+                        available_epic_words = [
+                            ew for ew in page_epic_words
+                            if ew["epic"] not in used_epics
+                        ]
+                        available_epic_words.sort(key=lambda e: (e["top"], e["x0"]))
+                        recovered_count = 0
+                        for vi, voter in voters_missing_epic:
+                            if vi < len(card_positions):
+                                cx0, ctop, cx1, _ = card_positions[vi]
+                            else:
+                                continue
+                            best_epic = None
+                            best_dist = float("inf")
+                            for ew in available_epic_words:
+                                if ew["epic"] in used_epics:
+                                    continue
+                                if ew["x0"] < cx0 - 15 or ew["x1"] > cx1 + 15:
+                                    continue
+                                dist = abs(ew["top"] - ctop)
+                                if dist < best_dist:
+                                    best_dist = dist
+                                    best_epic = ew
+                            if best_epic and best_dist < 80:
+                                voter.voter_id = best_epic["epic"]
+                                used_epics.add(best_epic["epic"])
+                                recovered_count += 1
+                        if recovered_count > 0:
                             logger.info(
                                 f"[SPATIAL EPIC-RECOVERY] Page {page_idx+1}: "
-                                f"assigned {epic_idx} EPICs to voters missing IDs"
+                                f"recovered {recovered_count} EPICs via word-position matching"
                             )
+
+                    # Strategy 2: Use full-page EPIC list with 1:1 mapping
+                    # In a 3-column card layout, voters and EPICs appear in the
+                    # same reading order. Build a mapping: for N voters on the
+                    # page, the N EPICs in reading order correspond 1:1.
+                    still_missing = [
+                        (i, v) for i, v in enumerate(page_voters) if not v.voter_id
+                    ]
+                    if still_missing and all_page_epics_ordered:
+                        # Get all EPICs for this page not used by any voter globally
+                        available_epics = [
+                            e for e in all_page_epics_ordered
+                            if e not in used_epics
+                        ]
+
+                        if available_epics:
+                            # Build the full mapping: voter index → expected EPIC
+                            # Each voter on the page corresponds to an EPIC in order.
+                            # Voters that already have EPICs help us align the mapping.
+                            epic_queue = list(all_page_epics_ordered)
+                            voter_epic_map: dict[int, str] = {}
+                            eq_idx = 0
+                            for vi, voter in enumerate(page_voters):
+                                if eq_idx >= len(epic_queue):
+                                    break
+                                if voter.voter_id:
+                                    # Find this EPIC in the queue to stay aligned
+                                    try:
+                                        pos = epic_queue.index(voter.voter_id, eq_idx)
+                                        eq_idx = pos + 1
+                                    except ValueError:
+                                        eq_idx += 1
+                                else:
+                                    # Assign next available EPIC from queue
+                                    voter_epic_map[vi] = epic_queue[eq_idx]
+                                    eq_idx += 1
+
+                            recovered2 = 0
+                            for vi, epic in voter_epic_map.items():
+                                if epic not in used_epics:
+                                    page_voters[vi].voter_id = epic
+                                    used_epics.add(epic)
+                                    recovered2 += 1
+
+                            if recovered2 > 0:
+                                logger.info(
+                                    f"[SPATIAL EPIC-RECOVERY] Page {page_idx+1}: "
+                                    f"recovered {recovered2} EPICs via 1:1 page mapping"
+                                )
+
+                    # Strategy 3: Last resort — assign any remaining unmatched EPICs
+                    final_missing = [
+                        (i, v) for i, v in enumerate(page_voters) if not v.voter_id
+                    ]
+                    if final_missing:
+                        remaining = [
+                            e for e in all_page_epics_ordered
+                            if e not in used_epics
+                        ]
+                        for idx, (vi, voter) in enumerate(final_missing):
+                            if idx < len(remaining):
+                                voter.voter_id = remaining[idx]
+                                used_epics.add(remaining[idx])
+
+                    epic_fill = sum(1 for v in page_voters if v.voter_id)
+                    if page_voters:
+                        logger.info(
+                            f"[SPATIAL] Page {page_idx+1}: EPIC fill {epic_fill}/{len(page_voters)}"
+                        )
 
                     logger.info(
                         f"[SPATIAL] Page {page_idx+1}: {len(card_bboxes)} cards detected, "
@@ -608,7 +907,7 @@ class VotersPDFProcessor:
                             f"Parsed page {page_idx + 1}/{total_pages} ({len(voters)} voters found)",
                         )
 
-                # Quality gate: compare voter count vs EPIC count in full text
+                # Quality check: compare voter count vs EPIC count (warning only, never discard voters)
                 if voters:
                     total_epics = sum(
                         len(_EPIC_RE.findall(pt)) for pt in all_page_texts
@@ -616,9 +915,8 @@ class VotersPDFProcessor:
                     if total_epics > 0 and len(voters) < total_epics * 0.4:
                         logger.warning(
                             f"Spatial extraction found {len(voters)} voters vs "
-                            f"{total_epics} EPICs in text — falling back"
+                            f"{total_epics} EPICs in text — low match rate but KEEPING voters"
                         )
-                        return [], 0, first_page_text
 
                     logger.info(
                         f"Spatial card extraction: {len(voters)} voters "
@@ -969,11 +1267,42 @@ class VotersPDFProcessor:
 
         The first row of the voter card grid often contains booth metadata:
         AC name, part number, address, "voter list" title etc.
+        Cover/summary pages also have table cells with category labels
+        (ஆண், பெண், மொத்தம், பொது, etc.) that must be skipped.
         These should be skipped, not parsed as voter records.
         """
         text_stripped = text.strip()
         if not text_stripped:
             return False
+
+        # --- Cover page summary table cell detection ---
+        # Cover pages have small cells with category labels like:
+        # "ஆண்" (Male), "பெண்" (Female), "மூன்றாம் பாலினம்" (Third gender),
+        # "பொது" (General), "மொத்தம்" (Total), "வரிசை எண்" (Serial No)
+        # These are short texts (< 40 chars) with NO voter field labels
+        _summary_cell_keywords = (
+            'மூன்றாம் பாலினம்', 'மொத்தம்', 'பொது', 'வரிசை',
+            'எண்ணிக்கை', 'தொடங்கும்', 'முடியும்',
+            'திருத்த', 'தீவிர', 'சிறப்பு', 'supplement',
+            'amendment', 'revision', 'deletion', 'நிகர',
+            'nazri', 'naksha', 'google', 'map',
+            'cad view', 'key map', 'front view',
+            'கையொப்பம்', 'அலுவலரின்', 'பதிவு',
+        )
+        text_lower = text_stripped.lower()
+        for kw in _summary_cell_keywords:
+            if kw in text_lower:
+                return True
+
+        # Bare gender words as standalone cell text (from summary tables)
+        # "ஆண்" or "பெண்" alone (not inside a voter card with other fields)
+        bare_text = re.sub(r'\s+', '', text_stripped)
+        if bare_text in ('ஆண்', 'பெண்', 'ஆண', 'பெண', 'Male', 'Female'):
+            return True
+
+        # Very short cells (≤ 15 chars) with only a number — summary table data cell
+        if len(text_stripped) <= 15 and re.fullmatch(r'\d[\d,.\s]*', text_stripped):
+            return True
 
         # Common header indicators
         _header_indicators = (
@@ -989,7 +1318,6 @@ class VotersPDFProcessor:
             'constituency', 'polling', 'part no', 'electoral',
             'assembly', 'voter list', 'supplement',
         )
-        text_lower = text_stripped.lower()
         indicator_count = sum(1 for kw in _header_indicators if kw in text_lower)
         if indicator_count >= 2:
             return True
@@ -1080,6 +1408,16 @@ class VotersPDFProcessor:
 
         # Detect card grid using OpenCV
         card_bboxes = self._detect_card_grid_from_image(gray)
+
+        # If grid detection fails, try applying learned grid from previous pages
+        if not card_bboxes and hasattr(self, '_learned_img_grid') and self._learned_img_grid:
+            card_bboxes = self._apply_learned_img_grid(gray, self._learned_img_grid)
+            if card_bboxes:
+                logger.info(
+                    f"[IMG-CARD-OCR] Page {page_idx+1}: applied learned grid — "
+                    f"{len(card_bboxes)} cards"
+                )
+
         if not card_bboxes:
             # Try full-page OCR fallback for pages without grid
             try:
@@ -1097,6 +1435,10 @@ class VotersPDFProcessor:
             except Exception:
                 pass
             return result
+
+        # Learn grid template from first successful detection
+        if not hasattr(self, '_learned_img_grid') or not self._learned_img_grid:
+            self._learned_img_grid = card_bboxes
 
         result["card_count"] = len(card_bboxes)
         logger.info(f"[IMG-CARD-OCR] Page {page_idx+1}: {len(card_bboxes)} cards detected")
@@ -1120,11 +1462,42 @@ class VotersPDFProcessor:
         # Reusable CLAHE enhancer
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
 
-        # --- Per-card OCR + dedicated EPIC strip OCR ---
+        # --- Step 0: Single whole-page EPIC scan (1 pytesseract call) ---
+        # Much faster than per-card EPIC strip OCR (saves up to 18 calls/card)
+        page_epic_by_pos: list[dict] = []
+        try:
+            epic_data = pytesseract.image_to_data(
+                gray, lang="eng",
+                config="--oem 3 --psm 3",
+                output_type=pytesseract.Output.DICT,
+            )
+            for wi in range(len(epic_data["text"])):
+                word = epic_data["text"][wi].strip()
+                if not word:
+                    continue
+                m = _EPIC_RE.search(word)
+                if m:
+                    page_epic_by_pos.append({
+                        "epic": m.group(1),
+                        "x": epic_data["left"][wi] + epic_data["width"][wi] // 2,
+                        "y": epic_data["top"][wi],
+                    })
+                else:
+                    fm = _EPIC_FUZZY_RE.search(word)
+                    if fm:
+                        norm = _normalize_epic(fm.group(1))
+                        if norm:
+                            page_epic_by_pos.append({
+                                "epic": norm,
+                                "x": epic_data["left"][wi] + epic_data["width"][wi] // 2,
+                                "y": epic_data["top"][wi],
+                            })
+        except Exception:
+            pass
+
+        # --- Per-card OCR (single OCR call per card) ---
         page_voters: list[VoterRecord] = []
         card_to_voter: dict[int, int] = {}
-        # Store expanded bboxes for whole-page EPIC fallback
-        expanded_bboxes: list[tuple[int, int, int, int]] = []
         has_missing_epic = False
         skipped_header_cards = 0
         used_epics: set[str] = set()
@@ -1133,38 +1506,42 @@ class VotersPDFProcessor:
             row_idx = row_tops.index(y) if y in row_tops else 0
             inset = 4
 
-            # --- Step A: OCR card body (NO header extension) ---
-            # Crop only the card interior to avoid header metadata pollution
+            # --- Step A: Single OCR of card body (left 65%) ---
+            # OCR only the left portion to avoid "Photo is available" box
+            # interference. Only OCR full card if left portion fails.
             card_img = gray[y + inset:y + h - inset, x + inset:x + w - inset]
             if card_img.size == 0:
-                # Store a dummy expanded bbox
-                expanded_bboxes.append((x, y, w, h))
                 continue
 
-            card_enhanced = clahe.apply(card_img)
+            left_w = int(w * 0.65)
+            left_img = gray[y + inset:y + h - inset, x + inset:x + left_w]
+            card_text = ""
+            if left_img.size > 0:
+                try:
+                    card_text = pytesseract.image_to_string(
+                        clahe.apply(left_img), lang="tam+eng",
+                        config="--oem 3 --psm 6",
+                    )
+                except Exception:
+                    pass
 
-            try:
-                card_text = pytesseract.image_to_string(
-                    card_enhanced, lang="tam+eng",
-                    config="--oem 3 --psm 6",
-                )
-            except Exception:
-                expanded_bboxes.append((x, y, w, h))
-                continue
+            # Fallback: full card OCR only if left portion gave nothing
+            full_text = ""
+            if not card_text.strip():
+                try:
+                    full_text = pytesseract.image_to_string(
+                        clahe.apply(card_img), lang="tam+eng",
+                        config="--oem 3 --psm 6",
+                    )
+                    card_text = full_text
+                except Exception:
+                    continue
 
             # Strip header metadata lines that may leak into first-row cards
             card_text = re.sub(
                 r'^.*?(?:சட்டமன்ற|தொகுதி|பிரிவு எண்|பகுதி எண்|பாகம் எண்).*?\n',
                 '', card_text, count=2,
             )
-
-            # Store expanded bbox for whole-page EPIC fallback
-            if row_idx == 0:
-                expanded_bboxes.append((x, y, w, h))
-            else:
-                prev_bottom = row_prev_bottom.get(y)
-                epic_y = prev_bottom if prev_bottom is not None else max(0, y - 50)
-                expanded_bboxes.append((x, epic_y, w, h + (y - epic_y)))
 
             if self._is_header_card_text(card_text):
                 skipped_header_cards += 1
@@ -1175,51 +1552,84 @@ class VotersPDFProcessor:
 
             voter = self._extract_voter_from_segment(card_text)
 
-            # --- Step B: Dedicated EPIC strip OCR ---
-            # The EPIC (voter ID) is in a strip near the card:
-            #   Row 0: EPIC may be just ABOVE the card or at the top INSIDE
-            #          the card (varies by page layout)
-            #   Row 1+: EPIC is in the gap BETWEEN previous row bottom
-            #           and current row top
+            # If missing house_no, try full card OCR (only if not already done)
+            if not voter.house_no and not full_text and card_img.size > 0:
+                try:
+                    full_text = pytesseract.image_to_string(
+                        clahe.apply(card_img), lang="tam+eng",
+                        config="--oem 3 --psm 6",
+                    )
+                except Exception:
+                    full_text = ""
+            if not voter.house_no and full_text.strip():
+                full_voter = self._extract_voter_from_segment(full_text)
+                if full_voter.house_no:
+                    voter.house_no = full_voter.house_no
+
+            # --- Step B: Assign EPIC from whole-page EPIC scan ---
+            # Match by position: EPIC word should be above/near the card
+            # and within the card's horizontal range.
             if not voter.voter_id:
-                epic_strips: list[np.ndarray] = []
+                # Compute the EPIC strip region for this card
                 if row_idx == 0:
-                    # Try strip above card first (most pages)
-                    above_strip = gray[max(0, y - 50):y, x:x + w]
-                    if above_strip.size > 0:
-                        epic_strips.append(above_strip)
-                    # Also try top of card (some pages have EPIC inside)
-                    inside_strip = gray[y:y + 35, x:x + w]
-                    if inside_strip.size > 0:
-                        epic_strips.append(inside_strip)
+                    epic_y_top = max(0, y - 80)
+                else:
+                    prev_bottom = row_prev_bottom.get(y)
+                    epic_y_top = max(0, prev_bottom - 10) if prev_bottom else max(0, y - 80)
+                epic_y_bot = y + 30
+
+                best_epic = None
+                best_dist = float("inf")
+                for ep in page_epic_by_pos:
+                    if ep["epic"] in used_epics:
+                        continue
+                    # Must be within card's horizontal range
+                    if ep["x"] < x - 10 or ep["x"] > x + w + 10:
+                        continue
+                    # Must be in the EPIC strip zone (above card to just inside top)
+                    if ep["y"] < epic_y_top or ep["y"] > epic_y_bot:
+                        continue
+                    dist = abs(ep["y"] - y)
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_epic = ep
+                if best_epic:
+                    voter.voter_id = best_epic["epic"]
+
+            # --- Step C: Per-card EPIC strip OCR (only if still missing) ---
+            # Reduced to 1 strip × 1 enhancement × 1 PSM = 1 call max
+            if not voter.voter_id:
+                epic_strip = None
+                if row_idx == 0:
+                    epic_strip = gray[max(0, y - 80):y + 30, x:x + w]
                 else:
                     prev_bottom = row_prev_bottom.get(y)
                     if prev_bottom is not None:
-                        epic_strips.append(gray[prev_bottom:y, x:x + w])
+                        epic_strip_top = max(0, prev_bottom - 10)
+                        epic_strip_bot = min(gray.shape[0], y + 30)
+                        epic_strip = gray[epic_strip_top:epic_strip_bot, x:x + w]
                     else:
-                        epic_strips.append(gray[max(0, y - 50):y, x:x + w])
+                        epic_strip = gray[max(0, y - 80):y, x:x + w]
 
-                for epic_strip in epic_strips:
-                    if epic_strip.size == 0:
-                        continue
+                if epic_strip is not None and epic_strip.size > 0:
                     try:
+                        _, binary_strip = cv2.threshold(
+                            epic_strip, 0, 255,
+                            cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+                        )
                         epic_text = pytesseract.image_to_string(
-                            epic_strip, lang="eng",
-                            config="--oem 3 --psm 3",
+                            binary_strip, lang="eng",
+                            config="--oem 3 --psm 7",
                         )
                         epic_m = _EPIC_RE.search(epic_text)
                         if epic_m and epic_m.group(1) not in used_epics:
                             voter.voter_id = epic_m.group(1)
-                            break
                         elif not epic_m:
                             fuzzy_m = _EPIC_FUZZY_RE.search(epic_text)
                             if fuzzy_m:
-                                normalized = _normalize_epic(
-                                    fuzzy_m.group(1)
-                                )
+                                normalized = _normalize_epic(fuzzy_m.group(1))
                                 if normalized and normalized not in used_epics:
                                     voter.voter_id = normalized
-                                    break
                     except Exception:
                         pass
 
@@ -1232,66 +1642,50 @@ class VotersPDFProcessor:
                     has_missing_epic = True
                 page_voters.append(voter)
 
-        # --- Whole-page EPIC pass: fallback for voters still missing IDs ---
-        if has_missing_epic:
-            try:
-                epic_data = pytesseract.image_to_data(
-                    gray, lang="eng",
-                    config="--oem 3 --psm 3",
-                    output_type=pytesseract.Output.DICT,
-                )
-                # Collect words with positions
-                epic_words: list[dict] = []
-                for i in range(len(epic_data["text"])):
-                    text = epic_data["text"][i].strip()
-                    conf = int(epic_data["conf"][i])
-                    if text and conf > 0:
-                        epic_words.append({
-                            "text": text,
-                            "left": epic_data["left"][i],
-                            "top": epic_data["top"][i],
-                            "width": epic_data["width"][i],
-                            "height": epic_data["height"][i],
-                        })
+        # --- Whole-page EPIC fallback: reuse page_epic_by_pos (no extra OCR) ---
+        if has_missing_epic and page_epic_by_pos:
+            # Sort remaining EPICs by vertical position
+            remaining_epics = [
+                ep for ep in page_epic_by_pos if ep["epic"] not in used_epics
+            ]
+            remaining_epics.sort(key=lambda e: (e["y"], e["x"]))
 
-                # Build text per expanded card region
-                margin = 15
-                for ci_target, vi in card_to_voter.items():
-                    if page_voters[vi].voter_id:
-                        continue
-                    ex, ey, ew, eh = expanded_bboxes[ci_target]
-                    card_word_texts = []
-                    for w in epic_words:
-                        wcx = w["left"] + w["width"] // 2
-                        wcy = w["top"] + w["height"] // 2
-                        if (ex - margin <= wcx <= ex + ew + margin and
-                                ey - margin <= wcy <= ey + eh + margin):
-                            card_word_texts.append(w["text"])
-                    combined = " ".join(card_word_texts)
-                    epic_m = _EPIC_RE.search(combined)
-                    if epic_m and epic_m.group(1) not in used_epics:
-                        page_voters[vi].voter_id = epic_m.group(1)
-                        used_epics.add(epic_m.group(1))
-                    elif not epic_m or epic_m.group(1) in used_epics:
-                        fuzzy_m = _EPIC_FUZZY_RE.search(combined)
-                        if fuzzy_m:
-                            normalized = _normalize_epic(fuzzy_m.group(1))
-                            if normalized and normalized not in used_epics:
-                                page_voters[vi].voter_id = normalized
-                                used_epics.add(normalized)
-            except Exception:
-                pass
+            # Assign remaining EPICs to voters without EPIC in order
+            missing_voters = [
+                (vi, v) for vi, v in enumerate(page_voters)
+                if not v.voter_id
+            ]
+            for idx, (vi, voter) in enumerate(missing_voters):
+                if idx < len(remaining_epics):
+                    voter.voter_id = remaining_epics[idx]["epic"]
+                    used_epics.add(remaining_epics[idx]["epic"])
 
-        # Quality check: if no voter has any evidence (EPIC, age, gender),
-        # this page is likely a cover/summary page — discard all voters
-        voters_with_evidence = sum(
+        # Quality check: detect cover/summary pages vs actual data pages.
+        # Real data pages have voters with EPICs + age + gender.
+        # Cover pages may produce "voters" from summary table cells with
+        # no EPICs and no real voter fields.
+        voters_with_epic = sum(1 for v in page_voters if v.voter_id)
+        voters_with_full_evidence = sum(
+            1 for v in page_voters
+            if (v.voter_id or v.age) and v.gender and v.name
+            and (v.father_husband_name or v.house_no)
+        )
+        voters_with_any_evidence = sum(
             1 for v in page_voters
             if v.voter_id or v.age or v.gender
         )
-        if page_voters and voters_with_evidence == 0:
+        if page_voters and voters_with_any_evidence == 0:
             logger.info(
                 f"[IMG-CARD-OCR] Page {page_idx+1}: discarding {len(page_voters)} "
-                f"voters — no EPIC/age/gender evidence (likely cover page)"
+                f"voters — no EPIC/age/gender evidence (cover/summary page)"
+            )
+            page_voters.clear()
+        elif page_voters and voters_with_epic == 0 and voters_with_full_evidence == 0:
+            # No EPICs and no fully-evidenced voters: likely cover/summary page
+            # Real data pages always have at least some EPICs
+            logger.info(
+                f"[IMG-CARD-OCR] Page {page_idx+1}: discarding {len(page_voters)} "
+                f"voters — no EPICs and no fully-evidenced records (cover/summary page)"
             )
             page_voters.clear()
 
@@ -1350,9 +1744,9 @@ class VotersPDFProcessor:
         if total_pages == 0:
             return [], 0
 
-        # Adaptive DPI: start at 200 for speed, fall back to 300 if quality is poor
-        INITIAL_DPI = int(os.environ.get("VOTER_OCR_DPI", "200"))
-        FALLBACK_DPI = 300
+        # Adaptive DPI: start at 300 for Tamil accuracy, fall back to 400 if quality is poor
+        INITIAL_DPI = int(os.environ.get("VOTER_OCR_DPI", "300"))
+        FALLBACK_DPI = 400
         current_dpi = INITIAL_DPI
         dpi_upgraded = False
 
@@ -1518,10 +1912,92 @@ class VotersPDFProcessor:
                 voter.serial_no = str(serial_counter)
                 voters.append(voter)
 
+        # --- Second-pass EPIC recovery (expensive: re-converts pages) ---
+        # Only attempt if missing rate is high (>30%) to avoid slow re-OCR
         if voters:
+            missing_epic_count = sum(1 for v in voters if not v.voter_id)
+            epic_rate = 1.0 - (missing_epic_count / len(voters)) if voters else 1.0
+            if missing_epic_count > 0 and epic_rate < 0.7:
+                logger.info(
+                    f"[EPIC-RECOVERY] {missing_epic_count}/{len(voters)} voters "
+                    f"missing EPIC ({epic_rate:.0%} fill) — attempting second-pass recovery"
+                )
+                all_used_epics = set(v.voter_id for v in voters if v.voter_id)
+                recovered = 0
+                for pr in page_results:
+                    if pr is None:
+                        continue
+                    page_voters_with_missing = [
+                        v for v in pr["voters"] if not v.voter_id
+                    ]
+                    if not page_voters_with_missing:
+                        continue
+                    try:
+                        page_idx = pr["page_idx"]
+                        retry_imgs = convert_from_path(
+                            str(path), dpi=current_dpi,
+                            first_page=page_idx + 1,
+                            last_page=page_idx + 1,
+                        )
+                        if not retry_imgs:
+                            continue
+                        import cv2
+                        retry_gray = np.array(retry_imgs[0])
+                        if len(retry_gray.shape) == 3:
+                            retry_gray = cv2.cvtColor(retry_gray, cv2.COLOR_RGB2GRAY)
+                        del retry_imgs
+
+                        retry_clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
+                        enhanced = retry_clahe.apply(retry_gray)
+                        try:
+                            import pytesseract
+                            epic_data = pytesseract.image_to_data(
+                                enhanced, lang="eng",
+                                config="--oem 3 --psm 3",
+                                output_type=pytesseract.Output.DICT,
+                            )
+                            page_epic_words_retry = []
+                            for wi in range(len(epic_data["text"])):
+                                word = epic_data["text"][wi].strip()
+                                if not word:
+                                    continue
+                                m = _EPIC_RE.search(word)
+                                if m and m.group(1) not in all_used_epics:
+                                    page_epic_words_retry.append(m.group(1))
+                                else:
+                                    fm = _EPIC_FUZZY_RE.search(word)
+                                    if fm:
+                                        norm = _normalize_epic(fm.group(1))
+                                        if norm and norm not in all_used_epics:
+                                            page_epic_words_retry.append(norm)
+                            # Sequential assignment of recovered EPICs
+                            epic_idx = 0
+                            for v in page_voters_with_missing:
+                                if v.voter_id or epic_idx >= len(page_epic_words_retry):
+                                    continue
+                                v.voter_id = page_epic_words_retry[epic_idx]
+                                all_used_epics.add(page_epic_words_retry[epic_idx])
+                                epic_idx += 1
+                                recovered += 1
+                        except Exception:
+                            pass
+                        del retry_gray
+                    except Exception:
+                        continue
+                if recovered > 0:
+                    logger.info(
+                        f"[EPIC-RECOVERY] Recovered {recovered} EPICs in second pass"
+                    )
+            elif missing_epic_count > 0:
+                logger.info(
+                    f"[EPIC-RECOVERY] {missing_epic_count}/{len(voters)} voters "
+                    f"missing EPIC ({epic_rate:.0%} fill) — skipping expensive second pass"
+                )
+
             logger.info(
                 f"[IMG-CARD-OCR] Total: {len(voters)} voters from "
-                f"{total_pages} pages at {current_dpi} DPI"
+                f"{total_pages} pages at {current_dpi} DPI "
+                f"(EPICs: {sum(1 for v in voters if v.voter_id)}/{len(voters)})"
             )
 
         return voters, total_pages
@@ -1561,7 +2037,7 @@ class VotersPDFProcessor:
 
         # Find horizontal line y-positions
         h_proj = np.sum(h_lines, axis=1)
-        h_threshold = w_img * 0.1 * 255  # at least 10% of page width
+        h_threshold = w_img * 0.07 * 255  # at least 7% of page width (relaxed for faint lines)
         h_positions = []
         in_line = False
         line_start = 0
@@ -1579,7 +2055,7 @@ class VotersPDFProcessor:
 
         # Find vertical line x-positions
         v_proj = np.sum(v_lines, axis=0)
-        v_threshold = h_img * 0.05 * 255  # at least 5% of page height
+        v_threshold = h_img * 0.035 * 255  # at least 3.5% of page height (relaxed for faint lines)
         v_positions = []
         in_line = False
         line_start = 0
@@ -1615,6 +2091,45 @@ class VotersPDFProcessor:
                     cards.append((x0, y0, card_w, card_h))
 
         # Sort: top-to-bottom, left-to-right
+        cards.sort(key=lambda c: (c[1], c[0]))
+        return cards
+
+    @staticmethod
+    def _apply_learned_img_grid(
+        gray: np.ndarray,
+        template_cards: list[tuple[int, int, int, int]],
+    ) -> list[tuple[int, int, int, int]]:
+        """Apply a grid template learned from a previous page to this page.
+
+        Uses the column x-positions and row heights from a successful detection
+        on another page. Pages in voter PDFs have consistent grid layouts.
+        """
+        h_img, w_img = gray.shape[:2]
+
+        # Extract column x-positions and typical card dimensions from template
+        col_xs = sorted(set(x for x, y, w, h in template_cards))
+        row_ys = sorted(set(y for x, y, w, h in template_cards))
+
+        if not col_xs or not row_ys:
+            return []
+
+        # Get typical card dimensions
+        avg_w = int(sum(w for _, _, w, _ in template_cards) / len(template_cards))
+        avg_h = int(sum(h for _, _, _, h in template_cards) / len(template_cards))
+
+        # Build grid using template column positions and evenly spaced rows
+        cards: list[tuple[int, int, int, int]] = []
+        row_spacing = row_ys[1] - row_ys[0] if len(row_ys) > 1 else avg_h + 20
+
+        # Use template row y-positions directly (they should be consistent)
+        for ry in row_ys:
+            if ry + avg_h > h_img:
+                continue
+            for cx in col_xs:
+                if cx + avg_w > w_img:
+                    continue
+                cards.append((cx, ry, avg_w, avg_h))
+
         cards.sort(key=lambda c: (c[1], c[0]))
         return cards
 
@@ -1933,82 +2448,66 @@ class VotersPDFProcessor:
     def _is_false_positive_voter(voter: "VoterRecord") -> bool:
         """Check if a voter record is actually metadata/header text misidentified.
 
-        IMPORTANT: Never drop a record that has strong secondary evidence
-        (father name, age, gender, voter_id, house_no). Real voters whose
-        names got garbled by OCR or merged with header text must be kept.
+        IMPORTANT: Never drop a record that has a valid EPIC (voter ID) or
+        strong secondary evidence. Real voters must NEVER be discarded.
         """
         name = voter.name.strip()
         if not name:
+            # Even with empty name, if voter has EPIC, keep them (name will be set to EPIC later)
+            return not bool(voter.voter_id)
+
+        # CRITICAL: A voter with a valid EPIC is ALWAYS a real voter — never drop
+        if voter.voter_id:
+            return False
+
+        # --- Cover page summary cell detection ---
+        # Standalone gender/category words from summary tables are NOT voters.
+        # e.g. name="ஆண்" with gender="Male" but no EPIC/age/house/father
+        name_bare = re.sub(r'\s+', '', name)
+        _summary_names = {
+            'ஆண்', 'பெண்', 'ஆண', 'பெண',
+            'மூன்றாம்பாலினம்', 'பொது', 'மொத்தம்',
+            'வரிசை', 'எண்ணிக்கை', 'திருத்தம்',
+        }
+        if name_bare in _summary_names:
             return True
+        # Also catch partial OCR of summary labels (e.g. "மற்றும் ஒ")
+        _summary_fragments = (
+            'மற்றும் ஒ', 'தீவிர திருத்தம்', 'ப்பன்னி',
+            'சிறப்பு திருத்தம்', 'supplement', 'amendment',
+            'deletion', 'revision',
+        )
+        name_lower = name.lower()
+        for frag in _summary_fragments:
+            if frag in name_lower:
+                return True
 
         # Count how many secondary fields this record has
         evidence_count = sum([
             bool(voter.father_husband_name and len(voter.father_husband_name.strip()) > 2),
             bool(voter.age),
             bool(voter.gender),
-            bool(voter.voter_id),
             bool(voter.house_no and voter.house_no.strip()),
         ])
 
-        # Strong evidence: 2+ secondary fields means this is almost certainly
-        # a real voter, even if the name looks garbled or contains metadata text.
-        # OCR often prepends/appends header text to the first voter's name.
-        if evidence_count >= 2:
+        # Any secondary evidence means this is likely a real voter — keep
+        if evidence_count >= 1:
             return False
 
         # Header keywords that indicate this is metadata, not a voter
+        # (Only strong, unambiguous header-only keywords — removed city names
+        # and common Tamil words that could appear in voter names)
         metadata_kw = (
             'சாவடி', 'தொகுதி', 'பட்டியல்', 'வாக்காளர்',
-            'ஊராட்சி', 'சட்டமன்ற', 'நாடாளுமன்ற', 'பிரிவு',
+            'ஊராட்சி', 'சட்டமன்ற', 'நாடாளுமன்ற',
             'electoral', 'constituency', 'polling', 'station',
-            'பாகம்', 'கையொப்பம்', 'google', 'map', 'nazri', 'naksha',
-            'நூலக', 'கட்டிடம்',
-            'ஆண்/பெண்', 'நகரம்', 'frade', 'bape',
-            # Cover page / summary keywords
-            'முக்கிய', 'கிராமம்', 'மற்றும்', 'வருவாய்', 'மாவட்ட',
-            'சுருக்கம்', 'விவரம்',
-            # Common OCR fragments from page headers/footers
-            'மாற்றம்', 'என் மற்றும்', 'திருத்த', 'குறிப்பு',
-            'முகவரி', 'சேர்த்தல்', 'நீக்கம்', 'அட்டவணை',
+            'கையொப்பம்', 'google', 'map', 'nazri', 'naksha',
+            'ஆண்/பெண்', 'frade', 'bape',
             'amendment', 'supplement', 'revision', 'deletion',
-        )
-        # Tamil Nadu city/district names that appear in page headers
-        _city_district_kw = (
-            'கடலூர்', 'சென்னை', 'கோயம்புத்தூர்', 'மதுரை', 'திருச்சி',
-            'சேலம்', 'திருநெல்வேலி', 'ஈரோடு', 'தூத்துக்குடி',
-            'விழுப்புரம்', 'வேலூர்', 'திருவண்ணாமலை', 'தஞ்சாவூர்',
-            'நாகப்பட்டினம்', 'கன்னியாகுமரி', 'தருமபுரி', 'திண்டுக்கல்',
-            'கரூர்', 'நாமக்கல்', 'பெரம்பலூர்', 'அரியலூர்',
-            'கிருஷ்ணகிரி', 'சிவகங்கை', 'விருதுநகர்', 'ராமநாதபுரம்',
-            'புதுக்கோட்டை', 'நீலகிரி', 'திருப்பூர்', 'திருவாரூர்',
-            'காஞ்சிபுரம்', 'திருவள்ளூர்', 'ராணிப்பேட்டை', 'தென்காசி',
-            'செங்கல்பட்டு', 'கள்ளக்குறிச்சி', 'மயிலாடுதுறை',
         )
         name_lower = name.lower()
 
-        # With 1 evidence field, only drop on very strong metadata signals
-        if evidence_count == 1:
-            # Only drop if name is PURELY metadata (no Tamil name chars at all)
-            tamil_chars = len(re.findall(r'[\u0B80-\u0BFF]', name))
-            metadata_hit = any(kw in name_lower for kw in metadata_kw)
-            city_hit = any(kw in name for kw in _city_district_kw)
-            if metadata_hit or city_hit:
-                # Check: does the name have real Tamil name content BEYOND the keyword?
-                # Strip all metadata/city keywords and see what's left
-                cleaned = name
-                for kw in list(metadata_kw) + list(_city_district_kw):
-                    cleaned = cleaned.replace(kw, '')
-                cleaned = re.sub(r'[\d\s\-–.,;:()\[\]{}|/]', '', cleaned)
-                tamil_remaining = len(re.findall(r'[\u0B80-\u0BFF]', cleaned))
-                if tamil_remaining >= 3:
-                    # Real Tamil name mixed with metadata — keep it
-                    return False
-                # Pure metadata with 1 evidence field — drop
-                return True
-            # Not metadata keyword match — keep
-            return False
-
-        # No evidence fields: apply full metadata checks
+        # No evidence fields: apply metadata checks
         tamil_chars = len(re.findall(r'[\u0B80-\u0BFF]', name))
 
         # Early rejection: garbage names that are too short or pure ASCII noise
@@ -2020,8 +2519,6 @@ class VotersPDFProcessor:
             return True
 
         if any(kw in name_lower for kw in metadata_kw):
-            return True
-        if any(kw in name for kw in _city_district_kw):
             return True
         # Pattern: "digit-CityName" or "(மா)" (municipality) — page header metadata
         if re.search(r'^\d+\s*[-–]\s*\S', name):
@@ -2038,14 +2535,15 @@ class VotersPDFProcessor:
         ascii_chars = len(re.findall(r'[a-zA-Z]', name))
         if ascii_chars > 10 and tamil_chars < 3:
             return True
-        # Names containing special chars — only drop if no other voter fields
+        # Names containing special chars — clean rather than drop
         if re.search(r'[{}\[\]|]', name):
-            # Clean the special chars from name rather than dropping
-            # (OCR often inserts stray | or } chars in real names)
             return False
         # Very short names with mostly non-Tamil chars are likely noise
         if tamil_chars < 2 and len(name) > 3:
             return True
+        # Keep voters with Tamil name content even without secondary fields
+        if tamil_chars >= 3:
+            return False
         # A real voter should have at least name + (age or gender or voter_id)
         has_secondary = bool(voter.age or voter.gender or voter.voter_id)
         if not has_secondary:
@@ -3051,6 +3549,23 @@ class VotersPDFProcessor:
             if name:
                 voter.name = name
 
+        # Fallback: if no labeled name found, use first line with ≥3 Tamil chars
+        if not voter.name:
+            for line in segment.split('\n'):
+                line = line.strip()
+                tamil_count = len(re.findall(r'[\u0B80-\u0BFF]', line))
+                # Skip lines that are pure EPIC or serial numbers
+                if _EPIC_RE.search(line) and tamil_count < 3:
+                    continue
+                if re.fullmatch(r'\d{1,4}', line.strip()):
+                    continue
+                if tamil_count >= 3:
+                    cleaned = VotersPDFProcessor._clean_name(line)
+                    cleaned = cleaned.rstrip(' .,;:-')
+                    if cleaned and len(cleaned) >= 2:
+                        voter.name = cleaned
+                        break
+
         # --- Father/Husband Name ---
         # Broader pattern: handle OCR variations of தந்தை/கணவர்/தாயின்/இதரர்
         # OCR commonly garbles: தந்தையின் → தந்தை ின், பெயர் → ( பயர் / பயர்
@@ -3072,6 +3587,31 @@ class VotersPDFProcessor:
             fname = fname.rstrip(' .,;:-')
             if fname:
                 voter.father_husband_name = fname
+
+        # Fallback: if no labeled father name, try second Tamil text line
+        if not voter.father_husband_name and voter.name:
+            found_name = False
+            for line in segment.split('\n'):
+                line = line.strip()
+                tamil_count = len(re.findall(r'[\u0B80-\u0BFF]', line))
+                if tamil_count < 3:
+                    continue
+                if _EPIC_RE.search(line) and tamil_count < 3:
+                    continue
+                cleaned = VotersPDFProcessor._clean_name(line)
+                cleaned = cleaned.rstrip(' .,;:-')
+                if not cleaned or len(cleaned) < 2:
+                    continue
+                if not found_name:
+                    # Skip the first Tamil line (already used as name)
+                    if cleaned == voter.name or cleaned in voter.name:
+                        found_name = True
+                        continue
+                    found_name = True
+                    continue
+                # This is the second Tamil text line — use as father name
+                voter.father_husband_name = cleaned
+                break
 
         # --- House Number ---
         # Handle both standard Tamil label and garbled OCR variants

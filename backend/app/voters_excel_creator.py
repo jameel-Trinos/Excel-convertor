@@ -62,6 +62,8 @@ class VotersExcelCreator:
         address: str = "",
         total_voters: str = "",
         source_filename: str = "",
+        expected_total: str = "",
+        extracted_total: str = "",
     ) -> str:
         """
         Create voter list Excel file.
@@ -75,6 +77,8 @@ class VotersExcelCreator:
             address: Booth address
             total_voters: Total voter count
             source_filename: Original PDF filename
+            expected_total: Expected total from PDF header (மொத்தம்)
+            extracted_total: Actual extracted count
 
         Returns:
             Path to created file.
@@ -87,7 +91,8 @@ class VotersExcelCreator:
 
         # --- Header metadata section ---
         current_row = self._write_metadata(
-            ws, current_row, ac_no, part_no, address, total_voters, source_filename
+            ws, current_row, ac_no, part_no, address, total_voters, source_filename,
+            expected_total=expected_total, extracted_total=extracted_total,
         )
 
         # Blank row separator
@@ -165,6 +170,8 @@ class VotersExcelCreator:
         address: str,
         total_voters: str,
         source_filename: str,
+        expected_total: str = "",
+        extracted_total: str = "",
     ) -> int:
         """Write metadata header section. Returns next row number."""
         row = start_row
@@ -181,11 +188,18 @@ class VotersExcelCreator:
         row += 1
 
         # Metadata rows: label in columns A-C (merged), value in columns D-G (merged)
+        # Build total voters display with reconciliation info
+        total_display = total_voters or "—"
+        if expected_total and extracted_total and expected_total != extracted_total:
+            total_display = f"{extracted_total} (Expected: {expected_total})"
+        elif expected_total and extracted_total and expected_total == extracted_total:
+            total_display = f"{extracted_total} (Matched)"
+
         meta_items = [
             ("AC No / சட்டமன்றத் தொகுதி எண்:", ac_no or "—"),
             ("Booth No / பகுதி எண்:", part_no or "—"),
             ("Address / முகவரி:", address or "—"),
-            ("Total Voters / மொத்த வாக்காளர்கள்:", total_voters or "—"),
+            ("Total Voters / மொத்த வாக்காளர்கள்:", total_display),
         ]
 
         for label, value in meta_items:

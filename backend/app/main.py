@@ -511,6 +511,8 @@ async def process_voters_conversion(task_id: str, file_path: Path):
             address=header_info.address,
             total_voters=header_info.total_voters,
             source_filename=tasks[task_id].filename,
+            expected_total=result.get("expected_total", ""),
+            extracted_total=result.get("extracted_total", ""),
         )
 
         update_task_progress(task_id, 95, "Finalizing...")
@@ -643,6 +645,8 @@ async def _process_voter_convert_job(job_id: str, temp_pdf: Path, original_filen
             address=header_info.address,
             total_voters=header_info.total_voters,
             source_filename=original_filename,
+            expected_total=result.get("expected_total", ""),
+            extracted_total=result.get("extracted_total", ""),
         )
 
         ac = header_info.ac_no or "unknown"
