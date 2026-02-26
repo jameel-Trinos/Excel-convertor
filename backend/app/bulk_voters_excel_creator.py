@@ -26,6 +26,7 @@ VOTER_COLUMNS = [
     ("Age", "வயது"),
     ("Gender", "பாலினம்"),
     ("Voter ID", "வாக்காளர் அடையாள எண்"),
+    ("Street Name", "தெரு பெயர்"),
 ]
 
 # Styles
@@ -43,7 +44,7 @@ _THIN_BORDER = Border(
 )
 _CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
 _LEFT = Alignment(horizontal="left", vertical="center", wrap_text=True)
-_COL_WIDTHS = [12, 25, 25, 15, 8, 12, 22]
+_COL_WIDTHS = [12, 25, 25, 15, 8, 12, 22, 35]
 
 # Summary styles
 _SUMMARY_HEADER_FONT = Font(name="Calibri", bold=True, color="FFFFFF", size=11)

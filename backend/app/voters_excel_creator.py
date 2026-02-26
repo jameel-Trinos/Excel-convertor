@@ -24,6 +24,7 @@ VOTER_COLUMNS = [
     ("Age", "வயது"),
     ("Gender", "பாலினம்"),
     ("Voter ID", "வாக்காளர் அடையாள எண்"),
+    ("Street Name", "தெரு பெயர்"),
 ]
 
 # Styles
@@ -45,7 +46,7 @@ _CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
 _LEFT = Alignment(horizontal="left", vertical="center", wrap_text=True)
 
 # Column widths
-_COL_WIDTHS = [12, 25, 25, 15, 8, 12, 22]
+_COL_WIDTHS = [12, 25, 25, 15, 8, 12, 22, 35]
 
 
 class VotersExcelCreator:

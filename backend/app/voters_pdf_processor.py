@@ -91,6 +91,16 @@ _ADDRESS_LABEL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Section name / street name pattern — per page header
+# Matches: "பிரிவு எண் மற்றும் பெயர்" followed by the section/street text
+_SECTION_NAME_RE = re.compile(
+    r'(?:'
+    r'பிரிவு\s*எண்\s*மற்றும்\s*பெயர்'
+    r'|Section\s*(?:Number|No\.?)\s*(?:and|&)\s*Name'
+    r')\s*[:：]?\s*(.*)',
+    re.IGNORECASE,
+)
+
 # Tamil field label patterns for splitting concatenated voter text
 _NAME_LABEL_RE = re.compile(
     r'(?:பெயர்\s*:|Name\s*:|Elector\s*Name\s*:)', re.IGNORECASE
@@ -162,6 +172,7 @@ class VoterRecord:
         age: str = "",
         gender: str = "",
         voter_id: str = "",
+        street_name: str = "",
     ):
         self.serial_no = serial_no
         self.name = name
@@ -170,6 +181,7 @@ class VoterRecord:
         self.age = age
         self.gender = gender
         self.voter_id = voter_id
+        self.street_name = street_name
 
     def to_row(self) -> list[str]:
         return [
@@ -180,6 +192,7 @@ class VoterRecord:
             self.age,
             self.gender,
             self.voter_id,
+            self.street_name,
         ]
 
     @property
@@ -271,6 +284,11 @@ class VotersPDFProcessor:
                                     break
                         for i, page_text in enumerate(text_pages):
                             page_voters = self._parse_voters_from_text(page_text)
+                            # Assign per-page section/street name
+                            page_section_name = self._extract_section_name(page_text)
+                            if page_section_name:
+                                for v in page_voters:
+                                    v.street_name = page_section_name
                             self.voters.extend(page_voters)
                             if progress_callback:
                                 pct = 30 + int((i + 1) / max(total_pages, 1) * 50)
@@ -305,6 +323,11 @@ class VotersPDFProcessor:
                 for i, page_text in enumerate(text_pages):
                     epic_map = epic_maps[i] if i < len(epic_maps) else {}
                     page_voters = self._parse_voters_from_text(page_text, epic_map)
+                    # Assign per-page section/street name
+                    page_section_name = self._extract_section_name(page_text)
+                    if page_section_name:
+                        for v in page_voters:
+                            v.street_name = page_section_name
                     self.voters.extend(page_voters)
                     if progress_callback:
                         pct = 30 + int((i + 1) / max(total_pages, 1) * 50)
@@ -344,6 +367,16 @@ class VotersPDFProcessor:
         for i, voter in enumerate(self.voters, 1):
             voter.serial_no = str(i)
 
+        # Normalize gender to short form: M / F / O
+        for voter in self.voters:
+            g = voter.gender.strip().lower()
+            if g in ("male", "m", "ஆண்"):
+                voter.gender = "M"
+            elif g in ("female", "f", "பெண்"):
+                voter.gender = "F"
+            elif g:
+                voter.gender = "O"
+
         # Update total voters from actual count if header didn't have it
         if not self.header_info.total_voters and self.voters:
             self.header_info.total_voters = str(len(self.voters))
@@ -354,6 +387,7 @@ class VotersPDFProcessor:
         headers = [
             "Serial No", "Name", "Father/Husband Name",
             "House No", "Age", "Gender", "Voter ID",
+            "Street Name",
         ]
 
         return {
@@ -400,6 +434,9 @@ class VotersPDFProcessor:
                     # (covers, signature pages, maps may precede voter data)
                     if page_idx < 4:
                         first_page_text += ("\n" + page_text) if first_page_text else page_text
+
+                    # Extract section/street name for this page
+                    page_section_name = self._extract_section_name(page_text)
 
                     # Detect card bounding boxes
                     card_bboxes = self._detect_card_grid(page)
@@ -556,6 +593,11 @@ class VotersPDFProcessor:
 
                     # Fix house numbers with OCR digit↔letter confusion using page context
                     self._fix_house_numbers_contextual(page_voters)
+
+                    # Assign per-page section/street name to all voters on this page
+                    if page_section_name:
+                        for v in page_voters:
+                            v.street_name = page_section_name
 
                     voters.extend(page_voters)
 
@@ -749,9 +791,13 @@ class VotersPDFProcessor:
                     progress_callback(10, f"Trying table extraction on {total_pages} pages...")
 
                 for page_idx, page in enumerate(pdf.pages):
-                    # Get plain text for header parsing (first page only)
+                    # Get plain text for header parsing and street name
+                    page_text = page.extract_text() or ""
                     if page_idx == 0:
-                        first_page_text = page.extract_text() or ""
+                        first_page_text = page_text
+
+                    # Extract section/street name for this page
+                    page_section_name = self._extract_section_name(page_text)
 
                     # Try multiple table extraction strategies
                     tables = None
@@ -776,6 +822,10 @@ class VotersPDFProcessor:
                         if not table or len(table) < 2:
                             continue
                         page_voters = self._parse_table_rows(table)
+                        # Assign per-page section/street name
+                        if page_section_name:
+                            for v in page_voters:
+                                v.street_name = page_section_name
                         voters.extend(page_voters)
 
                     if progress_callback:
@@ -1001,7 +1051,21 @@ class VotersPDFProcessor:
             "voters": [],
             "header_text": "",
             "card_count": 0,
+            "section_name": "",
         }
+
+        # Extract section/street name from top header strip of every page
+        try:
+            h_img, w_img = gray.shape[:2]
+            header_strip = gray[0:int(h_img * 0.12), :]
+            header_strip_text = pytesseract.image_to_string(
+                header_strip, lang="tam+eng", config="--oem 3 --psm 6"
+            )
+            section_name = self._extract_section_name(header_strip_text)
+            if section_name:
+                result["section_name"] = section_name
+        except Exception:
+            pass
 
         # Try to get header text from first few pages
         if do_header_ocr:
@@ -1351,6 +1415,7 @@ class VotersPDFProcessor:
                         page_results[page_idx] = {
                             "page_idx": page_idx, "voters": [],
                             "header_text": "", "card_count": 0,
+                            "section_name": "",
                         }
                     completed_count += 1
                     if progress_callback:
@@ -1421,6 +1486,7 @@ class VotersPDFProcessor:
                                         page_results[pidx] = {
                                             "page_idx": pidx, "voters": [],
                                             "header_text": "", "card_count": 0,
+                                            "section_name": "",
                                         }
                                     completed_count += 1
                             del retry_gray
@@ -1443,8 +1509,11 @@ class VotersPDFProcessor:
                 if self.header_info.ac_no and self.header_info.part_no:
                     header_ocr_done = True
 
-            # Assign serial numbers and collect voters
+            # Assign section/street name and serial numbers, then collect voters
+            page_section_name = pr.get("section_name", "")
             for voter in pr["voters"]:
+                if page_section_name:
+                    voter.street_name = page_section_name
                 serial_counter = len(voters) + 1
                 voter.serial_no = str(serial_counter)
                 voters.append(voter)
@@ -1724,6 +1793,42 @@ class VotersPDFProcessor:
             )
 
         return pages_text
+
+    # ------------------------------------------------------------------
+    # Section / street name extraction (per-page)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_section_name(page_text: str) -> str:
+        """Extract section/street name from a page's header text.
+
+        Looks for "பிரிவு எண் மற்றும் பெயர்" (Section Number and Name)
+        and captures everything after it on that line (and optionally the
+        next line if it continues).
+
+        Returns the section name string, or "" if not found.
+        """
+        page_text = _strip_zw(page_text)
+        lines = page_text.split("\n")
+
+        for i, line in enumerate(lines):
+            m = _SECTION_NAME_RE.search(line.strip())
+            if m:
+                section_text = m.group(1).strip()
+                # If the captured text is very short, the value might
+                # continue on the next line
+                if len(section_text) < 5 and i + 1 < len(lines):
+                    next_line = lines[i + 1].strip()
+                    if (next_line
+                            and not _AC_NO_RE.search(next_line)
+                            and not _PART_NO_RE.search(next_line)
+                            and not _TOTAL_VOTERS_RE.search(next_line)
+                            and not _ADDRESS_LABEL_RE.search(next_line)
+                            and not _SERIAL_RE.match(next_line)):
+                        section_text = (section_text + " " + next_line).strip()
+                return section_text
+
+        return ""
 
     # ------------------------------------------------------------------
     # Header parsing

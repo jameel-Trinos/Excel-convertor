@@ -263,6 +263,7 @@ async def process_conversion(
                 "passed": vr.passed,
                 "confidence": round(vr.confidence, 3),
                 "issues": vr.issues[:50],
+                "warnings": getattr(vr, "warnings", [])[:20],
                 "suggestions": getattr(vr, "suggestions", [])[:10],
             }
             logger.info(
@@ -1178,6 +1179,7 @@ async def get_status(task_id: str):
         message=task.message,
         output_file=task.output_file,
         error=task.error,
+        validation_issues=task.validation_issues,
     )
 
 
@@ -1210,8 +1212,8 @@ async def progress_stream(task_id: str):
                         "data": json.dumps(event.model_dump()),
                     }
 
-                # Stop streaming when complete or failed
-                if task.status in ["completed", "failed"]:
+                # Stop streaming when complete, failed, or needs_review
+                if task.status in ["completed", "failed", "needs_review"]:
                     break
 
             await asyncio.sleep(0.3)

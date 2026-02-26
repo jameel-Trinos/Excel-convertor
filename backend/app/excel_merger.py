@@ -290,13 +290,13 @@ class ExcelMerger:
         data_start = header_row + 2
 
         rows: list[list[Any]] = []
-        for row in ws.iter_rows(min_row=data_start, max_col=7, values_only=True):
+        for row in ws.iter_rows(min_row=data_start, max_col=8, values_only=True):
             # Skip empty rows
             if all(v is None or str(v).strip() == "" for v in row):
                 continue
 
-            # Pad row to 7 columns
-            vals = list(row) + [None] * (7 - len(row))
+            # Pad row to 8 columns
+            vals = list(row) + [None] * (8 - len(row))
 
             serial_no = str(vals[0] or "").strip()
             name = str(vals[1] or "").strip()
@@ -305,12 +305,18 @@ class ExcelMerger:
             age = str(vals[4] or "").strip()
             gender = str(vals[5] or "").strip()
             voter_id = str(vals[6] or "").strip()
+            street_name = str(vals[7] or "").strip()
 
             # Skip rows that look like headers or metadata
             if serial_no.lower() in ("serial no", "வ.எண்", ""):
                 # Allow empty serial if there's other data
                 if not name and not voter_id:
                     continue
+
+            # Use street_name from the PDF (column 8) if available,
+            # otherwise fall back to the section map lookup
+            row_section = street_name if street_name else section_name
+            row_section_tamil = street_name if street_name else section_tamil
 
             # Build target row (serial placeholder = 0, will be renumbered)
             merged_row = [
@@ -324,8 +330,8 @@ class ExcelMerger:
                 gender,             # gender
                 age,                # age
                 house_no,           # house_number
-                section_name,       # section_name
-                section_tamil,      # section_name_tamil
+                row_section,        # section_name
+                row_section_tamil,  # section_name_tamil
                 part_no,            # part_number
                 ac_no,              # ac_number
                 "",                 # district_code (blank)

@@ -19,7 +19,7 @@ class ConversionTask(BaseModel):
     created_at: datetime = Field(default_factory=datetime.utcnow)
     output_file: Optional[str] = Field(default=None, description="Path to generated Excel file")
     error: Optional[str] = Field(default=None, description="Error message if failed")
-    validation_issues: Optional[list] = Field(default=None, description="Validation issues if needs_review status")
+    validation_issues: Optional[dict] = Field(default=None, description="Validation issues if needs_review status")
 
     class Config:
         json_schema_extra = {
