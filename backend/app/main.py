@@ -60,6 +60,8 @@ load_dotenv()
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+# Enable debug logging for voter EPIC extraction diagnostics
+logging.getLogger("app.voters_pdf_processor").setLevel(logging.DEBUG)
 
 # Configuration
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "./uploads"))
