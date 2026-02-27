@@ -537,9 +537,11 @@ async def process_voters_conversion(task_id: str, file_path: Path):
         else:
             tasks[task_id].status = "completed"
             tasks[task_id].progress = 100
-            tasks[task_id].message = f"Extraction complete: {voter_count} voters from {result['total_pages']} pages"
+            deleted_count = result.get("deleted_count", 0)
+            deleted_msg = f" ({deleted_count} deleted voters excluded)" if deleted_count else ""
+            tasks[task_id].message = f"Extraction complete: {voter_count} voters from {result['total_pages']} pages{deleted_msg}"
             tasks[task_id].output_file = str(output_path)
-            logger.info(f"Voters extraction done for task {task_id}: {voter_count} voters")
+            logger.info(f"Voters extraction done for task {task_id}: {voter_count} voters{deleted_msg}")
 
     except Exception as e:
         logger.error(f"Voters extraction failed for task {task_id}: {e}", exc_info=True)

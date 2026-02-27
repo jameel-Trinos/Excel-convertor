@@ -119,6 +119,12 @@ _TOTAL_VOTERS_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Deleted voter detection: cards marked with "DELETED" watermark/stamp only
+_DELETED_RE = re.compile(
+    r'\bDELETED\b|\bD\s*E\s*L\s*E\s*T\s*E\s*D\b|நீக்கப்பட்டது',
+    re.IGNORECASE,
+)
+
 # Address label pattern — matches "வாக்குச் சாவடியின் முகவரி" and English variants
 # The address text follows the label after a colon (same line or next line)
 _ADDRESS_LABEL_RE = re.compile(
@@ -248,6 +254,7 @@ class VoterRecord:
         self.gender = gender
         self.voter_id = voter_id
         self.street_name = street_name
+        self.is_deleted = False
 
     def to_row(self) -> list[str]:
         return [
@@ -286,6 +293,7 @@ class VotersPDFProcessor:
         self.voters: list[VoterRecord] = []
         self._is_scanned = False
         self._learned_img_grid: list[tuple[int, int, int, int]] = []
+        self._deleted_voter_count = 0
 
     def extract(
         self,
@@ -400,6 +408,14 @@ class VotersPDFProcessor:
                         pct = 30 + int((i + 1) / max(total_pages, 1) * 50)
                         progress_callback(pct, f"Parsed page {i + 1}/{total_pages} ({len(self.voters)} voters found)")
 
+        # Filter out deleted/struck-off voters (safety net — most are caught earlier)
+        deleted_count = sum(1 for v in self.voters if v.is_deleted)
+        if deleted_count > 0:
+            logger.info(f"[DELETED FILTER] Removing {deleted_count} deleted voters")
+            self.voters = [v for v in self.voters if not v.is_deleted]
+        # Track total deleted for reconciliation (includes those skipped at card level)
+        self._deleted_voter_count = getattr(self, '_deleted_voter_count', 0) + deleted_count
+
         # Filter out false-positive voters (header/metadata misidentified as voter)
         pre_filter_count = len(self.voters)
         dropped_voters = [v for v in self.voters if self._is_false_positive_voter(v)]
@@ -457,20 +473,31 @@ class VotersPDFProcessor:
         if not self.header_info.total_voters and self.voters:
             self.header_info.total_voters = extracted_total
 
-        # Reconciliation: compare expected vs extracted
+        # Reconciliation: compare expected vs extracted (accounting for deleted voters)
+        deleted_total = self._deleted_voter_count
         if expected_total and expected_total.isdigit() and self.voters:
             expected_int = int(expected_total)
             extracted_int = len(self.voters)
             epic_count = sum(1 for v in self.voters if v.voter_id)
-            if expected_int != extracted_int:
+            # The header total includes deleted voters, so adjust expected
+            expected_after_deleted = expected_int - deleted_total
+            if deleted_total > 0:
+                logger.info(
+                    f"[RECONCILIATION] {deleted_total} deleted voters removed. "
+                    f"Header total: {expected_int}, After deletion: {expected_after_deleted}"
+                )
+            if expected_after_deleted != extracted_int:
                 logger.warning(
-                    f"[RECONCILIATION] Expected {expected_int} voters (from header), "
-                    f"extracted {extracted_int} — {expected_int - extracted_int} missing! "
+                    f"[RECONCILIATION] Expected {expected_after_deleted} voters "
+                    f"(header={expected_int} minus {deleted_total} deleted), "
+                    f"extracted {extracted_int} — "
+                    f"{expected_after_deleted - extracted_int} missing! "
                     f"EPIC fill rate: {epic_count}/{extracted_int}"
                 )
             else:
                 logger.info(
-                    f"[RECONCILIATION] All {expected_int} voters extracted successfully. "
+                    f"[RECONCILIATION] All {expected_after_deleted} voters extracted successfully "
+                    f"({deleted_total} deleted excluded). "
                     f"EPIC fill rate: {epic_count}/{extracted_int}"
                 )
 
@@ -490,6 +517,7 @@ class VotersPDFProcessor:
             "total_pages": total_pages,
             "expected_total": expected_total,
             "extracted_total": extracted_total,
+            "deleted_count": self._deleted_voter_count,
         }
 
     # ------------------------------------------------------------------
@@ -601,6 +629,49 @@ class VotersPDFProcessor:
                             })
                     except Exception:
                         page_words = []
+
+                    # --- Detect "DELETED" words with positions ---
+                    # Deleted voter cards have "DELETED" text overlaid.
+                    # Also check page.chars for rotated/diagonal DELETED text
+                    # that extract_words() may miss.
+                    deleted_card_zones: list[tuple[float, float, float, float]] = []
+                    # Check extract_words result
+                    for pw in page_words:
+                        if _DELETED_RE.search(pw["text"]):
+                            deleted_card_zones.append((
+                                pw["x0"], pw["top"], pw["x1"], pw["bottom"]
+                            ))
+                    # Also check page.chars for DELETED (catches rotated text)
+                    if not deleted_card_zones:
+                        try:
+                            chars = page.chars
+                            for ci_c, ch in enumerate(chars):
+                                ch_text = ch.get("text", "")
+                                if ch_text.upper() != "D":
+                                    continue
+                                # Try to form "DELETED" from consecutive chars
+                                seq_chars = []
+                                for offset in range(7):
+                                    idx = ci_c + offset
+                                    if idx < len(chars):
+                                        seq_chars.append(chars[idx])
+                                seq_text = ''.join(
+                                    c.get('text', '') for c in seq_chars
+                                )
+                                if seq_text.upper() == "DELETED":
+                                    # Use bounding box of the full word
+                                    d_x0 = min(c.get('x0', 0) for c in seq_chars)
+                                    d_top = min(c.get('top', 0) for c in seq_chars)
+                                    d_x1 = max(c.get('x1', 0) for c in seq_chars)
+                                    d_bot = max(c.get('bottom', 0) for c in seq_chars)
+                                    deleted_card_zones.append((d_x0, d_top, d_x1, d_bot))
+                        except Exception:
+                            pass
+                    # Also check full page text
+                    if not deleted_card_zones and _DELETED_RE.search(page_text):
+                        # DELETED is in the page text but we couldn't locate it
+                        # spatially. Flag entire page for card-level text checking.
+                        pass
 
                     # --- Collect ALL EPICs from the full page text ---
                     # Using full page text is more reliable than word-level
@@ -764,6 +835,28 @@ class VotersPDFProcessor:
                         if not has_voter_fields:
                             if has_epic or has_name_field or tamil_chars >= 5:
                                 skipped_cards.append(card_text)
+                            continue
+
+                        # Skip deleted/struck-off voters
+                        # 1. Check card text for "DELETED" keyword
+                        # 2. Check if card overlaps a detected DELETED zone
+                        is_del = self._is_deleted_voter_card(card_text)
+                        if not is_del and deleted_card_zones:
+                            for dz_x0, dz_top, dz_x1, dz_bot in deleted_card_zones:
+                                # Require the CENTER of the DELETED zone to fall
+                                # within this card — prevents a stamp on one card
+                                # from bleeding into a neighboring card's bbox.
+                                dz_cx = (dz_x0 + dz_x1) / 2
+                                dz_cy = (dz_top + dz_bot) / 2
+                                if (x0 <= dz_cx <= x1 and top <= dz_cy <= bottom):
+                                    is_del = True
+                                    break
+                        if is_del:
+                            self._deleted_voter_count += 1
+                            logger.info(
+                                f"[SPATIAL] Page {page_idx+1}: "
+                                f"DELETED voter skipped — text: {card_text[:80]!r}"
+                            )
                             continue
 
                         voter = self._extract_voter_from_segment(card_text)
@@ -1539,11 +1632,138 @@ class VotersPDFProcessor:
 
         return False
 
+    @staticmethod
+    def _is_deleted_voter_card(card_text: str) -> bool:
+        """Check if a voter card text contains a 'DELETED' marker."""
+        return bool(_DELETED_RE.search(card_text))
+
+    @staticmethod
+    def _is_deleted_voter_card_image(card_img_color: np.ndarray) -> bool:
+        """Detect 'DELETED' watermark on a voter card using image analysis.
+
+        The DELETED stamp is a red-colored diagonal text overlaid on the card.
+        We detect it by looking for significant red-colored pixel regions,
+        which are distinctive because normal card content is black text on
+        white background with no red.
+        """
+        import cv2
+
+        if card_img_color is None or card_img_color.size == 0:
+            return False
+
+        # Convert to HSV to detect red color
+        # The DELETED stamp is red — unique in voter cards which are black/white
+        if len(card_img_color.shape) < 3:
+            return False  # Grayscale image, can't detect red
+
+        # Image comes from PIL (RGB format), convert to HSV
+        hsv = cv2.cvtColor(card_img_color, cv2.COLOR_RGB2HSV)
+
+        # Red in HSV wraps around 0/180, so we need two ranges
+        # Lower red: H=0-10, S=70-255, V=50-255
+        lower_red1 = np.array([0, 70, 50])
+        upper_red1 = np.array([10, 255, 255])
+        # Upper red: H=160-180, S=70-255, V=50-255
+        lower_red2 = np.array([160, 70, 50])
+        upper_red2 = np.array([180, 255, 255])
+
+        mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+        mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+        red_mask = mask1 | mask2
+
+        # Count red pixels as fraction of total card area
+        total_pixels = card_img_color.shape[0] * card_img_color.shape[1]
+        red_pixels = cv2.countNonZero(red_mask)
+        red_ratio = red_pixels / max(total_pixels, 1)
+
+        # A DELETED stamp typically covers a significant portion of the card
+        # with red text. Normal cards have essentially 0 red pixels.
+        # Threshold: >0.5% red pixels indicates a red stamp/watermark
+        if red_ratio > 0.005:
+            logger.debug(
+                f"[DELETED-IMG] Red ratio: {red_ratio:.4f} "
+                f"({red_pixels}/{total_pixels} pixels) — DELETED detected"
+            )
+            return True
+
+        return False
+
+    @staticmethod
+    def _is_deleted_voter_card_diagonal(card_img_gray: np.ndarray) -> bool:
+        """Detect 'DELETED' watermark using diagonal line analysis.
+
+        The DELETED stamp is diagonal text (roughly 30-50 degrees) overlaid
+        on the card.  Normal voter card content is strictly horizontal text,
+        so diagonal strokes are a strong signal of a watermark.
+
+        Uses Canny edge detection + Hough line transform to count diagonal
+        line segments within the left 60 percent of the card (right side has
+        the "Photo is available" box which is all horizontal/vertical).
+
+        The detection threshold is normalised to card dimensions so it is
+        DPI-independent.
+        """
+        import cv2
+
+        if card_img_gray is None or card_img_gray.size == 0:
+            return False
+
+        h, w = card_img_gray.shape[:2]
+        if h < 20 or w < 20:
+            return False
+
+        # Only analyse left 60% of card to avoid photo box interference
+        left_w = int(w * 0.6)
+        roi = card_img_gray[:, :left_w]
+
+        edges = cv2.Canny(roi, 50, 150)
+        lines = cv2.HoughLinesP(
+            edges, 1, np.pi / 180, 30,
+            minLineLength=max(15, h // 15),
+            maxLineGap=5,
+        )
+
+        if lines is None:
+            return False
+
+        diag_count = 0
+        total_diag_length = 0.0
+
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            dx = x2 - x1
+            if dx == 0:
+                continue
+            angle = abs(np.degrees(np.arctan2(y2 - y1, dx)))
+            if 20 <= angle <= 70:
+                length = np.sqrt(dx * dx + (y2 - y1) ** 2)
+                diag_count += 1
+                total_diag_length += length
+
+        # Normalise total diagonal length relative to card diagonal so the
+        # threshold is DPI-independent.  The DELETED watermark spans a
+        # significant fraction of the card diagonal.
+        card_diag = np.sqrt(float(h * h + left_w * left_w))
+        diag_ratio = total_diag_length / max(card_diag, 1.0)
+
+        # True DELETED stamps yield ratio > 1.0 (many overlapping diagonal
+        # strokes), normal cards yield < 0.6.
+        if diag_ratio >= 1.0 and diag_count >= 15:
+            logger.debug(
+                f"[DELETED-DIAG] diag_lines={diag_count}, "
+                f"total_len={total_diag_length:.0f}, "
+                f"ratio={diag_ratio:.2f} — DELETED detected"
+            )
+            return True
+
+        return False
+
     def _ocr_single_page_cards(
         self,
         page_idx: int,
         gray: np.ndarray,
         do_header_ocr: bool,
+        color_img: np.ndarray | None = None,
     ) -> dict[str, Any]:
         """OCR a single page: detect card grid, per-card OCR, return voters.
 
@@ -1733,6 +1953,29 @@ class VotersPDFProcessor:
 
             if self._is_header_card_text(card_text):
                 skipped_header_cards += 1
+                continue
+
+            # Skip deleted/struck-off voters
+            # Strategy 1: Check card text for "DELETED" keyword
+            is_deleted = self._is_deleted_voter_card(card_text)
+            # Strategy 2: Diagonal watermark detection (dark/gray DELETED stamp)
+            # This catches black diagonal "DELETED" text that OCR misses.
+            if not is_deleted:
+                inset_d = 4
+                card_gray_roi = gray[y + inset_d:y + h - inset_d,
+                                     x + inset_d:x + w - inset_d]
+                is_deleted = self._is_deleted_voter_card_diagonal(card_gray_roi)
+            # Strategy 3: Check color image for red watermark stamp
+            if not is_deleted and color_img is not None and len(color_img.shape) == 3:
+                inset_c = 4
+                card_color = color_img[y + inset_c:y + h - inset_c, x + inset_c:x + w - inset_c]
+                is_deleted = self._is_deleted_voter_card_image(card_color)
+            if is_deleted:
+                self._deleted_voter_count += 1
+                logger.info(
+                    f"[IMG-CARD-OCR] Page {page_idx+1} card {ci}: "
+                    f"DELETED voter skipped"
+                )
                 continue
 
             if len(card_text.strip()) < 3:
@@ -2011,10 +2254,12 @@ class VotersPDFProcessor:
                 logger.warning(f"pdf2image batch {batch_start+1}-{batch_end} failed: {e}")
                 continue
 
-            # Convert to grayscale numpy arrays
+            # Convert to grayscale and color numpy arrays
             gray_batch: list[np.ndarray] = []
+            color_batch: list[np.ndarray] = []
             for pil_img in batch_images:
                 img = np.array(pil_img)
+                color_batch.append(img)
                 if len(img.shape) == 3:
                     gray_batch.append(cv2.cvtColor(img, cv2.COLOR_RGB2GRAY))
                 else:
@@ -2028,8 +2273,10 @@ class VotersPDFProcessor:
                 for i, gray in enumerate(gray_batch):
                     page_idx = batch_start + i
                     do_header = page_idx < 2  # Only first 2 pages for header
+                    color_img = color_batch[i]
                     future = executor.submit(
-                        self._ocr_single_page_cards, page_idx, gray, do_header
+                        self._ocr_single_page_cards, page_idx, gray, do_header,
+                        color_img,
                     )
                     futures[future] = page_idx
 
@@ -2082,8 +2329,10 @@ class VotersPDFProcessor:
                                 first_page=1, last_page=batch_end,
                             )
                             retry_gray: list[np.ndarray] = []
+                            retry_color: list[np.ndarray] = []
                             for pil_img in retry_images:
                                 img = np.array(pil_img)
+                                retry_color.append(img)
                                 if len(img.shape) == 3:
                                     retry_gray.append(
                                         cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
@@ -2101,6 +2350,7 @@ class VotersPDFProcessor:
                                     future = executor.submit(
                                         self._ocr_single_page_cards,
                                         i, gray, do_hdr,
+                                        retry_color[i],
                                     )
                                     futures[future] = i
                                 for future in as_completed(futures):
@@ -2116,7 +2366,7 @@ class VotersPDFProcessor:
                                             "section_name": "",
                                         }
                                     completed_count += 1
-                            del retry_gray
+                            del retry_gray, retry_color
                         except Exception as e:
                             logger.warning(
                                 f"[IMG-CARD-OCR] DPI upgrade retry failed: {e}"
@@ -2588,6 +2838,12 @@ class VotersPDFProcessor:
                             and not _ADDRESS_LABEL_RE.search(next_line)
                             and not _SERIAL_RE.match(next_line)):
                         section_text = (section_text + " " + next_line).strip()
+                # Strip leading numbering like "1-", "2-" from each
+                # comma/semicolon-separated address segment.
+                # e.g. "1-தெரு பெயர், 2-வேறு தெரு" → "தெரு பெயர், வேறு தெரு"
+                parts = re.split(r'[,;]\s*', section_text)
+                cleaned = [re.sub(r'^\d+\s*[-–—.]\s*', '', p).strip() for p in parts]
+                section_text = ', '.join(c for c in cleaned if c)
                 return section_text
 
         return ""
