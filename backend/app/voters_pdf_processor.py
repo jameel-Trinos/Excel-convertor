@@ -209,17 +209,31 @@ def _cluster_positions(positions: list[float], tolerance: float = 5.0) -> list[f
 def _words_to_text(words: list[dict], line_tolerance: float = 3.0) -> str:
     """Reconstruct text from pdfplumber word dicts, grouped into lines.
 
-    Words with similar ``top`` values (within *line_tolerance* pt) are placed
-    on the same line, sorted left-to-right and joined with spaces.  Lines are
+    Words with similar ``top`` values (within tolerance) are placed on the
+    same line, sorted left-to-right and joined with spaces.  Lines are
     joined with newlines.
+
+    The tolerance adapts to 30% of median word height (floored at the
+    default) so that larger fonts don't cause same-line words to split
+    into separate lines.
     """
     if not words:
         return ""
+
+    # Adaptive tolerance based on actual word heights in this card
+    heights = [w["bottom"] - w["top"] for w in words
+               if w.get("bottom") is not None and w.get("top") is not None]
+    if heights:
+        median_h = sorted(heights)[len(heights) // 2]
+        adaptive_tol = max(line_tolerance, median_h * 0.30)
+    else:
+        adaptive_tol = line_tolerance
+
     sorted_words = sorted(words, key=lambda w: (w["top"], w["x0"]))
     lines: list[list[dict]] = []
     current_line: list[dict] = [sorted_words[0]]
     for w in sorted_words[1:]:
-        if abs(w["top"] - current_line[0]["top"]) <= line_tolerance:
+        if abs(w["top"] - current_line[0]["top"]) <= adaptive_tol:
             current_line.append(w)
         else:
             lines.append(current_line)
@@ -245,6 +259,7 @@ class VoterRecord:
         gender: str = "",
         voter_id: str = "",
         street_name: str = "",
+        relation_type: str = "",
     ):
         self.serial_no = serial_no
         self.name = name
@@ -254,6 +269,7 @@ class VoterRecord:
         self.gender = gender
         self.voter_id = voter_id
         self.street_name = street_name
+        self.relation_type = relation_type  # "F" = Father, "H" = Husband
         self.is_deleted = False
 
     def to_row(self) -> list[str]:
@@ -261,6 +277,7 @@ class VoterRecord:
             self.serial_no,
             self.name,
             self.father_husband_name,
+            self.relation_type,
             self.house_no,
             self.age,
             self.gender,
@@ -294,6 +311,27 @@ class VotersPDFProcessor:
         self._is_scanned = False
         self._learned_img_grid: list[tuple[int, int, int, int]] = []
         self._deleted_voter_count = 0
+
+    @staticmethod
+    def _detect_relation_type(text: str) -> str:
+        """Detect relation type from label text.
+
+        Returns 'H' if Husband/கணவர், 'F' if Father/தந்தை/Mother/Other,
+        '' if unknown.
+        """
+        # Check S/W/D first — it contains both Wife (H) and Son/Daughter (F)
+        # In Indian voter rolls "S/W/D of" typically precedes father's name
+        # so default to "F" for this pattern
+        if re.search(r'S/W/D', text, re.IGNORECASE):
+            return "F"
+        # Husband — specific keywords
+        if re.search(r'கணவ[ர்]?|Husband|Wife\b', text, re.IGNORECASE):
+            return "H"
+        # Father / Mother / Other — all parent/guardian relations → "F"
+        # Also catches OCR-garbled forms like தந்த ன் (truncated தந்தையின்)
+        if re.search(r'தந்த|தாயின்|இதர(?:ர்)?|Father|Mother|Guardian|Son\b|Daughter\b', text, re.IGNORECASE):
+            return "F"
+        return ""
 
     def extract(
         self,
@@ -506,7 +544,7 @@ class VotersPDFProcessor:
 
         headers = [
             "Serial No", "Name", "Father/Husband Name",
-            "House No", "Age", "Gender", "Voter ID",
+            "Relation Type", "House No", "Age", "Gender", "Voter ID",
             "Street Name",
         ]
 
@@ -3126,21 +3164,45 @@ class VotersPDFProcessor:
         # Remove trailing artifacts: " - ; ;", " ; ;", trailing " ."
         name = re.sub(r'\s*-?\s*;\s*;?\s*$', '', name)
         name = re.sub(r'\s+\.\s*$', '', name)
-        # Remove garbled father label fragments that leaked into the name
-        # e.g. "ஊமத்துரை - தந்த leit பெயர்: ஊமத்துரை" → "ஊமத்துரை"
+        # --- Remove LEADING label prefixes that leaked into the value ---
+        # e.g. "தந்தையின் பெயர்: முத்துசாமி" → "முத்துசாமி"
+        # e.g. "தந்த ன் பெயர்: முத்துசாமி" → "முத்துசாமி" (garbled)
         name = re.sub(
-            r'\s*-?\s*(?:தந்த\w*|கணவர்?|இதர\w*|தாயின்)\s*(?:leit|lelt|lett|peit|lest|leat)?\s*(?:பெயர்|பயர்)\s*:?\s*.*$',
+            r'^(?:தந்தை(?:யின்)?\s*.{0,6}(?:பெயர்|பயர்)'
+            r'|தந்த.{0,8}(?:பெயர்|பயர்)'
+            r'|கணவர்\s*.{0,4}(?:பெயர்|பயர்)'
+            r'|இதர(?:ர்)?\s*.{0,4}(?:பெயர்|பயர்)'
+            r'|தாயின்\s*.{0,4}(?:பெயர்|பயர்)'
+            r'|பெயர்'
+            r')\s*:?\s*',
             '', name
         )
-        # Remove "கணவர் N பயர்:" type garbled patterns
-        name = re.sub(r'கணவர்?\s*\d*\s*(?:பயர்|பெயர்)\s*:?\s*', '', name)
-        # Remove trailing label-like text: "- தந்தையின் பெயர்:" and everything after
+        # --- Remove TRAILING label fragments that leaked into the name ---
+        # Each pattern requires the relation keyword + பெயர்/பயர் to avoid
+        # matching legitimate name substrings.
+        # e.g. "ஊமத்துரை - தந்தையின் பெயர்: ஊமத்துரை" → "ஊமத்துரை"
         name = re.sub(
-            r'\s*-?\s*(?:தந்தையின்|கணவர்|இதரர்|தாயின்)\s*(?:பெயர்|பயர்)\s*:?\s*.*$',
+            r'\s*-?\s*(?:தந்தையின்|தந்தை)\s*(?:leit|lelt|lett|peit|lest|leat)?\s*(?:பெயர்|பயர்)\s*:?\s*.*$',
             '', name
         )
-        # Remove "பெயர் :" at end (leaked label)
+        name = re.sub(
+            r'\s*-?\s*கணவர்\s*(?:leit|lelt|lett|peit|lest|leat)?\s*(?:பெயர்|பயர்)\s*:?\s*.*$',
+            '', name
+        )
+        name = re.sub(
+            r'\s*-?\s*(?:இதரர்|தாயின்)\s*(?:leit|lelt|lett|peit|lest|leat)?\s*(?:பெயர்|பயர்)\s*:?\s*.*$',
+            '', name
+        )
+        # Remove "கணவர் N பயர்:" type garbled patterns (require பெயர்/பயர்)
+        name = re.sub(r'கணவர்\s*\d*\s*(?:பயர்|பெயர்)\s*:?\s*', '', name)
+        # Remove trailing bare "பெயர் :" (leaked label with no preceding keyword)
         name = re.sub(r'\s*பெயர்\s*:?\s*$', '', name)
+        # --- Remove field-label lines that leaked into the name ---
+        # e.g. "வீட்டு எண் : 111" should not be a name
+        name = re.sub(
+            r'^(?:வீட்டு\s*எண்|ட்டு\s*எண்|வயது|பாலினம்|Photo\s+is)\s*:?\s*.*$',
+            '', name
+        )
         name = name.strip().rstrip(' -.:;')
         return name
 
@@ -3349,6 +3411,8 @@ class VotersPDFProcessor:
         voters: list[VoterRecord] = []
         current_names: list[str] = []
         current_fathers: list[str] = []
+        current_relation_type: str = ""  # "F" or "H" for the current row of cards
+        current_per_card_relations: list[str] = []  # per-card overrides when a row mixes F/H
         current_houses: list[str] = []
         current_ages: list[str] = []
         current_genders: list[str] = []
@@ -3467,12 +3531,17 @@ class VotersPDFProcessor:
                         logger.info(f"[CARD-ROW FILTER] Dropped digit-heavy name: '{name}'")
                         continue
 
+                # Use per-card relation type if available, else row-level
+                rel_type = (current_per_card_relations[i]
+                            if current_per_card_relations and i < len(current_per_card_relations)
+                            else current_relation_type)
                 voter = VoterRecord(
                     name=name,
                     father_husband_name=father,
                     house_no=VotersPDFProcessor._clean_house_no(house) if house else "",
                     age=age,
                     gender=gender,
+                    relation_type=rel_type,
                 )
                 if voter.is_valid:
                     voters.append(voter)
@@ -3503,6 +3572,7 @@ class VotersPDFProcessor:
                 _flush()
                 current_names = []
                 current_fathers = []
+                current_per_card_relations = []
 
                 # Extract names: split by பெயர் :
                 raw = re.split(r'\s*-?\s*பெயர்\s*:\s*', line)
@@ -3514,7 +3584,26 @@ class VotersPDFProcessor:
                 _init_slots()
 
             elif has_father:
-                # Father/husband name line
+                # Father/husband name line — detect per-card relation types.
+                # A row can mix Father and Husband labels across cards.
+                label_matches = list(re.finditer(
+                    r'(?:தந்தையின்|கணவர்|இதரர்|தாயின்)\s*(?:பெயர்|பயர்)',
+                    line,
+                ))
+                per_card_rels = [
+                    VotersPDFProcessor._detect_relation_type(m.group(0))
+                    for m in label_matches
+                ]
+                if len(per_card_rels) > 1:
+                    current_per_card_relations = per_card_rels
+                    # Use the first as default fallback
+                    current_relation_type = per_card_rels[0]
+                elif len(per_card_rels) == 1:
+                    current_relation_type = per_card_rels[0]
+                    current_per_card_relations = []
+                else:
+                    current_relation_type = VotersPDFProcessor._detect_relation_type(line)
+                    current_per_card_relations = []
                 raw = re.split(
                     r'\s*-?\s*(?:தந்தையின்|கணவர்|இதரர்|தாயின்)\s*(?:பெயர்|பயர்)\s*:?\s*',
                     line,
@@ -3883,6 +3972,7 @@ class VotersPDFProcessor:
         )
         if rel_match:
             voter.father_husband_name = rel_match.group(1).strip()
+            voter.relation_type = VotersPDFProcessor._detect_relation_type(rel_match.group(0))
 
         # Extract name: typically the first line or first significant text
         name_match = re.search(
@@ -4014,6 +4104,71 @@ class VotersPDFProcessor:
 
         return voters
 
+    # Regex for field labels that should start new lines (used by _collapse_non_label_newlines)
+    _FIELD_LABEL_RE = re.compile(
+        r'^\s*(?:'
+        r'பெயர்\s*:|Name\s*:|Elector\s*Name\s*:'      # Name label
+        r'|தந்தை|கணவர்|இதர|தாயின்'                      # Relation labels (Tamil)
+        r'|தந்த\w*\s*.*(?:பெயர்|பயர்)'                  # OCR-garbled father label
+        r'|Father|Husband|Mother'                         # Relation labels (English)
+        r'|F/H\s*Name|S/W/D'                              # English shorthand
+        r'|வீட்டு\s*எண்|ட்டு\s*எண்|House\s*No'          # House number
+        r'|வயது\s*:?|Age\s*:?'                            # Age
+        r'|பாலினம்\s*:?|Gender\s*:?'                      # Gender
+        r'|Photo\s+is'                                     # Photo marker
+        r'|[A-Z]{3}\d{7}'                                  # EPIC voter ID
+        r'|\d{1,4}\s+[A-Z]{3}\d{7}'                       # Serial + EPIC
+        r')',
+        re.IGNORECASE,
+    )
+
+    # Regex to detect that a father/relation label exists somewhere in text
+    _HAS_RELATION_LABEL_RE = re.compile(
+        r'தந்தை|கணவர்|இதர(?:ர்)?|தாயின்'
+        r'|Father|Husband|Mother|F/H\s*Name|S/W/D',
+        re.IGNORECASE,
+    )
+
+    @staticmethod
+    def _collapse_non_label_newlines(text: str) -> str:
+        """Collapse newlines that don't precede a field label into spaces.
+
+        Tamil voter card text reconstructed from word positions may split
+        names across lines. This method joins continuation lines back to
+        their parent field while preserving label-starting newlines.
+
+        IMPORTANT: Only collapses when a father/relation label EXISTS in
+        the text. If there is no father label, non-label lines are kept
+        separate so the fallback can use them as unlabeled father names.
+
+        Example:
+            "பெயர் : கொளஞ்\\nசி\\nதந்தையின் பெயர்: செல்வராசு"
+            → "பெயர் : கொளஞ் சி\\nதந்தையின் பெயர்: செல்வராசு"
+        """
+        lines = text.split('\n')
+        if len(lines) <= 1:
+            return text
+
+        # If there is no father/relation label in the text, non-label Tamil
+        # lines are likely unlabeled father names — keep them separate.
+        has_relation_label = bool(
+            VotersPDFProcessor._HAS_RELATION_LABEL_RE.search(text)
+        )
+
+        if not has_relation_label:
+            return text
+
+        collapsed = [lines[0]]
+        for line in lines[1:]:
+            if VotersPDFProcessor._FIELD_LABEL_RE.search(line):
+                # This line starts a new field — keep the newline
+                collapsed.append(line)
+            else:
+                # Continuation line — join to previous with space
+                collapsed[-1] = collapsed[-1] + ' ' + line
+
+        return '\n'.join(collapsed)
+
     def _extract_voter_from_segment(self, segment: str) -> VoterRecord:
         """Extract a single voter's fields from a text segment.
 
@@ -4021,6 +4176,8 @@ class VotersPDFProcessor:
         """
         # Strip zero-width chars for reliable regex matching
         segment = _strip_zw(segment)
+        # Collapse continuation lines so split names are reconstructed
+        segment = VotersPDFProcessor._collapse_non_label_newlines(segment)
         voter = VoterRecord()
 
         # --- EPIC ---
@@ -4036,10 +4193,23 @@ class VotersPDFProcessor:
                     voter.voter_id = normalized
 
         # --- Name ---
-        # Try labeled name first, then fallback to line-based extraction
+        # Try labeled name first, then fallback to line-based extraction.
+        # The lookahead uses full relation label patterns (keyword + பெயர்) to
+        # avoid stopping prematurely on partial keyword matches inside names.
         name_match = re.search(
-            r'(?:பெயர்|Name|Elector\s*Name)\s*:?\s*(.+?)(?=தந்தை|கணவர்|இதர|தாயின்|Father|Husband|'
-            r'F/H|S/W/D|வீட்டு|House|வயது|Age|பாலினம்|Gender|[A-Z]{3}\d{7}|\n|$)',
+            r'(?:பெயர்|Name|Elector\s*Name)\s*:?\s*(.+?)'
+            r'(?=\s*(?:தந்தை(?:யின்)?\s*(?:[^\u0B80-\u0BFF]{0,4})?\s*(?:பெயர்|பயர்)'
+            r'|கணவர்\s*(?:[^\u0B80-\u0BFF]{0,4})?\s*(?:பெயர்|பயர்)'
+            r'|இதர(?:ர்)?\s*(?:[^\u0B80-\u0BFF]{0,4})?\s*(?:பெயர்|பயர்)'
+            r'|தாயின்\s*(?:[^\u0B80-\u0BFF]{0,4})?\s*(?:பெயர்|பயர்))'
+            r'|(?:Father|Husband|Mother)(?:\s*(?:\'s)?)?\s*(?:Name)?'
+            r'|F/H\s*Name|S/W/D\s*of'
+            r'|வீட்டு\s*எண்|ட்டு\s*எண்|House\s*No'
+            r'|வயது\s*:?|Age\s*:?'
+            r'|பாலினம்\s*:?|Gender\s*:?'
+            r'|[A-Z]{3}\d{7}'
+            r'|Photo\s+is'
+            r'|\n|$)',
             segment,
             re.IGNORECASE,
         )
@@ -4070,15 +4240,18 @@ class VotersPDFProcessor:
                         break
 
         # --- Father/Husband Name ---
-        # Broader pattern: handle OCR variations of தந்தை/கணவர்/தாயின்/இதரர்
-        # OCR commonly garbles: தந்தையின் → தந்தை ின், பெயர் → ( பயர் / பயர்
-        # Use .{0,6} to allow up to 6 noise chars between keyword and பெயர்/பயர்
+        # Handle OCR variations of தந்தை/கணவர்/தாயின்/இதரர்.
+        # Use [^\u0B80-\u0BFF]{0,4} (non-Tamil noise chars only) between keyword
+        # and பெயர்/பயர் to prevent consuming actual Tamil name characters.
         father_match = re.search(
-            r"(?:தந்தை(?:யின்|.{0,6})?\s*(?:பெயர்|பயர்)|கணவர்?\s*.{0,4}(?:பெயர்|பயர்)|"
-            r"தாயின்\s*.{0,4}(?:பெயர்|பயர்)|இதர(?:ர்)?\s*.{0,4}(?:பெயர்|பயர்)|"
-            r"Father(?:'s)?\s*(?:Name)?|Husband(?:'s)?\s*(?:Name)?|Mother(?:'s)?\s*(?:Name)?|"
-            r"F/H\s*Name|S/W/D\s*of|Relation\s*Name)\s*:?\s*"
-            r"(.+?)(?=வீட்டு|ட்டு\s*எண்|House|வயது|Age|பாலினம்|Gender|[A-Z]{3}\d{7}|Photo\s+is|\n|$)",
+            r"(?:தந்தை(?:யின்)?\s*(?:[^\u0B80-\u0BFF]{0,4})?\s*(?:பெயர்|பயர்)"
+            r"|தந்த.{0,8}(?:பெயர்|பயர்)"                     # OCR-garbled: தந்த ன் பெயர்
+            r"|கணவர்\s*(?:[^\u0B80-\u0BFF]{0,4})?\s*(?:பெயர்|பயர்)"
+            r"|தாயின்\s*(?:[^\u0B80-\u0BFF]{0,4})?\s*(?:பெயர்|பயர்)"
+            r"|இதர(?:ர்)?\s*(?:[^\u0B80-\u0BFF]{0,4})?\s*(?:பெயர்|பயர்)"
+            r"|Father(?:'s)?\s*(?:Name)?|Husband(?:'s)?\s*(?:Name)?|Mother(?:'s)?\s*(?:Name)?"
+            r"|F/H\s*Name|S/W/D\s*of|Relation\s*Name)\s*:?\s*"
+            r"(.+?)(?=வீட்டு|ட்டு\s*எண்|House\s*No|வயது\s*:?|Age\s*:?|பாலினம்\s*:?|Gender\s*:?|[A-Z]{3}\d{7}|Photo\s+is|\n|$)",
             segment,
             re.IGNORECASE,
         )
@@ -4090,8 +4263,16 @@ class VotersPDFProcessor:
             fname = fname.rstrip(' .,;:-')
             if fname:
                 voter.father_husband_name = fname
+                voter.relation_type = VotersPDFProcessor._detect_relation_type(father_match.group(0))
 
-        # Fallback: if no labeled father name, try second Tamil text line
+        # Fallback: if no labeled father name, try second Tamil text line.
+        # Skip lines that contain known field labels (house, age, gender, etc.)
+        # to avoid picking up "வீட்டு எண் : 111" as father name.
+        _NON_NAME_LABEL_RE = re.compile(
+            r'வீட்டு\s*எண்|ட்டு\s*எண்|House\s*No|வயது\s*:|Age\s*:'
+            r'|பாலினம்\s*:|Gender\s*:|Photo\s+is|[A-Z]{3}\d{7}',
+            re.IGNORECASE,
+        )
         if not voter.father_husband_name and voter.name:
             found_name = False
             for line in segment.split('\n'):
@@ -4099,7 +4280,10 @@ class VotersPDFProcessor:
                 tamil_count = len(re.findall(r'[\u0B80-\u0BFF]', line))
                 if tamil_count < 3:
                     continue
-                if _EPIC_RE.search(line) and tamil_count < 3:
+                if _EPIC_RE.search(line):
+                    continue
+                # Skip lines that are clearly field-label lines (house, age, gender)
+                if _NON_NAME_LABEL_RE.search(line):
                     continue
                 cleaned = VotersPDFProcessor._clean_name(line)
                 cleaned = cleaned.rstrip(' .,;:-')
@@ -4107,7 +4291,7 @@ class VotersPDFProcessor:
                     continue
                 if not found_name:
                     # Skip the first Tamil line (already used as name)
-                    if cleaned == voter.name or cleaned in voter.name:
+                    if cleaned == voter.name or voter.name in cleaned or cleaned in voter.name:
                         found_name = True
                         continue
                     found_name = True

@@ -20,6 +20,7 @@ VOTER_COLUMNS = [
     ("Serial No", "வ.எண்"),
     ("Name", "பெயர்"),
     ("Father/Husband Name", "தந்தை/கணவர் பெயர்"),
+    ("Relation Type", "உறவு வகை"),
     ("House No", "வீட்டு எண்"),
     ("Age", "வயது"),
     ("Gender", "பாலினம்"),
@@ -46,7 +47,7 @@ _CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
 _LEFT = Alignment(horizontal="left", vertical="center", wrap_text=True)
 
 # Column widths
-_COL_WIDTHS = [12, 25, 25, 15, 8, 12, 22, 35]
+_COL_WIDTHS = [12, 25, 25, 10, 15, 8, 12, 22, 35]
 
 
 class VotersExcelCreator:
@@ -129,8 +130,8 @@ class VotersExcelCreator:
                 cell = ws.cell(row=current_row, column=col_idx + 1, value=value)
                 cell.font = _DATA_FONT
                 cell.border = _THIN_BORDER
-                # Center align Serial No, Age, Gender, Voter ID
-                if col_idx in (0, 4, 5, 6):
+                # Center align Serial No, Relation Type, Age, Gender, Voter ID
+                if col_idx in (0, 3, 5, 6, 7):
                     cell.alignment = Alignment(horizontal="center", vertical="center")
                 else:
                     cell.alignment = _LEFT
