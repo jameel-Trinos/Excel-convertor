@@ -50,11 +50,15 @@ def _fix_ocr_epic(text: str) -> str:
     Handles:
     - $ misread as S: $SL → SSL
     - S$SL prefix bloat: SSSL → SSL
+    - Spurious O/o duplication: SSLO0957704 → SSL0957704 (OCR reads 0 as O AND keeps 0)
     - 4-letter prefix where 4th char is a misread digit: NNKT099068 → NNK1099068
     """
     text = text.replace('$', 'S')
     # Collapse runs like SSSL → SSL (OCR doubling the S prefix)
     text = re.sub(r'S{2,}([A-Z]\d{7})', r'SS\1', text)
+    # Fix OCR duplication: 0 misread as O while original 0 is also kept,
+    # producing 11-char strings like SSLO0957704 instead of SSL0957704.
+    text = re.sub(r'([A-Z]{3})[Oo](\d{7})\b', r'\g<1>\2', text)
     # Fix 4-letter EPIC prefix where the 4th letter is a misread digit.
     # e.g. NNKT099068 → NNK1099068 (T misread as 1)
     def _fix_4letter_prefix(m: re.Match) -> str:
@@ -87,6 +91,7 @@ _AGE_RE = re.compile(r'\b(\d{1,3})\b')
 # Gender patterns (English + Tamil)
 _GENDER_MALE = re.compile(r'(?<![a-zA-Z\u0B80-\u0BFF])(Male|ஆண்|M)(?![a-zA-Z\u0B80-\u0BFF])', re.IGNORECASE)
 _GENDER_FEMALE = re.compile(r'(?<![a-zA-Z\u0B80-\u0BFF])(Female|பெண்|F)(?![a-zA-Z\u0B80-\u0BFF])', re.IGNORECASE)
+_GENDER_OTHER = re.compile(r'(?<![a-zA-Z\u0B80-\u0BFF])(மூன்றாம்\s*பாலினம்|O)(?![a-zA-Z\u0B80-\u0BFF])', re.IGNORECASE)
 
 # Serial number at start of a voter entry
 _SERIAL_RE = re.compile(r'^\s*(\d{1,4})\s')
@@ -500,6 +505,8 @@ class VotersPDFProcessor:
                 voter.gender = "M"
             elif g in ("female", "f", "பெண்"):
                 voter.gender = "F"
+            elif g in ("மூன்றாம் பாலினம்", "மூன்றாம்பாலினம்", "o"):
+                voter.gender = "O"
             elif g:
                 voter.gender = "O"
 
@@ -1610,7 +1617,7 @@ class VotersPDFProcessor:
         # Bare gender words as standalone cell text (from summary tables)
         # "ஆண்" or "பெண்" alone (not inside a voter card with other fields)
         bare_text = re.sub(r'\s+', '', text_stripped)
-        if bare_text in ('ஆண்', 'பெண்', 'ஆண', 'பெண', 'Male', 'Female'):
+        if bare_text in ('ஆண்', 'பெண்', 'ஆண', 'பெண', 'Male', 'Female', 'மூன்றாம்பாலினம்'):
             return True
 
         # Very short cells (≤ 15 chars) with only a number — summary table data cell
@@ -3224,6 +3231,108 @@ class VotersPDFProcessor:
         'என்': 'N',
     }
 
+    # OCR letter→digit confusion map for characters inside numeric segments.
+    # These are letters commonly misread by OCR when the correct char is a digit.
+    _LETTER_TO_DIGIT: dict[str, str] = {
+        'O': '0', 'o': '0', 'Q': '0',
+        'l': '1', 'I': '1', 'i': '1', '|': '1',
+        'Z': '2', 'z': '2',
+        'S': '5', 's': '5',
+        'B': '8', 'b': '8',
+        'G': '6', 'g': '6',
+        'D': '0', 'T': '7',
+    }
+
+    # Letters that look like digits and should NOT be treated as intentional
+    # house-number suffixes. These are almost never used as real house number
+    # subdivisions in Indian voter rolls, so if they appear as trailing chars,
+    # they are more likely OCR-garbled digits.
+    # Note: B, D, G ARE legitimate suffixes so they're excluded from this set.
+    _AMBIGUOUS_SUFFIX_LETTERS: set[str] = {'O', 'I', 'S', 'Z', 'T'}
+
+    @staticmethod
+    def _fix_ocr_digit_confusion(h: str) -> str:
+        """Fix OCR letter↔digit confusion in house number numeric segments.
+
+        House numbers follow patterns like "123", "1/8", "1-21B", "08/191".
+        Numeric segments (groups of digits possibly mixed with OCR-garbled
+        letters) should be pure digits. A trailing single letter (A-Z suffix)
+        is intentional and preserved — UNLESS the letter itself commonly
+        looks like a digit (O, I, S, B, D, G, Z, T).
+
+        Single-letter tokens after separators (e.g., "15/B") are preserved
+        as letter subdivisions.
+
+        Examples:
+            "l2"    → "12"    (lowercase L → 1)
+            "O8"    → "08"    (letter O → 0)
+            "1S3"   → "153"   (letter S → 5)
+            "l-2lB" → "1-21B" (B is unambiguous suffix)
+            "O8/l9l"→ "08/191"
+            "12B"   → "12B"   (trailing letter suffix kept)
+            "3O"    → "30"    (O is ambiguous, treated as 0)
+            "15/B"  → "15/B"  (single-letter token = subdivision)
+            "12A"   → "12A"   (A is unambiguous suffix)
+        """
+        if not h:
+            return h
+
+        # Split house number into tokens by separators (-, /)
+        # Preserve separators for reassembly
+        tokens = re.split(r'([-/])', h)
+        result_parts = []
+
+        for idx, token in enumerate(tokens):
+            # Separators pass through unchanged
+            if token in ('-', '/'):
+                result_parts.append(token)
+                continue
+
+            if not token:
+                result_parts.append(token)
+                continue
+
+            # Single-letter token after a separator (e.g., "B" in "15/B")
+            # is a letter subdivision — preserve as-is
+            if len(token) == 1 and token.isalpha() and idx > 0:
+                result_parts.append(token)
+                continue
+
+            # Determine if this token ends with a letter suffix (e.g., "21B", "8C")
+            # Only the LAST token in the house number can have a letter suffix.
+            # Letters that commonly look like digits (O, I, S, B, etc.) are NOT
+            # treated as suffixes — they are more likely OCR-garbled digits.
+            is_last_token = idx == len(tokens) - 1
+            suffix = ""
+            core = token
+            if is_last_token and len(token) >= 2 and token[-1].isalpha() and token[-1].isupper():
+                last_char = token[-1]
+                # Only treat as suffix if the letter is NOT commonly confused with a digit
+                if last_char not in VotersPDFProcessor._AMBIGUOUS_SUFFIX_LETTERS:
+                    before_suffix = token[:-1]
+                    has_digit_like = any(
+                        c.isdigit() or c in VotersPDFProcessor._LETTER_TO_DIGIT
+                        for c in before_suffix
+                    )
+                    if has_digit_like:
+                        suffix = last_char
+                        core = before_suffix
+
+            # Fix letter→digit confusion in the core numeric part
+            fixed_chars = []
+            for c in core:
+                if c.isdigit():
+                    fixed_chars.append(c)
+                elif c in VotersPDFProcessor._LETTER_TO_DIGIT:
+                    fixed_chars.append(VotersPDFProcessor._LETTER_TO_DIGIT[c])
+                else:
+                    # Unknown char — keep as-is (could be legitimate)
+                    fixed_chars.append(c)
+
+            result_parts.append(''.join(fixed_chars) + suffix)
+
+        return ''.join(result_parts)
+
     @staticmethod
     def _clean_house_no(h: str) -> str:
         """Clean OCR artifacts from a house number value.
@@ -3236,6 +3345,7 @@ class VotersPDFProcessor:
         - Stray OCR-garbled Tamil chars (not letter sub-units): "43 ர" → "43"
         - "&" OCR misread of "A" or "/": "36&" → "36A"
         - Alphanumeric house numbers preserved: "1A", "1/8", "56J/11"
+        - OCR letter↔digit confusion: "O8" → "08", "l2" → "12", "1S3" → "153"
         """
         if not h:
             return h
@@ -3271,9 +3381,13 @@ class VotersPDFProcessor:
         # If result is empty or just dashes, return empty
         if not h or re.fullmatch(r'[\s_\-\.]+', h):
             return ""
-        # Reject house numbers with no digits (pure text like "SEAS", Tamil-only)
-        if not re.search(r'\d', h):
+        # Reject house numbers with no digits AND no digit-like letters
+        # (after OCR fix, letters like "O", "l" may represent digits)
+        if not re.search(r'[\dOoQlIiSsZzBbGgDT|]', h):
             return ""
+        # Fix OCR letter↔digit confusion in numeric segments
+        # e.g., "O8" → "08", "l2" → "12", "l-2lB" → "1-21B"
+        h = VotersPDFProcessor._fix_ocr_digit_confusion(h)
         # Strip trailing English words (e.g., "4671 STREET" → "4671")
         h = re.sub(r'\s+[A-Za-z]{3,}.*$', '', h).strip()
         # Strip trailing text after comma (e.g., "16J,SWETHAN" → "16J", "121,சண்முகா" → "121")
@@ -3293,7 +3407,7 @@ class VotersPDFProcessor:
         If most house numbers on a page have letter suffixes (e.g., "1-21A",
         "1-22C"), then "1-218" is likely "1-21B" (OCR confused B→8).
 
-        Common OCR confusions: B→8, C→0, D→0, A→4, G→6
+        Common OCR confusions: B↔8, C↔0, D↔0, A↔4, G↔6, S↔5, Z↔2, I↔1
         """
         if not voters:
             return
@@ -3320,7 +3434,10 @@ class VotersPDFProcessor:
             return
 
         # Reverse OCR confusion map: digit → most likely letter
-        _DIGIT_TO_LETTER = {'8': 'B', '0': 'C', '4': 'A', '6': 'G'}
+        _DIGIT_TO_LETTER = {
+            '8': 'B', '0': 'C', '4': 'A', '6': 'G',
+            '5': 'S', '2': 'Z', '1': 'I', '7': 'T',
+        }
 
         fixed_count = 0
         for v in voters:
@@ -3331,7 +3448,6 @@ class VotersPDFProcessor:
             # e.g., "1-218" → could be "1-21B", "1-80" → could be "1-8C"
             m = re.match(r'^(.+[-/]\d*)(\d)$', h)
             if m and m.group(2) in _DIGIT_TO_LETTER:
-                # Also check: standalone like "128" where "12B" is expected
                 v.house_no = m.group(1) + _DIGIT_TO_LETTER[m.group(2)]
                 fixed_count += 1
             elif not _letter_suffix_re.search(h):
@@ -3634,9 +3750,9 @@ class VotersPDFProcessor:
                 _fill_slots_houses(new_houses, line)
 
                 new_ages = re.findall(r'வயது\s*:\s*(\d+)', line)
-                new_genders_raw = re.findall(r'பாலினம்\s*:\s*(ஆண்|பெண்)', line)
+                new_genders_raw = re.findall(r'பாலினம்\s*:\s*(ஆண்|பெண்|மூன்றாம்\s*பாலினம்)', line)
                 new_genders = [
-                    "Male" if g == 'ஆண்' else "Female" for g in new_genders_raw
+                    "Male" if g == 'ஆண்' else ("Female" if g == 'பெண்' else "Other") for g in new_genders_raw
                 ]
 
                 # Place ages into slots that had houses BEFORE this line
@@ -3660,9 +3776,9 @@ class VotersPDFProcessor:
             elif has_age:
                 # Age + gender line
                 new_ages = re.findall(r'வயது\s*:\s*(\d+)', line)
-                new_genders_raw = re.findall(r'பாலினம்\s*:\s*(ஆண்|பெண்)', line)
+                new_genders_raw = re.findall(r'பாலினம்\s*:\s*(ஆண்|பெண்|மூன்றாம்\s*பாலினம்)', line)
                 new_genders = [
-                    "Male" if g == 'ஆண்' else "Female" for g in new_genders_raw
+                    "Male" if g == 'ஆண்' else ("Female" if g == 'பெண்' else "Other") for g in new_genders_raw
                 ]
                 _fill_slots_age_gender(new_ages, new_genders)
 
@@ -3846,6 +3962,8 @@ class VotersPDFProcessor:
                         voter.gender = "Male"
                     elif _GENDER_FEMALE.search(part):
                         voter.gender = "Female"
+                    elif _GENDER_OTHER.search(part):
+                        voter.gender = "Other"
 
                 if not voter.age:
                     age_match = _AGE_RE.search(part)
@@ -3862,7 +3980,7 @@ class VotersPDFProcessor:
                     continue
                 if part == voter.age:
                     continue
-                if part in ("Male", "Female", "M", "F", "ஆண்", "பெண்"):
+                if part in ("Male", "Female", "Other", "M", "F", "O", "ஆண்", "பெண்", "மூன்றாம் பாலினம்"):
                     continue
                 text_parts.append(part)
 
@@ -3988,7 +4106,7 @@ class VotersPDFProcessor:
             # Remove EPIC if present
             first_line = _EPIC_RE.sub("", first_line).strip()
             # Remove gender/age tokens
-            first_line = re.sub(r'\b(Male|Female|ஆண்|பெண்|M|F)\b', '', first_line, flags=re.IGNORECASE).strip()
+            first_line = re.sub(r'\b(Male|Female|Other|ஆண்|பெண்|மூன்றாம்\s*பாலினம்|M|F|O)\b', '', first_line, flags=re.IGNORECASE).strip()
             if first_line and len(first_line) > 1:
                 voter.name = first_line
 
@@ -4350,7 +4468,7 @@ class VotersPDFProcessor:
 
         # --- Gender ---
         gender_match = re.search(
-            r'(?:பாலினம்|Gender)\s*:?\s*(ஆண்|பெண்|Male|Female|M|F)',
+            r'(?:பாலினம்|Gender)\s*:?\s*(மூன்றாம்\s*பாலினம்|ஆண்|பெண்|Male|Female|Other|M|F|O)',
             segment,
             re.IGNORECASE,
         )
@@ -4360,17 +4478,23 @@ class VotersPDFProcessor:
                 voter.gender = "Male"
             elif g in ('பெண்', 'Female', 'F', 'f'):
                 voter.gender = "Female"
+            elif g.replace(' ', '') in ('மூன்றாம்பாலினம்',) or g in ('Other', 'O', 'o'):
+                voter.gender = "Other"
         else:
             if _GENDER_FEMALE.search(segment):
                 voter.gender = "Female"
             elif _GENDER_MALE.search(segment):
                 voter.gender = "Male"
+            elif _GENDER_OTHER.search(segment):
+                voter.gender = "Other"
             else:
                 # Tertiary fallback: plain Tamil gender words without boundaries
                 if re.search(r'பெண்', segment):
                     voter.gender = "Female"
                 elif re.search(r'ஆண்', segment):
                     voter.gender = "Male"
+                elif re.search(r'மூன்றாம்\s*பாலினம்', segment):
+                    voter.gender = "Other"
 
         # --- Serial Number ---
         # Only match a leading number that is NOT already captured as house/age

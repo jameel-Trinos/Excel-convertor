@@ -29,6 +29,7 @@ MERGED_COLUMNS = [
     "gender",
     "age",
     "house_number",
+    "street_name",
     "section_name",
     "section_name_tamil",
     "part_number",
@@ -37,7 +38,7 @@ MERGED_COLUMNS = [
 ]
 
 # Column widths for the merged output
-_COL_WIDTHS = [10, 22, 22, 22, 22, 14, 18, 10, 8, 14, 18, 18, 14, 14, 14]
+_COL_WIDTHS = [10, 22, 22, 22, 22, 14, 18, 10, 8, 14, 18, 18, 18, 14, 14, 14]
 
 # ── Styles ───────────────────────────────────────────────────────────────
 _DARK_BLUE = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
@@ -290,33 +291,29 @@ class ExcelMerger:
         data_start = header_row + 2
 
         rows: list[list[Any]] = []
-        for row in ws.iter_rows(min_row=data_start, max_col=8, values_only=True):
+        for row in ws.iter_rows(min_row=data_start, max_col=9, values_only=True):
             # Skip empty rows
             if all(v is None or str(v).strip() == "" for v in row):
                 continue
 
-            # Pad row to 8 columns
-            vals = list(row) + [None] * (8 - len(row))
+            # Pad row to 9 columns
+            vals = list(row) + [None] * (9 - len(row))
 
             serial_no = str(vals[0] or "").strip()
             name = str(vals[1] or "").strip()
             relation = str(vals[2] or "").strip()
-            house_no = str(vals[3] or "").strip()
-            age = str(vals[4] or "").strip()
-            gender = str(vals[5] or "").strip()
-            voter_id = str(vals[6] or "").strip()
-            street_name = str(vals[7] or "").strip()
+            relation_type = str(vals[3] or "").strip()
+            house_no = str(vals[4] or "").strip()
+            age = str(vals[5] or "").strip()
+            gender = str(vals[6] or "").strip()
+            voter_id = str(vals[7] or "").strip()
+            street_name = str(vals[8] or "").strip()
 
             # Skip rows that look like headers or metadata
             if serial_no.lower() in ("serial no", "வ.எண்", ""):
                 # Allow empty serial if there's other data
                 if not name and not voter_id:
                     continue
-
-            # Use street_name from the PDF (column 8) if available,
-            # otherwise fall back to the section map lookup
-            row_section = street_name if street_name else section_name
-            row_section_tamil = street_name if street_name else section_tamil
 
             # Build target row (serial placeholder = 0, will be renumbered)
             merged_row = [
@@ -325,13 +322,14 @@ class ExcelMerger:
                 name,               # voter_name_tamil (same Tamil text)
                 relation,           # relation_name
                 relation,           # relation_name_tamil (same Tamil text)
-                "F",                # relation_type (default Father)
+                relation_type,      # relation_type
                 voter_id,           # epic_number
                 gender,             # gender
                 age,                # age
                 house_no,           # house_number
-                row_section,        # section_name
-                row_section_tamil,  # section_name_tamil
+                street_name,        # street_name
+                section_name,       # section_name
+                section_tamil,      # section_name_tamil
                 part_no,            # part_number
                 ac_no,              # ac_number
                 "",                 # district_code (blank)
@@ -364,7 +362,7 @@ class ExcelMerger:
                 cell.border = _THIN_BORDER
                 # Center-align: Serial No, relation_type, gender, age,
                 # part_number, ac_number, district_code
-                if col_idx in (1, 6, 8, 9, 13, 14, 15):
+                if col_idx in (1, 6, 8, 9, 14, 15, 16):
                     cell.alignment = _CENTER
                 else:
                     cell.alignment = _LEFT
